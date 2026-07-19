@@ -29,6 +29,8 @@ dependencies = [
  "amphion-geometry",
  "amphion-topology",
  "amphion-validation",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

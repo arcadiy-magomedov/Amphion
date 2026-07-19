@@ -11,6 +11,8 @@ amphion-foundation = { path = "../foundation" }
 amphion-geometry = { path = "../geometry" }
 amphion-topology = { path = "../topology" }
 amphion-validation = { path = "../validation" }
+serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true
