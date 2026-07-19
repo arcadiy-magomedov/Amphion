@@ -3,6 +3,8 @@
 use core::error::Error;
 use core::fmt;
 
+use amphion_foundation::SchemaVersion;
+
 /// A failure returned when constructing an analytic curve or surface.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -23,6 +25,15 @@ pub enum ConstructionError {
     /// Two provided axes are linearly dependent and cannot form an independent
     /// frame.
     DependentAxes,
+    /// A serialized representation carried a [`SchemaVersion`] that does not
+    /// exactly match the version supported by this build. Deserialization is
+    /// rejected rather than silently reinterpreting incompatible data.
+    UnsupportedSchemaVersion {
+        /// The version found in the serialized representation.
+        found: SchemaVersion,
+        /// The exact version supported by this build.
+        supported: SchemaVersion,
+    },
 }
 
 impl fmt::Display for ConstructionError {
@@ -41,6 +52,16 @@ impl fmt::Display for ConstructionError {
             Self::InvalidHalfAngle => "cone half-angle must be strictly between 0 and π/2",
             Self::DependentAxes => {
                 "two provided axes are linearly dependent and cannot form an independent frame"
+            }
+            Self::UnsupportedSchemaVersion { found, supported } => {
+                return write!(
+                    formatter,
+                    "unsupported schema version {}.{} (this build supports exactly {}.{})",
+                    found.major(),
+                    found.minor(),
+                    supported.major(),
+                    supported.minor(),
+                );
             }
         };
         formatter.write_str(message)

@@ -39,19 +39,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::traits::SurfaceEvaluator;
 use crate::{
-    AngularParameterBound, CurveFirstDerivativeLimit, CurveSecondDerivativeLimit, DerivativeOrder,
-    DistanceBound, EvaluationContext, FirstDerivativeBound, GeometryError, LinearParameterBound,
-    ParameterErrorBound, ParameterRange, ParameterValue, PositionBound, SecondDerivativeBound,
-    SurfaceDomain, SurfaceDuvLimit, SurfaceDvLimit, SurfaceDvvLimit, SurfaceEvaluation,
-    SurfaceKind, SurfaceProjection,
+    AngularParameterBound, DerivativeOrder, DistanceBound, EvaluationContext, FirstDerivativeBound,
+    GeometryError, LinearParameterBound, ParameterErrorBound, ParameterRange, ParameterValue,
+    PositionBound, SecondDerivativeBound, SurfaceDomain, SurfaceEvaluation, SurfaceKind,
+    SurfaceProjection,
 };
 
 use super::{
     ConstructionError, TransformError,
     helpers::{
-        ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite3, check_angular_tolerance,
-        check_derivative_limit, check_parametric_tolerance, check_tolerance, dot3,
-        exact_cylinder_eval, exact_cylinder_project, frame_deviation_bound_terms, in_range, mag3,
+        ILL_COND_THRESH, all_finite3, check_angular_tolerance, check_derivative_limit,
+        check_parametric_tolerance, check_tolerance, dot3, exact_cylinder_eval,
+        exact_cylinder_project, frame_deviation_bound_3d, in_range, mag3,
         normalization_to_construction, scale3, sub3,
     },
     transform::similarity_scale,
@@ -224,8 +223,11 @@ impl Cylinder {
 impl TryFrom<CylinderRepr> for Cylinder {
     type Error = ConstructionError;
     fn try_from(repr: CylinderRepr) -> Result<Self, Self::Error> {
-        if repr.version.major() != SCHEMA_VERSION.major() {
-            return Err(ConstructionError::NonFiniteInput);
+        if repr.version != SCHEMA_VERSION {
+            return Err(ConstructionError::UnsupportedSchemaVersion {
+                found: repr.version,
+                supported: SCHEMA_VERSION,
+            });
         }
         let axis_origin = repr.axis_origin.into_array();
         if !all_finite3(axis_origin) || !repr.radius.is_finite() {
@@ -236,9 +238,10 @@ impl TryFrom<CylinderRepr> for Cylinder {
         }
         let a_unit = repr.axis_dir;
         let x_unit = repr.x_axis;
-        if a_unit.dot(x_unit).abs() > UNIT_VECTOR_TOL {
-            return Err(ConstructionError::DependentAxes);
-        }
+        // Stored `(axis_dir, x_axis)` is used as-is; the certified projection
+        // and evaluation paths bound any frame deviation rigorously (see
+        // `frame_deviation_bound_3d`). Linear independence is enforced by the
+        // cross-product normalization below.
         let y_axis = UnitVector3::try_normalize(a_unit.cross(x_unit))
             .map_err(|_| ConstructionError::DependentAxes)?;
         Ok(Self {
@@ -301,10 +304,11 @@ impl SurfaceEvaluator for Cylinder {
                 reason: "cylinder position is non-finite".to_owned(),
             }
         })?;
-        // Certified frame-deviation bound (exact rational) covering the radial
-        // axes and the axial direction contribution v·Z.
-        let raw_pos_bound = eval.position_error_bound
-            + frame_deviation_bound_terms(&[(&x_ax, self.radius), (&y_ax, self.radius), (&ad, v)]);
+        // Certified ideal-frame deviation bound (exact rational) covering the
+        // radial axes (coefficient magnitude ≤ radius) and the axial direction
+        // contribution v·Z (coefficient magnitude ≤ |v|).
+        let raw_pos_bound =
+            eval.position_error_bound + frame_deviation_bound_3d(ad, x_ax, y_ax, self.radius, v);
         let position_error_bound =
             PositionBound::try_new(raw_pos_bound).map_err(|_| GeometryError::Uncertified {
                 reason: "position error bound overflowed representable range".to_owned(),
@@ -348,14 +352,11 @@ impl SurfaceEvaluator for Cylinder {
             DerivativeOrder::First => {
                 check_derivative_limit(
                     du_error_bound.get(),
-                    context
-                        .derivative_limits()
-                        .first_or_du
-                        .map(CurveFirstDerivativeLimit::get),
+                    context.derivative_limits().surface.du.get(),
                 )?;
                 check_derivative_limit(
                     dv_error_bound.get(),
-                    context.derivative_limits().dv.map(SurfaceDvLimit::get),
+                    context.derivative_limits().surface.dv.get(),
                 )?;
                 let du = to_vec3(eval.du, "cylinder first u-derivative")?;
                 let dv = to_vec3(ad, "axis_dir")?;
@@ -375,29 +376,23 @@ impl SurfaceEvaluator for Cylinder {
             DerivativeOrder::Second => {
                 check_derivative_limit(
                     du_error_bound.get(),
-                    context
-                        .derivative_limits()
-                        .first_or_du
-                        .map(CurveFirstDerivativeLimit::get),
+                    context.derivative_limits().surface.du.get(),
                 )?;
                 check_derivative_limit(
                     dv_error_bound.get(),
-                    context.derivative_limits().dv.map(SurfaceDvLimit::get),
+                    context.derivative_limits().surface.dv.get(),
                 )?;
                 check_derivative_limit(
                     duu_error_bound.get(),
-                    context
-                        .derivative_limits()
-                        .second_or_duu
-                        .map(CurveSecondDerivativeLimit::get),
+                    context.derivative_limits().surface.duu.get(),
                 )?;
                 check_derivative_limit(
                     zero_second_bound.get(),
-                    context.derivative_limits().duv.map(SurfaceDuvLimit::get),
+                    context.derivative_limits().surface.duv.get(),
                 )?;
                 check_derivative_limit(
                     zero_second_bound.get(),
-                    context.derivative_limits().dvv.map(SurfaceDvvLimit::get),
+                    context.derivative_limits().surface.dvv.get(),
                 )?;
                 let du = to_vec3(eval.du, "cylinder first u-derivative")?;
                 let dv = to_vec3(ad, "axis_dir")?;
@@ -514,7 +509,7 @@ mod tests {
     }
 
     fn ctx() -> EvaluationContext {
-        EvaluationContext::new(tol())
+        EvaluationContext::unlimited(tol())
     }
 
     fn dist3(a: Point3, b: Point3) -> f64 {
@@ -832,6 +827,19 @@ mod tests {
             serde_json::from_value::<Cylinder>(missing).is_err(),
             "missing version must be rejected"
         );
+
+        // Item 6: exact-match — a different minor is now rejected too.
+        let wrong_minor = serde_json::json!({
+            "version": {"major": 1, "minor": 7},
+            "axis_origin": [0.0, 0.0, 0.0],
+            "axis_dir": [0.0, 0.0, 1.0],
+            "radius": 1.0,
+            "x_axis": [1.0, 0.0, 0.0]
+        });
+        assert!(
+            serde_json::from_value::<Cylinder>(wrong_minor).is_err(),
+            "major=1 minor=7 must be rejected under exact-match"
+        );
     }
 
     /// Blocker 4: Serialization round-trip must be byte-identical for version=1.
@@ -861,8 +869,9 @@ mod tests {
         .unwrap();
         let q = Point3::try_new(0.0, 2.0, 1.0).unwrap();
         // parametric=1e-20 is tighter than a typical non-zero rational bound.
-        let tight =
-            EvaluationContext::new(ToleranceContext::try_new(10.0, 0.0, 1e-10, 1e-20).unwrap());
+        let tight = EvaluationContext::unlimited(
+            ToleranceContext::try_new(10.0, 0.0, 1e-10, 1e-20).unwrap(),
+        );
         let result = c.project(q, &tight);
         // Either it succeeds (bound < 1e-20) or it fails (bound >= 1e-20).
         // The key check: if it fails, it must be Uncertified, not a panic.
@@ -873,7 +882,7 @@ mod tests {
 
         // With permissive tolerance, it must succeed.
         let permissive =
-            EvaluationContext::new(ToleranceContext::try_new(10.0, 0.0, 1e-10, 1.0).unwrap());
+            EvaluationContext::unlimited(ToleranceContext::try_new(10.0, 0.0, 1e-10, 1.0).unwrap());
         assert!(c.project(q, &permissive).is_ok());
     }
 }

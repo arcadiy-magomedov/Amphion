@@ -115,8 +115,11 @@ impl Line2 {
 impl TryFrom<Line2Repr> for Line2 {
     type Error = ConstructionError;
     fn try_from(repr: Line2Repr) -> Result<Self, Self::Error> {
-        if repr.version.major() != SCHEMA_VERSION.major() {
-            return Err(ConstructionError::NonFiniteInput);
+        if repr.version != SCHEMA_VERSION {
+            return Err(ConstructionError::UnsupportedSchemaVersion {
+                found: repr.version,
+                supported: SCHEMA_VERSION,
+            });
         }
         let origin = repr.origin.into_array();
         if !all_finite2(origin) {
@@ -352,8 +355,11 @@ impl Line3 {
 impl TryFrom<Line3Repr> for Line3 {
     type Error = ConstructionError;
     fn try_from(repr: Line3Repr) -> Result<Self, Self::Error> {
-        if repr.version.major() != SCHEMA_VERSION.major() {
-            return Err(ConstructionError::NonFiniteInput);
+        if repr.version != SCHEMA_VERSION {
+            return Err(ConstructionError::UnsupportedSchemaVersion {
+                found: repr.version,
+                supported: SCHEMA_VERSION,
+            });
         }
         let origin = repr.origin.into_array();
         if !all_finite3(origin) {
@@ -530,7 +536,7 @@ mod tests {
     }
 
     fn ctx() -> EvaluationContext {
-        EvaluationContext::new(tol())
+        EvaluationContext::unlimited(tol())
     }
 
     fn dist2(a: Point2, b: Point2) -> f64 {
@@ -730,7 +736,7 @@ mod tests {
         )
         .unwrap();
         let permissive =
-            EvaluationContext::new(ToleranceContext::try_new(1.0, 0.0, 1e-10, 1.0).unwrap());
+            EvaluationContext::unlimited(ToleranceContext::try_new(1.0, 0.0, 1e-10, 1.0).unwrap());
         for query in [
             line.evaluate(3.0, DerivativeOrder::Position, &ctx())
                 .unwrap()
@@ -909,6 +915,14 @@ mod tests {
             serde_json::from_str::<Line2>(r#"{"origin":[1.0,2.0],"direction":[1.0,0.0]}"#).is_err(),
             "missing version must be rejected"
         );
+        // Item 6: exact-match — a different minor is now rejected too.
+        assert!(
+            serde_json::from_str::<Line2>(
+                r#"{"version":{"major":1,"minor":7},"origin":[1.0,2.0],"direction":[1.0,0.0]}"#
+            )
+            .is_err(),
+            "major=1 minor=7 must be rejected under exact-match"
+        );
     }
 
     #[test]
@@ -1071,7 +1085,7 @@ mod tests {
         )
         .unwrap();
         let permissive =
-            EvaluationContext::new(ToleranceContext::try_new(1.0, 0.0, 1e-10, 1.0).unwrap());
+            EvaluationContext::unlimited(ToleranceContext::try_new(1.0, 0.0, 1e-10, 1.0).unwrap());
         for query in [
             line.evaluate(-4.0, DerivativeOrder::Position, &ctx())
                 .unwrap()
@@ -1196,8 +1210,9 @@ mod tests {
         let q = Point2::try_new(1.0, 0.0).unwrap();
         // Very tight parametric tolerance — the certified parameter bound cannot
         // satisfy this.
-        let tight_ctx =
-            EvaluationContext::new(ToleranceContext::try_new(1.0, 0.0, 1e-10, 1e-300).unwrap());
+        let tight_ctx = EvaluationContext::unlimited(
+            ToleranceContext::try_new(1.0, 0.0, 1e-10, 1e-300).unwrap(),
+        );
         let result = line.project(q, &tight_ctx);
         assert!(
             result.is_err(),
@@ -1221,7 +1236,7 @@ mod tests {
         .unwrap();
         let q = Point2::try_new(1.0, 0.0).unwrap();
         let permissive_ctx =
-            EvaluationContext::new(ToleranceContext::try_new(1.0, 0.0, 1e-10, 1.0).unwrap());
+            EvaluationContext::unlimited(ToleranceContext::try_new(1.0, 0.0, 1e-10, 1.0).unwrap());
         let result = line.project(q, &permissive_ctx);
         assert!(
             result.is_ok(),

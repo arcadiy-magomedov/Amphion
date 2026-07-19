@@ -39,8 +39,6 @@
 //! this reason.
 #![allow(clippy::similar_names, clippy::many_single_char_names)]
 
-use std::f64::consts::TAU;
-
 use amphion_foundation::{NormalizationError, ToleranceContext};
 use num_bigint::BigInt;
 use num_rational::BigRational;
@@ -51,14 +49,6 @@ use crate::{CertificationBudget, GeometryError, ParameterRange};
 use super::ConstructionError;
 use super::exact::{f64_to_rat, rat_to_f64, rat_to_f64_down, rat_to_f64_up, sqrt_down, sqrt_up};
 use super::trig::{RatInterval, TrigError, atan2_interval, sin_cos_interval, tau_interval};
-
-/// Serde validation tolerance: accept vectors whose squared-norm differs from
-/// 1 by at most `4ε`, matching the magnitude-deviation guarantee of the
-/// `UnitVector2`/`UnitVector3` types introduced in foundation commit
-/// `670516d`. Honest round-tripped values produced by this module's own
-/// normalization have `||v||² − 1| ≤ 2ε`, so they pass with a `2×` margin;
-/// clearly corrupted or hand-crafted non-unit vectors are rejected.
-pub(super) const UNIT_VECTOR_TOL: f64 = 4.0 * f64::EPSILON;
 
 /// Converts a foundation [`NormalizationError`] into the analytic
 /// geometry crate's own [`ConstructionError`].
@@ -800,29 +790,86 @@ fn ratio_by_bracket(
     }
 }
 
-/// Maps any finite angle to a canonical representative in `[0, τ)`.
-#[must_use]
-pub(super) fn angle_to_full_turn(angle: f64) -> f64 {
-    let r = angle.rem_euclid(TAU);
-    if r >= TAU { 0.0 } else { r + 0.0 }
-}
-
 /// Reduces a certified angular interval to a canonical periodic representative
-/// plus a certified periodic (circular) error bound.
+/// in `[0, τ)` together with a certified error bound — **without** any
+/// `rem_euclid` reduction and never using the `f64` `τ` constant for the
+/// reduction itself.
 ///
-/// `theta_interval` must be an exact enclosure of the true angle already
-/// placed on the intended branch (e.g. `[0, 2π)` after the seam-side `+2π`
-/// correction). The returned `canonical` value lies in `[0, TAU)` and is
-/// immediately evaluable; the returned bound is a certified upper bound on the
-/// **periodic** distance `min_k |θ_true − (canonical + k·2π)|`.
+/// `theta_interval` must already be nominally placed in `[0, 2π)` by the
+/// caller (the projection helpers add the certified `tau_interval` when
+/// `atan2` returns a negative branch). Two certified cases are handled using
+/// only the rational `τ` enclosure `tau_int`:
 ///
-/// The bound is the interval half-width plus the midpoint rounding error
-/// (both certified upper bounds from [`interval_to_f64_bound`]); wrapping the
-/// midpoint into `[0, TAU)` shifts it by an exact multiple of a full turn and
-/// therefore does not change the periodic distance to the true angle.
-pub(super) fn certified_periodic_param(theta_interval: &RatInterval) -> (f64, f64) {
-    let (theta, err) = interval_to_f64_bound(theta_interval);
-    (angle_to_full_turn(theta), err)
+/// * **Interior** — when the whole interval is provably inside `[0, tau_int.lo)`
+///   (`lo ≥ 0` and `hi < tau_int.lo`), the nearest-`f64` midpoint is returned
+///   with the combined half-width and rounding error. If that midpoint rounds
+///   up to (or past) the `f64` `τ` constant, it is clamped down to the largest
+///   representable parameter and the clamp gap is folded into the bound so the
+///   emitted value always lies strictly inside `[0, TAU)`.
+/// * **Seam** — when the interval touches or crosses the `0 ≡ τ` seam
+///   (`lo < 0` or `hi ≥ tau_int.lo`), the canonical representative is `0`
+///   (matching the removed `rem_euclid` mapping `τ → 0`). The error bound is
+///   the largest mod-`τ` circular distance from `0` to any point of the
+///   interval, taken over both seam representatives (`0` and the certified `τ`
+///   enclosure), so a tight interval sitting just below a full turn still
+///   yields a small *periodic* bound.
+///
+/// # Errors
+///
+/// Returns [`GeometryError::Uncertified`] only when the certified `τ` interval
+/// cannot be computed within `budget`.
+pub(super) fn certified_periodic_param(
+    theta_interval: &RatInterval,
+    budget: CertificationBudget,
+) -> Result<(f64, f64), GeometryError> {
+    let tau_int = tau_interval(budget).map_err(trig_err_to_uncertified)?;
+
+    // Interior case: the whole interval is provably inside [0, τ) using the
+    // certified lower bound tau_int.lo ≤ τ, so no wrap-around is needed. This is
+    // the `rem_euclid`-free proof that the representative is already canonical.
+    if !theta_interval.lo.is_negative() && theta_interval.hi < tau_int.lo {
+        let (canonical, error_bound) = interval_to_f64_bound(theta_interval);
+        // A nonnegative interval midpoint never rounds negative, but it may
+        // round up to (or past) the `f64` τ constant when the true value sits
+        // just below `τ`. Clamp it to the largest representable parameter and
+        // fold the clamp gap into the certified bound.
+        if canonical >= core::f64::consts::TAU {
+            let clamped = core::f64::consts::TAU.next_down();
+            let extra = (canonical - clamped).abs();
+            return Ok((clamped, (error_bound + extra).next_up()));
+        }
+        return Ok((canonical, error_bound));
+    }
+
+    // Seam case: the interval sits at (or crosses) the 0 ≡ τ seam. The canonical
+    // representative is 0 — matching the removed `rem_euclid` mapping τ → 0 —
+    // and the certified error is the largest mod-τ circular distance from 0 to
+    // any point of the interval. The distance is built from the rational τ
+    // enclosure (never the f64 τ constant): the seam is 0 for points near the
+    // lower endpoint and τ for points near a full turn, so the minimum of the
+    // two representative distances is the tight periodic bound.
+    let t_lo = &theta_interval.lo;
+    let t_hi = &theta_interval.hi;
+    let tau_lo = &tau_int.lo;
+    let tau_hi = &tau_int.hi;
+
+    let dist_zero = {
+        let a = t_lo.abs();
+        let b = t_hi.abs();
+        if a >= b { a } else { b }
+    };
+    let dist_tau = {
+        let a = (t_hi - tau_lo).abs();
+        let b = (tau_hi - t_lo).abs();
+        if a >= b { a } else { b }
+    };
+    let bound_rat = if dist_zero <= dist_tau {
+        dist_zero
+    } else {
+        dist_tau
+    };
+
+    Ok((0.0, rat_to_f64_up(&bound_rat)))
 }
 
 /// Certified projection of `query` onto a 2-D circle
@@ -900,20 +947,6 @@ pub(super) fn exact_circle_project2(
         });
     }
 
-    // Certified upper bound on |sqrt(sq_inplane) − r|: both endpoints of
-    // [mag_down − r, mag_up − r] are exact (mag_down/mag_up/r are all
-    // exactly representable f64 values), so the interval's supremum
-    // absolute value is an exact, certified bound.
-    let dev_lo = &mag_down_r - &r;
-    let dev_hi = &mag_up_r - &r;
-    let max_abs_dev = if dev_lo.abs() >= dev_hi.abs() {
-        dev_lo.abs()
-    } else {
-        dev_hi.abs()
-    };
-    check_rational_budget(budget, &max_abs_dev)?;
-    let distance_bound = rat_to_f64_up(&max_abs_dev);
-
     let ux_interval = ratio_by_bracket(&gram_s, &mag_down_r, &mag_up_r);
     let uy_interval = ratio_by_bracket(&gram_t, &mag_down_r, &mag_up_r);
     let point_x = RatInterval::point(c[0].clone()).add(&ux_interval.scale(&(&r * &xa[0])));
@@ -922,6 +955,18 @@ pub(super) fn exact_circle_project2(
     let point_y = point_y.add(&uy_interval.scale(&(&r * &ya[1])));
     check_interval_budget(budget, &point_x)?;
     check_interval_budget(budget, &point_y)?;
+
+    // Certified distance bound is the full 2-D ‖q − P′‖ to the *returned*
+    // point interval, coherent with the emitted point rather than the radial
+    // |‖in-plane‖ − r| deviation (which is only exact for an orthonormal frame).
+    let qp_x = RatInterval::point(q[0].clone()).sub(&point_x);
+    let qp_y = RatInterval::point(q[1].clone()).sub(&point_y);
+    let sq_dist = qp_x.mul(&qp_x).add(&qp_y.mul(&qp_y));
+    check_interval_budget(budget, &sq_dist)?;
+    let distance_bound = sqrt_up(&sq_dist.hi).map_err(|()| GeometryError::Uncertified {
+        reason: "circle projection distance is negative (unreachable)".to_owned(),
+    })?;
+
     let (px, ex) = interval_to_f64_bound(&point_x);
     let (py, ey) = interval_to_f64_bound(&point_y);
     let point_residual_bound = combine2_bounds(ex, ey);
@@ -937,7 +982,7 @@ pub(super) fn exact_circle_project2(
     } else {
         theta_interval
     };
-    let (theta, theta_err) = certified_periodic_param(&theta_final);
+    let (theta, theta_err) = certified_periodic_param(&theta_final, budget)?;
 
     Ok(ExactCircleProjection {
         parameter: theta,
@@ -1016,35 +1061,23 @@ pub(super) fn exact_circle_project3(
         });
     }
 
-    let dev_lo = &mag_down_r - &r;
-    let dev_hi = &mag_up_r - &r;
-    let max_abs_dev = if dev_lo.abs() >= dev_hi.abs() {
-        dev_lo.abs()
-    } else {
-        dev_hi.abs()
-    };
-
     // Out-of-plane squared distance: use ||diff||² - in_plane_sq (exact,
     // independent of the stored normal direction). This correctly handles
     // non-unit/non-orthogonal stored axes without relying on a `cz = diff·normal`
     // component that would be incorrect for approximate frames.
     let sq_diff = &diff[0] * &diff[0] + &diff[1] * &diff[1] + &diff[2] * &diff[2];
-    let sq_out_of_plane_raw = &sq_diff - &in_plane_sq;
-    check_rational_budget(budget, &sq_out_of_plane_raw)?;
-    // Clamp to zero: numerically sq_out_of_plane could be tiny negative due
-    // to Gram projection slightly overestimating in_plane_sq; the true value
-    // is non-negative.
-    let sq_out_of_plane = if sq_out_of_plane_raw.is_negative() {
-        BigRational::zero()
-    } else {
-        sq_out_of_plane_raw
-    };
-
-    let sq_total = &max_abs_dev * &max_abs_dev + &sq_out_of_plane;
-    check_rational_budget(budget, &sq_total)?;
-    let distance_bound = sqrt_up(&sq_total).map_err(|()| GeometryError::Uncertified {
-        reason: "circle projection distance is negative (unreachable)".to_owned(),
-    })?;
+    let sq_out_of_plane = &sq_diff - &in_plane_sq;
+    check_rational_budget(budget, &sq_out_of_plane)?;
+    // A negative out-of-plane residual is geometrically impossible: it means
+    // the Gram in-plane component exceeds the total, which only happens when
+    // the stored frame is too far from orthonormal to certify. Reject rather
+    // than clamp to zero — clamping would silently emit a false certificate.
+    if sq_out_of_plane.is_negative() {
+        return Err(GeometryError::Uncertified {
+            reason: "circle3 Gram projection yields an impossible negative out-of-plane residual"
+                .to_owned(),
+        });
+    }
 
     let ux_interval = ratio_by_bracket(&gram_s, &mag_down_r, &mag_up_r);
     let uy_interval = ratio_by_bracket(&gram_t, &mag_down_r, &mag_up_r);
@@ -1057,6 +1090,19 @@ pub(super) fn exact_circle_project3(
     check_interval_budget(budget, &point_x)?;
     check_interval_budget(budget, &point_y)?;
     check_interval_budget(budget, &point_z)?;
+
+    // Certified distance bound is the full 3-D ‖q − P′‖ to the *returned*
+    // point interval, coherent with the emitted point (not a radial-plus-
+    // out-of-plane bound around an idealized in-plane foot).
+    let qp_x = RatInterval::point(q[0].clone()).sub(&point_x);
+    let qp_y = RatInterval::point(q[1].clone()).sub(&point_y);
+    let qp_z = RatInterval::point(q[2].clone()).sub(&point_z);
+    let sq_dist = qp_x.mul(&qp_x).add(&qp_y.mul(&qp_y)).add(&qp_z.mul(&qp_z));
+    check_interval_budget(budget, &sq_dist)?;
+    let distance_bound = sqrt_up(&sq_dist.hi).map_err(|()| GeometryError::Uncertified {
+        reason: "circle projection distance is negative (unreachable)".to_owned(),
+    })?;
+
     let (px, ex) = interval_to_f64_bound(&point_x);
     let (py, ey) = interval_to_f64_bound(&point_y);
     let (pz, ez) = interval_to_f64_bound(&point_z);
@@ -1073,7 +1119,7 @@ pub(super) fn exact_circle_project3(
     } else {
         theta_interval
     };
-    let (theta, theta_err) = certified_periodic_param(&theta_final);
+    let (theta, theta_err) = certified_periodic_param(&theta_final, budget)?;
 
     Ok(ExactCircleProjection {
         parameter: theta,
@@ -1289,17 +1335,6 @@ pub(super) fn exact_cylinder_project(
                 .to_owned(),
         });
     }
-
-    let dev_lo = &mag_down_r - &r;
-    let dev_hi = &mag_up_r - &r;
-    let max_abs_dev = if dev_lo.abs() >= dev_hi.abs() {
-        dev_lo.abs()
-    } else {
-        dev_hi.abs()
-    };
-    check_rational_budget(budget, &max_abs_dev)?;
-    let distance_bound = rat_to_f64_up(&max_abs_dev);
-
     let ux_interval = ratio_by_bracket(&gram_s, &mag_down_r, &mag_up_r);
     let uy_interval = ratio_by_bracket(&gram_t, &mag_down_r, &mag_up_r);
     let base_x = &o[0] + &v_exact * &ad[0];
@@ -1314,6 +1349,22 @@ pub(super) fn exact_cylinder_project(
     check_interval_budget(budget, &point_x)?;
     check_interval_budget(budget, &point_y)?;
     check_interval_budget(budget, &point_z)?;
+
+    // Certified distance bound is the full 3-D ‖q − P′‖ to the *returned*
+    // point interval — not just the radial `|‖in-plane‖ − r|` deviation. A
+    // radial-only bound is a false certificate whenever the stored frame is
+    // not exactly orthonormal: the returned point can carry an out-of-plane
+    // component (e.g. from an x-axis with a small axial leak) that a radial
+    // bound ignores.
+    let qp_x = RatInterval::point(q[0].clone()).sub(&point_x);
+    let qp_y = RatInterval::point(q[1].clone()).sub(&point_y);
+    let qp_z = RatInterval::point(q[2].clone()).sub(&point_z);
+    let sq_dist = qp_x.mul(&qp_x).add(&qp_y.mul(&qp_y)).add(&qp_z.mul(&qp_z));
+    check_interval_budget(budget, &sq_dist)?;
+    let distance_bound = sqrt_up(&sq_dist.hi).map_err(|()| GeometryError::Uncertified {
+        reason: "cylinder projection distance is negative (unreachable)".to_owned(),
+    })?;
+
     let (px, ex) = interval_to_f64_bound(&point_x);
     let (py, ey) = interval_to_f64_bound(&point_y);
     let (pz, ez) = interval_to_f64_bound(&point_z);
@@ -1330,7 +1381,7 @@ pub(super) fn exact_cylinder_project(
     } else {
         theta_interval
     };
-    let (u, u_err) = certified_periodic_param(&theta_final);
+    let (u, u_err) = certified_periodic_param(&theta_final, budget)?;
     finite_or_uncertified(
         &[u, v],
         "cylinder projection parameter overflowed f64 range",
@@ -1656,16 +1707,17 @@ fn exact_cone_project_nappe(
     let (pz, ez) = interval_to_f64_bound(&point_z);
     let point_residual_bound = combine3_bounds(ex, ey, ez);
 
-    let sq_dist_exact = &h * &h + &in_plane_sq;
-    let t_star_sq = t_star.mul(&t_star);
-    let sq_dist_interval = RatInterval::point(sq_dist_exact).sub(&t_star_sq);
-    check_interval_budget(budget, &sq_dist_interval)?;
-    let sq_dist_hi_bound = if sq_dist_interval.hi.is_negative() {
-        BigRational::zero()
-    } else {
-        sq_dist_interval.hi.clone()
-    };
-    let distance_bound = sqrt_up(&sq_dist_hi_bound).map_err(|()| GeometryError::Uncertified {
+    // Certified distance bound is the full 3-D ‖q − P′‖ to the *returned*
+    // point interval, coherent with the emitted point. The previous
+    // `h² + ‖in-plane‖² − t*²` foot-of-perpendicular form is only valid for an
+    // exactly orthonormal stored frame; the direct q-to-point distance stays
+    // certified even when the stored axes leak slightly out of the ideal cone.
+    let qp_x = RatInterval::point(q[0].clone()).sub(&point_x);
+    let qp_y = RatInterval::point(q[1].clone()).sub(&point_y);
+    let qp_z = RatInterval::point(q[2].clone()).sub(&point_z);
+    let sq_dist = qp_x.mul(&qp_x).add(&qp_y.mul(&qp_y)).add(&qp_z.mul(&qp_z));
+    check_interval_budget(budget, &sq_dist)?;
+    let distance_bound = sqrt_up(&sq_dist.hi).map_err(|()| GeometryError::Uncertified {
         reason: "cone projection distance is negative (unreachable)".to_owned(),
     })?;
     finite_or_uncertified(
@@ -1688,7 +1740,7 @@ fn exact_cone_project_nappe(
     } else {
         theta_interval
     };
-    let (u, u_err) = certified_periodic_param(&theta_final);
+    let (u, u_err) = certified_periodic_param(&theta_final, budget)?;
     let (v, v_err) = interval_to_f64_bound(&v_interval);
     finite_or_uncertified(&[u, v], "cone projection parameter overflowed f64 range")?;
 
@@ -1753,6 +1805,26 @@ pub(super) fn exact_cone_project(
     }
     let h = &dot_diff_ax / &ax_sq;
     check_rational_budget(budget, &h)?;
+
+    // Query exactly at the apex (`diff = 0`): the nearest cone point is the
+    // apex itself. Every azimuth is equally valid, so report the canonical
+    // parameterization `(u = 0, v = 0)` with a zero distance/residual rather
+    // than `Singular` — the apex is a genuine, unique nearest point, unlike
+    // an on-axis non-apex query (which has no unique azimuth).
+    if diff[0].is_zero() && diff[1].is_zero() && diff[2].is_zero() {
+        return Ok(ExactConeProjectionPair {
+            primary: ExactConeProjection {
+                u: 0.0,
+                v: 0.0,
+                u_error_bound: 0.0,
+                v_error_bound: 0.0,
+                point: apex,
+                point_residual_bound: 0.0,
+                distance_bound: 0.0,
+            },
+            secondary: None,
+        });
+    }
 
     // Compute positive nappe projection first (always needed).
     let pos =
@@ -1844,75 +1916,190 @@ pub(super) fn check_parametric_tolerance(
 
 /// Checks a certified derivative error bound against a caller-supplied limit.
 /// Returns `Uncertified` if the bound exceeds the limit.
-pub(super) fn check_derivative_limit(bound: f64, limit: Option<f64>) -> Result<(), GeometryError> {
-    if let Some(lim) = limit
-        && bound > lim
-    {
+///
+/// `limit` is always finite and non-negative (the derivative-limit newtypes
+/// guarantee it); `f64::MAX` means "no effective limit". The check is a plain
+/// `bound > limit` comparison, which can never be silently disabled by a NaN
+/// or `+∞` limit.
+pub(super) fn check_derivative_limit(bound: f64, limit: f64) -> Result<(), GeometryError> {
+    if bound > limit {
         return Err(GeometryError::Uncertified {
             reason: format!(
-                "certified derivative error bound {bound:.3e} exceeds caller limit {lim:.3e}"
+                "certified derivative error bound {bound:.3e} exceeds caller limit {limit:.3e}"
             ),
         });
     }
     Ok(())
 }
 
-/// Returns a certified upper bound on `| ‖axis‖ − 1 |` — the exact deviation
-/// of a stored (approximately unit) axis from its own ideal normalization —
-/// as an exact rational, or `None` when the axis is degenerate (zero length).
+/// Certified componentwise enclosure of the ideal unit vector `v / ‖v‖`.
 ///
-/// Because `ideal = axis / ‖axis‖`, the Euclidean deviation is exactly
-/// `‖axis − ideal‖ = ‖axis‖ · |‖axis‖ − 1| / ‖axis‖ = |‖axis‖ − 1|`. Using
-/// `|‖axis‖ − 1| = |‖axis‖² − 1| / (‖axis‖ + 1)` and a certified lower bound
-/// `‖axis‖_down ≤ ‖axis‖`, the quotient `|‖axis‖² − 1| / (‖axis‖_down + 1)`
-/// is a rigorous upper bound (the exact `‖axis‖²` is `Σ cᵢ²`). This replaces
-/// the previous scalar `radius · 4ε` guess with an actual proof derived from
-/// the stored bits.
-fn axis_unit_deviation_rat(axis: &[f64]) -> Option<BigRational> {
+/// Each returned interval encloses the corresponding component of the exact
+/// normalization of `v`, using the certified magnitude bracket
+/// `[sqrt_down(‖v‖²), sqrt_up(‖v‖²)]` and the sign-aware [`ratio_by_bracket`].
+/// Returns `None` when `v` has exact zero magnitude or the magnitude
+/// underflows the smallest positive `f64` (a degenerate axis the caller must
+/// treat as uncertifiable).
+fn ideal_unit_components(v: &[BigRational]) -> Option<Vec<RatInterval>> {
     let mut norm_sq = BigRational::zero();
-    for &c in axis {
-        let r = f64_to_rat(c);
-        norm_sq += &r * &r;
+    for c in v {
+        norm_sq += c * c;
     }
     if !norm_sq.is_positive() {
         return None;
     }
-    let norm_down = match sqrt_down(&norm_sq) {
-        Ok(value) if value > 0.0 => value,
-        _ => return None,
-    };
-    let one = BigRational::one();
-    let numer = if norm_sq >= one {
-        &norm_sq - &one
-    } else {
-        &one - &norm_sq
-    };
-    let denom = f64_to_rat(norm_down) + &one;
-    Some(numer / denom)
+    let mag_down = sqrt_down(&norm_sq).ok().filter(|&m| m > 0.0)?;
+    let mag_up = sqrt_up(&norm_sq).ok()?;
+    let mag_down_r = f64_to_rat(mag_down);
+    let mag_up_r = f64_to_rat(mag_up);
+    if mag_down_r.is_zero() {
+        return None;
+    }
+    Some(
+        v.iter()
+            .map(|c| ratio_by_bracket(c, &mag_down_r, &mag_up_r))
+            .collect(),
+    )
 }
 
-/// Computes a certified upper bound on the model-space position error
-/// introduced by the approximate (non-exactly-unit) stored basis axes.
+/// Certified `f64` upper bound on `‖stored − ideal‖`, where each `ideal[i]`
+/// is a certified enclosure of the i-th ideal-vector component.
 ///
-/// Each term is `(axis_components, coefficient)`. For an evaluation of the
-/// form `p = base + Σ coeffᵢ · axisᵢ`, the deviation from the ideal
-/// (unit-frame) primitive is bounded — by the triangle inequality — by
-/// `Σ |coeffᵢ| · ‖axisᵢ − idealᵢ‖ = Σ |coeffᵢ| · |‖axisᵢ‖ − 1|`, each factor
-/// being the certified rational bound from [`axis_unit_deviation_rat`].
-///
-/// Including this term in `position_error_bound` ensures the evaluate→project
-/// round-trip closes: the evaluate bound refers to the same ideal-unit-frame
-/// primitive as the exact-Gram projection. Returns `+∞` when any axis is
-/// degenerate (which forces the caller into an `Uncertified` result).
-pub(super) fn frame_deviation_bound_terms(terms: &[(&[f64], f64)]) -> f64 {
-    let mut acc = BigRational::zero();
-    for (axis, coeff) in terms {
-        match axis_unit_deviation_rat(axis) {
-            Some(dev) => acc += dev * f64_to_rat(coeff.abs()),
-            None => return f64::INFINITY,
-        }
+/// The per-component deviation is the larger endpoint distance
+/// `max(|stored − lo|, |stored − hi|)` (an exact rational); the vector bound
+/// is the outward [`sqrt_up`] of the summed squares.
+fn vector_deviation_bound(stored: &[BigRational], ideal: &[RatInterval]) -> f64 {
+    let mut sq = BigRational::zero();
+    for (s, comp) in stored.iter().zip(ideal.iter()) {
+        let dlo = (s - &comp.lo).abs();
+        let dhi = (s - &comp.hi).abs();
+        let d = if dlo >= dhi { dlo } else { dhi };
+        sq += &d * &d;
     }
-    rat_to_f64_up(&acc)
+    sqrt_up(&sq).unwrap_or(f64::INFINITY)
+}
+
+/// Certified upper bound on the model-space position error introduced by an
+/// approximate stored 2-D frame `(x_stored, y_stored)` relative to the ideal
+/// orthonormal frame `x_ideal = x_stored / ‖x_stored‖`,
+/// `y_ideal = perp2(x_ideal)`.
+///
+/// For an evaluation `p = base + cx·x_stored + cy·y_stored` with
+/// `|cx|, |cy| ≤ radial_scale`, the triangle inequality bounds the position
+/// error by `radial_scale · (‖x_stored − x_ideal‖ + ‖y_stored − y_ideal‖)`.
+/// The two per-axis deviations are certified exactly via
+/// [`vector_deviation_bound`] from componentwise ideal enclosures — not a
+/// magnitude-only `|‖axis‖ − 1|` proxy. Returns `+∞` for a degenerate x-axis
+/// (forcing the caller into an `Uncertified` result).
+pub(super) fn frame_deviation_bound_2d(
+    x_stored: [f64; 2],
+    y_stored: [f64; 2],
+    radial_scale: f64,
+) -> f64 {
+    let xs = to_rat2(x_stored);
+    let ys = to_rat2(y_stored);
+    let Some(x_ideal) = ideal_unit_components(&xs) else {
+        return f64::INFINITY;
+    };
+    // y_ideal = perp2(x_ideal) = (−x_ideal[1], x_ideal[0]).
+    let y_ideal = [x_ideal[1].neg(), x_ideal[0].clone()];
+    let dev_x = vector_deviation_bound(&xs, &x_ideal);
+    let dev_y = vector_deviation_bound(&ys, &y_ideal);
+    let total = radial_scale.abs() * (dev_x + dev_y);
+    if total.is_finite() {
+        total
+    } else {
+        f64::INFINITY
+    }
+}
+
+/// Certified upper bound on the model-space position error introduced by an
+/// approximate stored 3-D frame `(z_stored, x_stored, y_stored)` relative to
+/// its ideal orthonormal Gram–Schmidt frame, defined by
+///
+/// ```text
+/// z_ideal = z_stored / ||z_stored||
+/// x_ideal = normalize(x_stored - z_ideal*(x_stored . z_ideal))
+/// y_ideal = z_ideal x x_ideal
+/// ```
+///
+/// For a point `base + cx*x_stored + cy*y_stored + cz*z_stored` with `|cx|` and
+/// `|cy|` at most `radial_scale` and `|cz|` at most `axial_scale`, the triangle
+/// inequality bounds the position error by
+///
+/// ```text
+/// radial_scale*(||x_stored - x_ideal|| + ||y_stored - y_ideal||)
+///   + axial_scale*||z_stored - z_ideal||
+/// ```
+///
+/// Unlike a magnitude-only deviation, this captures the full Gram–Schmidt
+/// orthogonalization error, so an x-axis that is near-unit but *not
+/// orthogonal* to z (e.g. `z = (0,0,1)`, `x = (1,0,4eps)`) yields the correct
+/// `4eps` deviation rather than the spurious `eps^2` of a norm-only bound. The
+/// deviations are certified from exact componentwise ideal enclosures (the
+/// Gram–Schmidt subtraction is exact; the two normalizations and the cross
+/// product use outward-rounded intervals). Returns `+inf` for a degenerate z-
+/// or (post-projection) x-axis.
+pub(super) fn frame_deviation_bound_3d(
+    z_stored: [f64; 3],
+    x_stored: [f64; 3],
+    y_stored: [f64; 3],
+    radial_scale: f64,
+    axial_scale: f64,
+) -> f64 {
+    let zs = to_rat3(z_stored);
+    let xs = to_rat3(x_stored);
+    let ys = to_rat3(y_stored);
+
+    let Some(z_ideal) = ideal_unit_components(&zs) else {
+        return f64::INFINITY;
+    };
+
+    // Gram–Schmidt: remove the exact z-parallel part of x, then normalize.
+    let mut z_norm_sq = BigRational::zero();
+    let mut dot_xz = BigRational::zero();
+    for (zi, xi) in zs.iter().zip(xs.iter()) {
+        z_norm_sq += zi * zi;
+        dot_xz += xi * zi;
+    }
+    if !z_norm_sq.is_positive() {
+        return f64::INFINITY;
+    }
+    let coeff = &dot_xz / &z_norm_sq;
+    let x_perp = [
+        &xs[0] - &coeff * &zs[0],
+        &xs[1] - &coeff * &zs[1],
+        &xs[2] - &coeff * &zs[2],
+    ];
+    let Some(x_ideal) = ideal_unit_components(&x_perp) else {
+        return f64::INFINITY;
+    };
+
+    // y_ideal = z_ideal × x_ideal (interval cross product; already unit since
+    // z_ideal ⟂ x_ideal, so no renormalization is required — the enclosure
+    // simply widens slightly).
+    let y_ideal = [
+        z_ideal[1]
+            .mul(&x_ideal[2])
+            .sub(&z_ideal[2].mul(&x_ideal[1])),
+        z_ideal[2]
+            .mul(&x_ideal[0])
+            .sub(&z_ideal[0].mul(&x_ideal[2])),
+        z_ideal[0]
+            .mul(&x_ideal[1])
+            .sub(&z_ideal[1].mul(&x_ideal[0])),
+    ];
+
+    let dev_x = vector_deviation_bound(&xs, &x_ideal);
+    let dev_y = vector_deviation_bound(&ys, &y_ideal);
+    let dev_z = vector_deviation_bound(&zs, &z_ideal);
+
+    let total = radial_scale.abs() * (dev_x + dev_y) + axial_scale.abs() * dev_z;
+    if total.is_finite() {
+        total
+    } else {
+        f64::INFINITY
+    }
 }
 
 /// Computes a certified upper bound on `tan(half_angle)` using the certified
@@ -1938,17 +2125,17 @@ mod tests {
 
     use std::f64::consts::TAU;
 
-    use amphion_foundation::{NormalizationError, ToleranceContext, Vector2, Vector3};
+    use amphion_foundation::{NormalizationError, ToleranceContext};
     use num_bigint::BigInt;
     use num_rational::BigRational;
-    use num_traits::{One, Zero};
+    use num_traits::One;
 
     use super::super::trig::RatInterval;
     use super::{
-        UNIT_VECTOR_TOL, angle_to_full_turn, axis_unit_deviation_rat, certified_periodic_param,
-        check_angular_tolerance, check_tolerance, exact_affine_eval2, exact_affine_eval3,
-        exact_line_project2, exact_line_project3, exact_plane_project3,
-        frame_deviation_bound_terms, normalization_to_construction, rounding_error_bound,
+        certified_periodic_param, check_angular_tolerance, check_tolerance, exact_affine_eval2,
+        exact_affine_eval3, exact_cone_project, exact_cylinder_project, exact_line_project2,
+        exact_line_project3, exact_plane_project3, frame_deviation_bound_2d,
+        frame_deviation_bound_3d, normalization_to_construction, rounding_error_bound,
     };
     use crate::CertificationBudget;
     use crate::analytic::ConstructionError;
@@ -2062,43 +2249,67 @@ mod tests {
     }
 
     #[test]
-    fn angle_to_full_turn_seam_cases() {
-        assert_eq!(angle_to_full_turn(TAU), 0.0);
-        assert_eq!(angle_to_full_turn(0.0), 0.0);
-        assert!(angle_to_full_turn(-f64::MIN_POSITIVE) >= 0.0);
-        assert!(angle_to_full_turn(-f64::MIN_POSITIVE) < TAU);
-        let theta = angle_to_full_turn(TAU.next_down());
-        assert!(theta < TAU);
-        assert!(theta >= 0.0);
-    }
-
-    #[test]
-    fn certified_periodic_param_reduces_to_full_turn_on_both_seam_sides() {
-        // A tiny interval just above 0 (θ ≈ +δ) stays near 0.
+    fn certified_periodic_param_certifies_interior_interval() {
+        // A tiny interval just above 0 (θ ≈ +δ), well inside [0, τ), is
+        // certified and reduced to a near-0 representative with a small bound.
         let tiny = BigRational::new(BigInt::one(), BigInt::from(1_000_000i64));
         let near_zero = RatInterval {
             lo: tiny.clone(),
             hi: &tiny + &tiny,
         };
-        let (canon_lo, err_lo) = certified_periodic_param(&near_zero);
+        let budget = CertificationBudget::default();
+        let (canon_lo, err_lo) = certified_periodic_param(&near_zero, budget).unwrap();
         assert!((0.0..TAU).contains(&canon_lo));
         assert!(canon_lo < 1e-3);
         assert!((0.0..1e-3).contains(&err_lo));
 
-        // An interval just below a full turn (θ ≈ 2π − δ), produced on the
-        // other seam side, must also yield a canonical value in [0, TAU) with a
-        // small *periodic* error bound even though it sits at the far end.
+        // An interval comfortably below a full turn (θ ≈ 2π − δ for a small
+        // but non-seam δ) is still strictly inside [0, τ) and is certified.
         let two = BigRational::from_integer(BigInt::from(2i64));
-        // Use the certified π enclosure to build 2π − δ exactly.
-        let pi = crate::analytic::trig::pi_interval(crate::CertificationBudget::default()).unwrap();
+        let delta = BigRational::new(BigInt::one(), BigInt::from(1000i64));
+        let pi = crate::analytic::trig::pi_interval(budget).unwrap();
+        // Use the certified *lower* π bound to build 2·π_lo − δ, which is
+        // guaranteed < true 2π, hence inside [0, τ).
         let two_pi_lo = &pi.lo * &two;
         let near_turn = RatInterval {
-            lo: &two_pi_lo - &tiny,
-            hi: two_pi_lo.clone(),
+            lo: &two_pi_lo - &delta - &delta,
+            hi: &two_pi_lo - &delta,
         };
-        let (canon_hi, err_hi) = certified_periodic_param(&near_turn);
+        let (canon_hi, err_hi) = certified_periodic_param(&near_turn, budget).unwrap();
         assert!((0.0..TAU).contains(&canon_hi));
-        assert!((0.0..1e-3).contains(&err_hi));
+        assert!((0.0..1e-2).contains(&err_hi));
+    }
+
+    #[test]
+    fn certified_periodic_param_reduces_seam_to_zero() {
+        let budget = CertificationBudget::default();
+
+        // An interval straddling 0 from just below (θ ≈ ±δ) maps to the
+        // canonical seam representative 0 with a small periodic bound — no
+        // `rem_euclid`, no rejection.
+        let tiny = BigRational::new(BigInt::one(), BigInt::from(1_000_000i64));
+        let across_zero = RatInterval {
+            lo: -tiny.clone(),
+            hi: tiny.clone(),
+        };
+        let (canon_zero, err_zero) = certified_periodic_param(&across_zero, budget).unwrap();
+        assert_eq!(canon_zero, 0.0);
+        assert!((0.0..1e-3).contains(&err_zero));
+
+        // An interval just above a full turn (θ ≳ 2π, produced by adding the τ
+        // enclosure to a tiny negative `atan2` branch) also reduces to the
+        // canonical 0 with a small *periodic* bound rather than an out-of-range
+        // value near τ.
+        let two = BigRational::from_integer(BigInt::from(2i64));
+        let pi = crate::analytic::trig::pi_interval(budget).unwrap();
+        let two_pi_hi = &pi.hi * &two;
+        let near_turn = RatInterval {
+            lo: two_pi_hi.clone(),
+            hi: &two_pi_hi + &tiny,
+        };
+        let (canon_turn, err_turn) = certified_periodic_param(&near_turn, budget).unwrap();
+        assert_eq!(canon_turn, 0.0);
+        assert!((0.0..1e-3).contains(&err_turn));
     }
 
     #[test]
@@ -2109,51 +2320,121 @@ mod tests {
         assert!((rounded - 0.333_333_333_333_333_3).abs() < 1e-9);
     }
 
+    /// Item 2 regression: an exactly orthonormal 2-D frame has (near) zero
+    /// certified deviation, so it contributes no spurious position error.
     #[test]
-    fn unit_vector_tol_matches_foundation_deviation_guarantee() {
-        // UnitVector2/UnitVector3 guarantee a magnitude within 4*EPSILON of
-        // 1.0 (see `amphion_foundation::unit`); this crate's own tolerance
-        // for downstream orthogonality/consistency checks matches it.
-        assert!((UNIT_VECTOR_TOL - 4.0 * f64::EPSILON).abs() < f64::EPSILON);
-        let _ = Vector2::try_new(1.0, 0.0).unwrap();
-        let _ = Vector3::try_new(1.0, 0.0, 0.0).unwrap();
+    fn frame_deviation_bound_2d_orthonormal_is_zero() {
+        let bound = frame_deviation_bound_2d([1.0, 0.0], [0.0, 1.0], 5.0);
+        assert_eq!(bound, 0.0, "orthonormal 2-D frame must have zero deviation");
     }
 
-    /// Correction 10-C: an exactly-unit axis has zero certified deviation, and
-    /// a slightly non-unit stored axis has a small positive certified bound
-    /// equal to `|‖axis‖ − 1|`.
+    /// Item 2 regression: a degenerate 2-D x-axis forces `+∞` (Uncertified).
     #[test]
-    fn axis_unit_deviation_is_exact() {
-        // Exactly unit axis → deviation exactly 0.
-        let dev = axis_unit_deviation_rat(&[1.0, 0.0]).unwrap();
-        assert!(dev.is_zero(), "unit axis deviation must be exactly zero");
+    fn frame_deviation_bound_2d_degenerate_is_infinite() {
+        let bound = frame_deviation_bound_2d([0.0, 0.0], [0.0, 1.0], 1.0);
+        assert!(bound.is_infinite());
+    }
 
-        // Axis of norm 2 → |‖axis‖ − 1| = 1 exactly.
-        let dev2 = axis_unit_deviation_rat(&[2.0, 0.0]).unwrap();
-        assert_eq!(
-            dev2,
-            BigRational::one(),
-            "norm-2 axis deviates by exactly 1"
+    /// Item 2 regression: an exactly orthonormal 3-D frame has zero deviation.
+    #[test]
+    fn frame_deviation_bound_3d_orthonormal_is_zero() {
+        let bound =
+            frame_deviation_bound_3d([0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], 2.0, 3.0);
+        assert_eq!(bound, 0.0, "orthonormal 3-D frame must have zero deviation");
+    }
+
+    /// Item 2 counterexample regression (reviewer blocker 2): a near-unit but
+    /// **non-orthogonal** stored x-axis `x = (1, 0, 4ε)` against `z = (0,0,1)`
+    /// must yield the true `≈ 4ε` frame deviation, not the spurious `≈ ε²` of
+    /// a magnitude-only bound. This is what makes the `z≈(0,0,1), x=(1,0,4ε)`
+    /// cylinder projection certify honestly instead of emitting a false ε²
+    /// certificate.
+    #[test]
+    fn frame_deviation_bound_3d_captures_non_orthogonal_x_axis() {
+        let eps = f64::EPSILON;
+        let bound = frame_deviation_bound_3d(
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 4.0 * eps],
+            [0.0, 1.0, 0.0],
+            1.0,
+            0.0,
         );
-
-        // Degenerate axis → None.
-        assert!(axis_unit_deviation_rat(&[0.0, 0.0]).is_none());
+        // True deviation is 4ε ≈ 8.88e-16; certified value is that up to a
+        // 1-ulp outward rounding. It must be far above the ε² ≈ 4.9e-32 that a
+        // norm-only bound would (wrongly) report.
+        assert!(bound >= 3.5 * eps, "expected ≳ 4ε deviation, got {bound:e}");
+        assert!(bound <= 1e-14, "deviation far too large: {bound:e}");
+        assert!(
+            bound > 1e-20,
+            "bound collapsed to the spurious ε² magnitude-only value: {bound:e}"
+        );
     }
 
-    /// Correction 10-C: the frame-deviation bound scales with the coefficient
-    /// and is a valid non-negative upper bound; a degenerate axis forces `+∞`.
+    /// Item 2 regression: a degenerate 3-D z-axis forces `+∞` (Uncertified).
     #[test]
-    fn frame_deviation_bound_terms_is_upper_bound() {
-        // Two unit axes → zero bound regardless of coefficient.
-        let zero = frame_deviation_bound_terms(&[(&[1.0, 0.0], 5.0), (&[0.0, 1.0], 5.0)]);
-        assert_eq!(zero, 0.0);
+    fn frame_deviation_bound_3d_degenerate_is_infinite() {
+        let bound =
+            frame_deviation_bound_3d([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], 1.0, 1.0);
+        assert!(bound.is_infinite());
+    }
 
-        // A norm-2 axis with coefficient r contributes ≥ r·1 = r.
-        let bound = frame_deviation_bound_terms(&[(&[2.0, 0.0], 3.0)]);
-        assert!(bound >= 3.0, "expected bound ≥ 3.0, got {bound}");
+    /// Item 4 regression (reviewer blocker 2): a stored cylinder x-axis with a
+    /// `4ε` axial leak makes the returned point carry a `≈4ε` out-of-plane
+    /// z-component. The certified distance bound must be the full `‖q − P′‖`
+    /// (`≈4ε`), not the radial-only `≈ε²` that produced a false certificate.
+    #[test]
+    fn exact_cylinder_project_full_distance_captures_out_of_plane() {
+        let eps = f64::EPSILON;
+        let budget = CertificationBudget::default();
+        let result = exact_cylinder_project(
+            budget,
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            1.0,
+            [1.0, 0.0, 4.0 * eps],
+            [0.0, 1.0, 0.0],
+        )
+        .unwrap();
+        assert!(
+            result.distance_bound >= 3.5 * eps,
+            "distance bound collapsed below the true ≈4ε out-of-plane distance: {:e}",
+            result.distance_bound
+        );
+        assert!(
+            result.distance_bound <= 1e-14,
+            "distance bound implausibly large: {:e}",
+            result.distance_bound
+        );
+        assert!(
+            result.distance_bound > 1e-20,
+            "distance bound is the spurious radial-only ε² value: {:e}",
+            result.distance_bound
+        );
+    }
 
-        // Degenerate axis → +∞ (drives caller to Uncertified).
-        let degenerate = frame_deviation_bound_terms(&[(&[0.0, 0.0], 1.0)]);
-        assert!(degenerate.is_infinite());
+    /// Item 5 regression: a query exactly at the cone apex returns the
+    /// canonical parameterization `(u = 0, v = 0)` with the apex as the point
+    /// and zero certified distance/residual — never `Singular`.
+    #[test]
+    fn exact_cone_project_apex_returns_canonical_parameter() {
+        let budget = CertificationBudget::default();
+        let apex = [1.0, 2.0, 3.0];
+        let pair = exact_cone_project(
+            budget,
+            apex,
+            apex,
+            [0.0, 0.0, 1.0],
+            std::f64::consts::FRAC_PI_4,
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        )
+        .unwrap();
+        assert_eq!(pair.primary.u, 0.0);
+        assert_eq!(pair.primary.v, 0.0);
+        assert_eq!(pair.primary.point, apex);
+        assert_eq!(pair.primary.distance_bound, 0.0);
+        assert_eq!(pair.primary.point_residual_bound, 0.0);
+        assert!(pair.secondary.is_none());
     }
 }

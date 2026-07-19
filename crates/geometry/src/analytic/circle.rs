@@ -37,18 +37,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::traits::{Curve2Evaluator, Curve3Evaluator};
 use crate::{
-    AngularParameterBound, CurveEvaluation2, CurveEvaluation3, CurveFirstDerivativeLimit,
-    CurveKind, CurveProjection2, CurveProjection3, CurveSecondDerivativeLimit, DerivativeOrder,
-    DistanceBound, EvaluationContext, FirstDerivativeBound, GeometryError, ParameterErrorBound,
-    ParameterRange, ParameterValue, PositionBound, SecondDerivativeBound,
+    AngularParameterBound, CurveEvaluation2, CurveEvaluation3, CurveKind, CurveProjection2,
+    CurveProjection3, DerivativeOrder, DistanceBound, EvaluationContext, FirstDerivativeBound,
+    GeometryError, ParameterErrorBound, ParameterRange, ParameterValue, PositionBound,
+    SecondDerivativeBound,
 };
 
 use super::{
     ConstructionError, TransformError,
     helpers::{
-        ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite2, all_finite3, check_angular_tolerance,
-        check_derivative_limit, check_tolerance, dot3, exact_circle_eval2, exact_circle_eval3,
-        exact_circle_project2, exact_circle_project3, frame_deviation_bound_terms, in_range, mag2,
+        ILL_COND_THRESH, all_finite2, all_finite3, check_angular_tolerance, check_derivative_limit,
+        check_tolerance, dot3, exact_circle_eval2, exact_circle_eval3, exact_circle_project2,
+        exact_circle_project3, frame_deviation_bound_2d, frame_deviation_bound_3d, in_range, mag2,
         mag3, normalization_to_construction, perp2, scale3, sub3,
     },
     transform::similarity_scale,
@@ -152,8 +152,11 @@ impl Circle2 {
 impl TryFrom<Circle2Repr> for Circle2 {
     type Error = ConstructionError;
     fn try_from(repr: Circle2Repr) -> Result<Self, Self::Error> {
-        if repr.version.major() != SCHEMA_VERSION.major() {
-            return Err(ConstructionError::NonFiniteInput); // unsupported schema version
+        if repr.version != SCHEMA_VERSION {
+            return Err(ConstructionError::UnsupportedSchemaVersion {
+                found: repr.version,
+                supported: SCHEMA_VERSION,
+            });
         }
         let center = repr.center.into_array();
         if !all_finite2(center) || !repr.radius.is_finite() {
@@ -221,8 +224,8 @@ impl Curve2Evaluator for Circle2 {
         })?;
         // Include the certified frame-deviation bound (exact rational from the
         // stored axis bits) so evaluate→project round-trips close.
-        let raw_pos_bound = eval.position_error_bound
-            + frame_deviation_bound_terms(&[(&x_ax, self.radius), (&y_ax, self.radius)]);
+        let raw_pos_bound =
+            eval.position_error_bound + frame_deviation_bound_2d(x_ax, y_ax, self.radius);
         let position_error_bound =
             PositionBound::try_new(raw_pos_bound).map_err(|_| GeometryError::Uncertified {
                 reason: "position error bound overflowed representable range".to_owned(),
@@ -250,10 +253,7 @@ impl Curve2Evaluator for Circle2 {
             DerivativeOrder::First => {
                 check_derivative_limit(
                     first_error_bound.get(),
-                    context
-                        .derivative_limits()
-                        .first_or_du
-                        .map(CurveFirstDerivativeLimit::get),
+                    context.derivative_limits().curve.first.get(),
                 )?;
                 let v = Vector2::try_new(eval.first[0], eval.first[1]).map_err(|_| {
                     GeometryError::Uncertified {
@@ -265,17 +265,11 @@ impl Curve2Evaluator for Circle2 {
             DerivativeOrder::Second => {
                 check_derivative_limit(
                     first_error_bound.get(),
-                    context
-                        .derivative_limits()
-                        .first_or_du
-                        .map(CurveFirstDerivativeLimit::get),
+                    context.derivative_limits().curve.first.get(),
                 )?;
                 check_derivative_limit(
                     second_error_bound.get(),
-                    context
-                        .derivative_limits()
-                        .second_or_duu
-                        .map(CurveSecondDerivativeLimit::get),
+                    context.derivative_limits().curve.second.get(),
                 )?;
                 let v = Vector2::try_new(eval.first[0], eval.first[1]).map_err(|_| {
                     GeometryError::Uncertified {
@@ -376,7 +370,15 @@ struct Circle3Repr {
 /// p(θ) = center + r·cos θ·x_axis + r·sin θ·y_axis
 /// ```
 /// where `y_axis = normal × x_axis`, `r = radius`, domain `[0, 2π)`.
-/// `normal`, `x_axis`, and `y_axis` form a right-handed orthonormal frame.
+///
+/// [`Circle3::try_new`] Gram-Schmidt-orthonormalizes the supplied vectors, so
+/// a circle built through it carries a right-handed orthonormal frame. A
+/// circle deserialized from a `Circle3Repr`, however, keeps its stored
+/// `normal`/`x_axis` **as-is** (only `y_axis = normal × x_axis` is derived and
+/// linear independence is enforced); the frame is therefore only *nominally*
+/// orthonormal. The certified projection and evaluation paths do not assume
+/// exact orthonormality — they rigorously bound the deviation of the stored
+/// frame from the ideal one (see `frame_deviation_bound_3d`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "Circle3Repr", into = "Circle3Repr")]
 pub struct Circle3 {
@@ -510,8 +512,11 @@ impl Circle3 {
 impl TryFrom<Circle3Repr> for Circle3 {
     type Error = ConstructionError;
     fn try_from(repr: Circle3Repr) -> Result<Self, Self::Error> {
-        if repr.version.major() != SCHEMA_VERSION.major() {
-            return Err(ConstructionError::NonFiniteInput); // unsupported schema version
+        if repr.version != SCHEMA_VERSION {
+            return Err(ConstructionError::UnsupportedSchemaVersion {
+                found: repr.version,
+                supported: SCHEMA_VERSION,
+            });
         }
         let center = repr.center.into_array();
         if !all_finite3(center) || !repr.radius.is_finite() {
@@ -522,9 +527,12 @@ impl TryFrom<Circle3Repr> for Circle3 {
         }
         let n_unit = repr.normal;
         let x_unit = repr.x_axis;
-        if n_unit.dot(x_unit).abs() > UNIT_VECTOR_TOL {
-            return Err(ConstructionError::DependentAxes);
-        }
+        // The stored `(normal, x_axis)` pair is used as-is: the certified
+        // projection/evaluation paths rigorously bound any deviation of this
+        // frame from the ideal orthonormal one (see `frame_deviation_bound_3d`),
+        // so no near-orthogonality gate is required for a sound certificate.
+        // Linear independence is still enforced via the cross-product
+        // normalization below (a zero cross means the axes are parallel).
         let y_unit = UnitVector3::try_normalize(n_unit.cross(x_unit))
             .map_err(|_| ConstructionError::DependentAxes)?;
         Ok(Self {
@@ -571,6 +579,7 @@ impl Curve3Evaluator for Circle3 {
             return Err(GeometryError::OutsideDomain);
         }
         let c = self.center.into_array();
+        let n_ax = self.normal.into_array();
         let x_ax = self.x_axis.into_array();
         let y_ax = self.y_axis.into_array();
 
@@ -580,9 +589,11 @@ impl Curve3Evaluator for Circle3 {
                 reason: "circle position is non-finite".to_owned(),
             }
         })?;
-        // Include the certified frame-deviation bound (exact rational).
+        // Include the certified ideal-frame deviation bound (exact rational).
+        // Circle3 is planar (no axial term), so the axial scale is 0; the
+        // in-plane radial coefficient magnitude is bounded by the radius.
         let raw_pos_bound = eval.position_error_bound
-            + frame_deviation_bound_terms(&[(&x_ax, self.radius), (&y_ax, self.radius)]);
+            + frame_deviation_bound_3d(n_ax, x_ax, y_ax, self.radius, 0.0);
         let position_error_bound =
             PositionBound::try_new(raw_pos_bound).map_err(|_| GeometryError::Uncertified {
                 reason: "position error bound overflowed representable range".to_owned(),
@@ -610,10 +621,7 @@ impl Curve3Evaluator for Circle3 {
             DerivativeOrder::First => {
                 check_derivative_limit(
                     first_error_bound.get(),
-                    context
-                        .derivative_limits()
-                        .first_or_du
-                        .map(CurveFirstDerivativeLimit::get),
+                    context.derivative_limits().curve.first.get(),
                 )?;
                 let v = Vector3::try_new(eval.first[0], eval.first[1], eval.first[2]).map_err(
                     |_| GeometryError::Uncertified {
@@ -625,17 +633,11 @@ impl Curve3Evaluator for Circle3 {
             DerivativeOrder::Second => {
                 check_derivative_limit(
                     first_error_bound.get(),
-                    context
-                        .derivative_limits()
-                        .first_or_du
-                        .map(CurveFirstDerivativeLimit::get),
+                    context.derivative_limits().curve.first.get(),
                 )?;
                 check_derivative_limit(
                     second_error_bound.get(),
-                    context
-                        .derivative_limits()
-                        .second_or_duu
-                        .map(CurveSecondDerivativeLimit::get),
+                    context.derivative_limits().curve.second.get(),
                 )?;
                 let v = Vector3::try_new(eval.first[0], eval.first[1], eval.first[2]).map_err(
                     |_| GeometryError::Uncertified {
@@ -726,14 +728,15 @@ mod tests {
 
     use std::f64::consts::{FRAC_PI_2, TAU};
 
-    use amphion_foundation::{Point2, Point3, ToleranceContext, Vector2, Vector3};
+    use amphion_foundation::{Point2, Point3, SchemaVersion, ToleranceContext, Vector2, Vector3};
     use serde_json::json;
 
     use crate::analytic::helpers::ILL_COND_THRESH;
     use crate::traits::{Curve2Evaluator, Curve3Evaluator};
     use crate::{
-        CurveFirstDerivativeLimit, DerivativeLimits, DerivativeOrder, EvaluationContext,
-        GeometryError,
+        CertificationBudget, CurveDerivativeLimits, CurveFirstDerivativeLimit,
+        CurveSecondDerivativeLimit, DerivativeLimits, DerivativeOrder, EvaluationContext,
+        GeometryError, SurfaceDerivativeLimits,
     };
 
     use super::{Circle2, Circle2Repr, Circle3, Circle3Repr, ConstructionError};
@@ -743,7 +746,7 @@ mod tests {
     }
 
     fn ctx() -> EvaluationContext {
-        EvaluationContext::new(tol())
+        EvaluationContext::unlimited(tol())
     }
 
     fn dist2(a: Point2, b: Point2) -> f64 {
@@ -942,7 +945,7 @@ mod tests {
         )
         .unwrap();
         let q = Point2::try_new(1.0, 1.0).unwrap();
-        let result = c.project(q, &EvaluationContext::new(tol_1m));
+        let result = c.project(q, &EvaluationContext::unlimited(tol_1m));
         match result {
             Err(GeometryError::Uncertified { .. }) => {}
             Ok(projs) => {
@@ -1376,10 +1379,15 @@ mod tests {
         )
         .unwrap();
         // A limit of 0.0 on the first derivative is always too tight.
-        let strict_ctx = ctx().with_limits(DerivativeLimits {
-            first_or_du: Some(CurveFirstDerivativeLimit::try_new(0.0).unwrap()),
-            ..Default::default()
-        });
+        let limits = DerivativeLimits::new(
+            CurveDerivativeLimits::new(
+                CurveFirstDerivativeLimit::try_new(0.0).unwrap(),
+                CurveSecondDerivativeLimit::try_new(f64::MAX).unwrap(),
+            ),
+            SurfaceDerivativeLimits::unlimited(),
+        );
+        let strict_ctx =
+            EvaluationContext::try_new(tol(), CertificationBudget::default(), limits).unwrap();
         let result = circle.evaluate(0.5, DerivativeOrder::First, &strict_ctx);
         assert!(
             matches!(result, Err(GeometryError::Uncertified { .. })),
@@ -1424,18 +1432,72 @@ mod tests {
         );
     }
 
-    /// Correction 10-G: current major (any minor) is accepted.
+    /// Item 6: the schema version must match **exactly**. The current `1.0` is
+    /// accepted, but any other minor (previously accepted under a major-only
+    /// check) is now rejected with [`ConstructionError::UnsupportedSchemaVersion`].
     #[test]
-    fn circle2_serde_version_acceptance() {
-        for minor in [0u16, 7u16] {
-            let valid = serde_json::json!({
-                "version": {"major": 1, "minor": minor},
-                "center": [0.0, 0.0],
-                "radius": 1.0,
-                "x_axis": [1.0, 0.0]
-            });
-            let result: Result<Circle2, _> = serde_json::from_value(valid);
-            assert!(result.is_ok(), "major=1 minor={minor} should be accepted");
-        }
+    fn circle2_serde_version_exact_match() {
+        // Exact 1.0 is accepted.
+        let valid = serde_json::json!({
+            "version": {"major": 1, "minor": 0},
+            "center": [0.0, 0.0],
+            "radius": 1.0,
+            "x_axis": [1.0, 0.0]
+        });
+        assert!(
+            serde_json::from_value::<Circle2>(valid).is_ok(),
+            "exact major=1 minor=0 should be accepted"
+        );
+
+        // A different minor is now rejected exactly, carrying the found and
+        // supported versions.
+        let wrong_minor: Circle2Repr = serde_json::from_value(serde_json::json!({
+            "version": {"major": 1, "minor": 7},
+            "center": [0.0, 0.0],
+            "radius": 1.0,
+            "x_axis": [1.0, 0.0]
+        }))
+        .unwrap();
+        assert_eq!(
+            Circle2::try_from(wrong_minor),
+            Err(ConstructionError::UnsupportedSchemaVersion {
+                found: SchemaVersion::new(1, 7),
+                supported: SchemaVersion::new(1, 0),
+            }),
+            "major=1 minor=7 must be rejected under exact-match"
+        );
+    }
+
+    /// Item 6: `Circle3` also enforces exact schema-version matching.
+    #[test]
+    fn circle3_serde_version_exact_match() {
+        let valid = serde_json::json!({
+            "version": {"major": 1, "minor": 0},
+            "center": [0.0, 0.0, 0.0],
+            "radius": 1.0,
+            "normal": [0.0, 0.0, 1.0],
+            "x_axis": [1.0, 0.0, 0.0]
+        });
+        assert!(
+            serde_json::from_value::<Circle3>(valid).is_ok(),
+            "exact major=1 minor=0 should be accepted"
+        );
+
+        let wrong_minor: Circle3Repr = serde_json::from_value(serde_json::json!({
+            "version": {"major": 1, "minor": 7},
+            "center": [0.0, 0.0, 0.0],
+            "radius": 1.0,
+            "normal": [0.0, 0.0, 1.0],
+            "x_axis": [1.0, 0.0, 0.0]
+        }))
+        .unwrap();
+        assert_eq!(
+            Circle3::try_from(wrong_minor),
+            Err(ConstructionError::UnsupportedSchemaVersion {
+                found: SchemaVersion::new(1, 7),
+                supported: SchemaVersion::new(1, 0),
+            }),
+            "major=1 minor=7 must be rejected under exact-match"
+        );
     }
 }
