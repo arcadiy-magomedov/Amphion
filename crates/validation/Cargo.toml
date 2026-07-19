@@ -1,0 +1,15 @@
+[package]
+name = "amphion-validation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+amphion-foundation = { path = "../foundation" }
+amphion-geometry = { path = "../geometry" }
+amphion-topology = { path = "../topology" }
+
+[lints]
+workspace = true

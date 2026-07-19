@@ -1,0 +1,15 @@
+/target/
+**/*.rs.bk
+
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+.env
+.env.*
+
+qa/fuzz/artifacts/
+qa/fuzz/coverage/
+
