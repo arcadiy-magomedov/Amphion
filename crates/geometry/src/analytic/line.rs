@@ -32,8 +32,9 @@ use crate::{
 use super::{
     ConstructionError,
     helpers::{
-        add2, add3, all_finite2, all_finite3, dot2, dot3, mag2_sq, mag3_sq, normalize2, normalize3,
-        scale2, scale3, sub2, sub3,
+        add2, add3, all_finite2, all_finite3, dot2, dot3, normalize2, normalize3, scale2, scale3,
+        sub2, sub3, validate_unit2, validate_unit3, widened_distance_bound2,
+        widened_distance_bound3,
     },
 };
 
@@ -81,7 +82,9 @@ impl Line2 {
         }
         let d_unit = normalize2(d).ok_or(ConstructionError::DegenerateAxis)?;
         Ok(Self {
+            // unreachable: validated above
             origin: Point2::try_new(o[0], o[1]).expect("origin is already validated finite"),
+            // unreachable: validated above
             direction: Vector2::try_new(d_unit[0], d_unit[1]).expect("unit direction is finite"),
         })
     }
@@ -102,7 +105,16 @@ impl Line2 {
 impl TryFrom<Line2Repr> for Line2 {
     type Error = ConstructionError;
     fn try_from(repr: Line2Repr) -> Result<Self, Self::Error> {
-        Self::try_new(repr.origin, repr.direction)
+        let origin = repr.origin.into_array();
+        let direction = repr.direction.into_array();
+        if !all_finite2(origin) || !all_finite2(direction) {
+            return Err(ConstructionError::NonFiniteInput);
+        }
+        validate_unit2(direction)?;
+        Ok(Self {
+            origin: repr.origin,
+            direction: repr.direction,
+        })
     }
 }
 
@@ -185,10 +197,7 @@ impl Curve2Evaluator for Line2 {
             Point2::try_new(proj_arr[0], proj_arr[1]).map_err(|_| GeometryError::Uncertified {
                 reason: "line projection point is non-finite".to_owned(),
             })?;
-        // Perpendicular distance: sqrt(|diff|² − t²), clamped to avoid negative
-        // floating-point residuals.
-        let dist_sq = (mag2_sq(diff) - t * t).max(0.0);
-        let dist = dist_sq.sqrt();
+        let dist = widened_distance_bound2(q, proj_arr);
         output.push(CurveProjection2 {
             parameter: ParameterValue::try_new(t).map_err(|_| GeometryError::Uncertified {
                 reason: "line projection parameter is non-finite".to_owned(),
@@ -240,7 +249,9 @@ impl Line3 {
         }
         let d_unit = normalize3(d).ok_or(ConstructionError::DegenerateAxis)?;
         Ok(Self {
+            // unreachable: validated above
             origin: Point3::try_new(o[0], o[1], o[2]).expect("origin is already validated finite"),
+            // unreachable: validated above
             direction: Vector3::try_new(d_unit[0], d_unit[1], d_unit[2])
                 .expect("unit direction is finite"),
         })
@@ -262,7 +273,16 @@ impl Line3 {
 impl TryFrom<Line3Repr> for Line3 {
     type Error = ConstructionError;
     fn try_from(repr: Line3Repr) -> Result<Self, Self::Error> {
-        Self::try_new(repr.origin, repr.direction)
+        let origin = repr.origin.into_array();
+        let direction = repr.direction.into_array();
+        if !all_finite3(origin) || !all_finite3(direction) {
+            return Err(ConstructionError::NonFiniteInput);
+        }
+        validate_unit3(direction)?;
+        Ok(Self {
+            origin: repr.origin,
+            direction: repr.direction,
+        })
     }
 }
 
@@ -348,8 +368,7 @@ impl Curve3Evaluator for Line3 {
                 reason: "line projection point is non-finite".to_owned(),
             }
         })?;
-        let dist_sq = (mag3_sq(diff) - t * t).max(0.0);
-        let dist = dist_sq.sqrt();
+        let dist = widened_distance_bound3(q, proj_arr);
         output.push(CurveProjection3 {
             parameter: ParameterValue::try_new(t).map_err(|_| GeometryError::Uncertified {
                 reason: "line projection parameter is non-finite".to_owned(),
@@ -372,14 +391,27 @@ mod tests {
     use std::f64::consts::SQRT_2;
 
     use amphion_foundation::{Point2, Point3, ToleranceContext, Vector2, Vector3};
+    use serde_json::json;
 
     use crate::traits::{Curve2Evaluator, Curve3Evaluator};
     use crate::{DerivativeOrder, GeometryError};
 
-    use super::{ConstructionError, Line2, Line3};
+    use super::{ConstructionError, Line2, Line2Repr, Line3, Line3Repr};
 
     fn tol() -> ToleranceContext {
         ToleranceContext::try_new(1e-9, 1e-8, 1e-10, 1e-12).unwrap()
+    }
+
+    fn dist2(a: Point2, b: Point2) -> f64 {
+        let [ax, ay] = a.into_array();
+        let [bx, by] = b.into_array();
+        (ax - bx).hypot(ay - by)
+    }
+
+    fn dist3(a: Point3, b: Point3) -> f64 {
+        let [ax, ay, az] = a.into_array();
+        let [bx, by, bz] = b.into_array();
+        (ax - bx).hypot((ay - by).hypot(az - bz))
     }
 
     // ── Line2 ────────────────────────────────────────────────────────────────
@@ -548,7 +580,30 @@ mod tests {
         // foot should be at (3, 0)
         assert!((proj.point.x() - 3.0).abs() < 1e-12);
         assert!(proj.point.y().abs() < 1e-12);
-        assert!((proj.distance_bound.get() - 4.0).abs() < 1e-12);
+        assert!(4.0 <= proj.distance_bound.get());
+    }
+
+    #[test]
+    fn line2_distance_bounds_certify_actual_distance_at_extreme_scales() {
+        let line = Line2::try_new(
+            Point2::try_new(1.0, -2.0).unwrap(),
+            Vector2::try_new(1.0, 1.0).unwrap(),
+        )
+        .unwrap();
+        for query in [
+            line.evaluate(3.0, DerivativeOrder::Position)
+                .unwrap()
+                .position,
+            Point2::try_new(3.0, 4.0).unwrap(),
+            Point2::try_new(1.0e12, 1.0e12 + 2.0).unwrap(),
+            Point2::try_new(1.0e-12, -2.0e-12).unwrap(),
+            Point2::try_new(10.0, 10.0 + 1.0e-12).unwrap(),
+        ] {
+            let projection = line.project(query, &tol()).unwrap().remove(0);
+            let actual = dist2(query, projection.point);
+            assert!(actual <= projection.distance_bound.get(), "{query:?}");
+            assert!(projection.distance_bound.get() >= 0.0);
+        }
     }
 
     #[test]
@@ -570,16 +625,38 @@ mod tests {
 
     #[test]
     fn line2_serde_round_trip() {
-        // Use a coordinate-aligned direction so normalization is a no-op and
-        // the serde round-trip is bit-identical.
         let line = Line2::try_new(
             Point2::try_new(1.0, 2.0).unwrap(),
-            Vector2::try_new(0.0, 1.0).unwrap(),
+            Vector2::try_new(1.0, 1.0).unwrap(),
         )
         .unwrap();
         let json = serde_json::to_string(&line).unwrap();
         let decoded: Line2 = serde_json::from_str(&json).unwrap();
         assert_eq!(line, decoded);
+    }
+
+    #[test]
+    fn line2_serde_rejects_non_unit_direction() {
+        let repr: Line2Repr = serde_json::from_value(json!({
+            "origin": [1.0, 2.0],
+            "direction": [2.0, 0.0]
+        }))
+        .unwrap();
+        assert_eq!(
+            Line2::try_from(repr),
+            Err(ConstructionError::DegenerateAxis)
+        );
+    }
+
+    #[test]
+    fn line2_serde_rejects_nan_and_inf_fields() {
+        assert!(
+            serde_json::from_str::<Line2>(r#"{"origin":[NaN,0.0],"direction":[1.0,0.0]}"#).is_err()
+        );
+        assert!(
+            serde_json::from_str::<Line2>(r#"{"origin":[0.0,0.0],"direction":[Infinity,0.0]}"#)
+                .is_err()
+        );
     }
 
     // ── Line3 ────────────────────────────────────────────────────────────────
@@ -683,11 +760,61 @@ mod tests {
     fn line3_serde_round_trip() {
         let line = Line3::try_new(
             Point3::try_new(1.0, -2.0, 3.0).unwrap(),
-            Vector3::try_new(0.0, 1.0, 0.0).unwrap(),
+            Vector3::try_new(1.0, 1.0, 1.0).unwrap(),
         )
         .unwrap();
         let json = serde_json::to_string(&line).unwrap();
         let decoded: Line3 = serde_json::from_str(&json).unwrap();
         assert_eq!(line, decoded);
+    }
+
+    #[test]
+    fn line3_distance_bounds_certify_actual_distance_at_extreme_scales() {
+        let line = Line3::try_new(
+            Point3::try_new(1.0, -2.0, 0.5).unwrap(),
+            Vector3::try_new(1.0, 1.0, 1.0).unwrap(),
+        )
+        .unwrap();
+        for query in [
+            line.evaluate(-4.0, DerivativeOrder::Position)
+                .unwrap()
+                .position,
+            Point3::try_new(3.0, 4.0, 5.0).unwrap(),
+            Point3::try_new(1.0e12, 1.0e12 + 2.0, 1.0e12 - 1.0).unwrap(),
+            Point3::try_new(1.0e-12, -2.0e-12, 3.0e-12).unwrap(),
+            Point3::try_new(10.0, 10.0 + 1.0e-12, 10.0 - 1.0e-12).unwrap(),
+        ] {
+            let projection = line.project(query, &tol()).unwrap().remove(0);
+            let actual = dist3(query, projection.point);
+            assert!(actual <= projection.distance_bound.get(), "{query:?}");
+            assert!(projection.distance_bound.get() >= 0.0);
+        }
+    }
+
+    #[test]
+    fn line3_serde_rejects_non_unit_direction() {
+        let repr: Line3Repr = serde_json::from_value(json!({
+            "origin": [1.0, 2.0, 3.0],
+            "direction": [2.0, 0.0, 0.0]
+        }))
+        .unwrap();
+        assert_eq!(
+            Line3::try_from(repr),
+            Err(ConstructionError::DegenerateAxis)
+        );
+    }
+
+    #[test]
+    fn line3_serde_rejects_nan_and_inf_fields() {
+        assert!(
+            serde_json::from_str::<Line3>(r#"{"origin":[NaN,0.0,0.0],"direction":[1.0,0.0,0.0]}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<Line3>(
+                r#"{"origin":[0.0,0.0,0.0],"direction":[Infinity,0.0,0.0]}"#
+            )
+            .is_err()
+        );
     }
 }

@@ -46,8 +46,8 @@ use crate::{
 use super::{
     ConstructionError,
     helpers::{
-        add3, all_finite3, angle_to_full_turn, cross3, dot3, in_range, mag3, normalize3, scale3,
-        sub3,
+        ILL_COND_THRESH, add3, all_finite3, angle_to_full_turn, cross3, dot3, in_range, mag3,
+        normalize3, scale3, sub3, validate_orthogonal3, validate_unit3, widened_distance_bound3,
     },
 };
 
@@ -96,6 +96,8 @@ impl Cylinder {
     /// - [`ConstructionError::DegenerateAxis`] — zero-length axis or x-axis
     /// - [`ConstructionError::NotPositive`] — `radius <= 0`
     /// - [`ConstructionError::DependentAxes`] — `x_axis` parallel to `axis_dir`
+    /// - [`ConstructionError::IllConditionedAxes`] — `x_axis` nearly parallel
+    ///   to `axis_dir`
     pub fn try_new(
         axis_origin: Point3,
         axis_dir: Vector3,
@@ -116,12 +118,22 @@ impl Cylinder {
         // Orthogonalize x against axis_dir.
         let dot_xa = dot3(x_norm, a_unit);
         let x_perp = sub3(x_norm, scale3(a_unit, dot_xa));
+        let perp_mag = mag3(x_perp);
+        if perp_mag == 0.0 {
+            return Err(ConstructionError::DependentAxes);
+        }
+        if perp_mag < ILL_COND_THRESH {
+            return Err(ConstructionError::IllConditionedAxes);
+        }
         let x_unit = normalize3(x_perp).ok_or(ConstructionError::DependentAxes)?;
         Ok(Self {
+            // unreachable: validated above
             axis_origin: Point3::try_new(o[0], o[1], o[2]).expect("origin validated finite"),
+            // unreachable: validated above
             axis_dir: Vector3::try_new(a_unit[0], a_unit[1], a_unit[2])
                 .expect("unit axis_dir is finite"),
             radius,
+            // unreachable: validated above
             x_axis: Vector3::try_new(x_unit[0], x_unit[1], x_unit[2])
                 .expect("unit x_axis is finite"),
         })
@@ -164,7 +176,28 @@ impl Cylinder {
 impl TryFrom<CylinderRepr> for Cylinder {
     type Error = ConstructionError;
     fn try_from(repr: CylinderRepr) -> Result<Self, Self::Error> {
-        Self::try_new(repr.axis_origin, repr.axis_dir, repr.radius, repr.x_axis)
+        let axis_origin = repr.axis_origin.into_array();
+        let axis_dir = repr.axis_dir.into_array();
+        let x_axis = repr.x_axis.into_array();
+        if !all_finite3(axis_origin)
+            || !all_finite3(axis_dir)
+            || !repr.radius.is_finite()
+            || !all_finite3(x_axis)
+        {
+            return Err(ConstructionError::NonFiniteInput);
+        }
+        if repr.radius <= 0.0 {
+            return Err(ConstructionError::NotPositive);
+        }
+        validate_unit3(axis_dir)?;
+        validate_unit3(x_axis)?;
+        validate_orthogonal3(axis_dir, x_axis)?;
+        Ok(Self {
+            axis_origin: repr.axis_origin,
+            axis_dir: repr.axis_dir,
+            radius: repr.radius,
+            x_axis: repr.x_axis,
+        })
     }
 }
 
@@ -266,7 +299,7 @@ impl SurfaceEvaluator for Cylinder {
     fn project_into(
         &self,
         point: Point3,
-        _tolerance: &ToleranceContext,
+        tolerance: &ToleranceContext,
         output: &mut Vec<SurfaceProjection>,
     ) -> Result<(), GeometryError> {
         output.clear();
@@ -280,8 +313,7 @@ impl SurfaceEvaluator for Cylinder {
         let v_val = dot3(diff, a);
         let radial_vec = sub3(diff, scale3(a, v_val));
         let radial_len = mag3(radial_vec);
-        if radial_len == 0.0 {
-            // Point is exactly on the cylinder axis; every u is equidistant.
+        if radial_len < tolerance.absolute_length() {
             return Err(GeometryError::Singular);
         }
         let u_val = angle_to_full_turn(dot3(radial_vec, y).atan2(dot3(radial_vec, x)));
@@ -295,9 +327,7 @@ impl SurfaceEvaluator for Cylinder {
                 reason: "cylinder projection point is non-finite".to_owned(),
             }
         })?;
-        // Radial distance from cylinder surface.
-        let dist = (radial_len - r).abs();
-        output.push(SurfaceProjection {
+        let local = SurfaceProjection {
             u: ParameterValue::try_new(u_val).map_err(|_| GeometryError::Uncertified {
                 reason: "cylinder projection u is non-finite".to_owned(),
             })?,
@@ -305,12 +335,13 @@ impl SurfaceEvaluator for Cylinder {
                 reason: "cylinder projection v is non-finite".to_owned(),
             })?,
             point: proj,
-            distance_bound: DistanceBound::try_new(dist).map_err(|_| {
-                GeometryError::Uncertified {
+            distance_bound: DistanceBound::try_new(widened_distance_bound3(q, proj_arr)).map_err(
+                |_| GeometryError::Uncertified {
                     reason: "cylinder projection distance is non-finite or negative".to_owned(),
-                }
-            })?,
-        });
+                },
+            )?,
+        };
+        output.push(local);
         Ok(())
     }
 }
@@ -322,14 +353,22 @@ mod tests {
     use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
     use amphion_foundation::{Point3, ToleranceContext, Vector3};
+    use serde_json::json;
 
+    use crate::analytic::helpers::ILL_COND_THRESH;
     use crate::traits::SurfaceEvaluator;
     use crate::{DerivativeOrder, GeometryError};
 
-    use super::{ConstructionError, Cylinder};
+    use super::{ConstructionError, Cylinder, CylinderRepr};
 
     fn tol() -> ToleranceContext {
         ToleranceContext::try_new(1e-9, 1e-8, 1e-10, 1e-12).unwrap()
+    }
+
+    fn dist3(a: Point3, b: Point3) -> f64 {
+        let [ax, ay, az] = a.into_array();
+        let [bx, by, bz] = b.into_array();
+        (ax - bx).hypot((ay - by).hypot(az - bz))
     }
 
     fn unit_cylinder() -> Cylinder {
@@ -382,6 +421,18 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, ConstructionError::DependentAxes);
+    }
+
+    #[test]
+    fn cylinder_construction_rejects_ill_conditioned_axes() {
+        let err = Cylinder::try_new(
+            Point3::try_new(0.0, 0.0, 0.0).unwrap(),
+            Vector3::try_new(0.0, 0.0, 1.0).unwrap(),
+            1.0,
+            Vector3::try_new(ILL_COND_THRESH / 2.0, 0.0, 1.0).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(err, ConstructionError::IllConditionedAxes);
     }
 
     #[test]
@@ -548,6 +599,8 @@ mod tests {
         // Point on the Z-axis: all u equidistant.
         let q = Point3::try_new(0.0, 0.0, 3.0).unwrap();
         assert_eq!(c.project(q, &tol()), Err(GeometryError::Singular));
+        let near_axis = Point3::try_new(0.5e-9, 0.0, 3.0).unwrap();
+        assert_eq!(c.project(near_axis, &tol()), Err(GeometryError::Singular));
     }
 
     #[test]
@@ -580,13 +633,139 @@ mod tests {
     fn cylinder_serde_round_trip() {
         let c = Cylinder::try_new(
             Point3::try_new(1.0, 2.0, 3.0).unwrap(),
-            Vector3::try_new(0.0, 1.0, 0.0).unwrap(),
+            Vector3::try_new(
+                1.0 / 3.0_f64.sqrt(),
+                1.0 / 3.0_f64.sqrt(),
+                1.0 / 3.0_f64.sqrt(),
+            )
+            .unwrap(),
             2.5,
-            Vector3::try_new(1.0, 0.0, 0.0).unwrap(),
+            Vector3::try_new(1.0 / 2.0_f64.sqrt(), -1.0 / 2.0_f64.sqrt(), 0.0).unwrap(),
         )
         .unwrap();
         let json = serde_json::to_string(&c).unwrap();
         let decoded: Cylinder = serde_json::from_str(&json).unwrap();
         assert_eq!(c, decoded);
+    }
+
+    #[test]
+    fn cylinder_distance_bounds_certify_actual_distance_at_extreme_scales() {
+        let tiny_tol = ToleranceContext::try_new(1e-15, 1e-8, 1e-10, 1e-12).unwrap();
+        let unit = unit_cylinder();
+        let tiny = Cylinder::try_new(
+            Point3::try_new(0.0, 0.0, 0.0).unwrap(),
+            Vector3::try_new(0.0, 0.0, 1.0).unwrap(),
+            1.0e-12,
+            Vector3::try_new(1.0, 0.0, 0.0).unwrap(),
+        )
+        .unwrap();
+        for (cylinder, query, tolerance) in [
+            (
+                unit.clone(),
+                unit.evaluate(0.25, 2.0, DerivativeOrder::Position)
+                    .unwrap()
+                    .position,
+                tol(),
+            ),
+            (unit.clone(), Point3::try_new(2.0, 0.0, 3.0).unwrap(), tol()),
+            (
+                unit.clone(),
+                Point3::try_new(1.0e12, 1.0, 3.0).unwrap(),
+                tol(),
+            ),
+            (
+                tiny.clone(),
+                Point3::try_new(2.0e-12, 0.0, 3.0e-12).unwrap(),
+                tiny_tol,
+            ),
+            (
+                unit.clone(),
+                Point3::try_new(1.0, 1.0e-12, 2.0).unwrap(),
+                tol(),
+            ),
+        ] {
+            let projection = cylinder.project(query, &tolerance).unwrap().remove(0);
+            let actual = dist3(query, projection.point);
+            assert!(actual <= projection.distance_bound.get(), "{query:?}");
+            assert!(projection.distance_bound.get() >= 0.0);
+            assert!(projection.u.get() < TAU);
+        }
+    }
+
+    #[test]
+    fn cylinder_project_into_clears_output_on_error() {
+        let c = unit_cylinder();
+        let mut output = c
+            .project(Point3::try_new(1.0, 0.0, 0.0).unwrap(), &tol())
+            .unwrap();
+        let err = c.project_into(Point3::try_new(0.0, 0.0, 3.0).unwrap(), &tol(), &mut output);
+        assert_eq!(err, Err(GeometryError::Singular));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn cylinder_projection_seam_stays_in_range() {
+        let c = unit_cylinder();
+        let eps = 1e-12_f64;
+        for u in [TAU - eps, eps] {
+            let query = c
+                .evaluate(u, 1.0, DerivativeOrder::Position)
+                .unwrap()
+                .position;
+            let projection = c.project(query, &tol()).unwrap().remove(0);
+            assert!(projection.u.get() >= 0.0);
+            assert!(projection.u.get() < TAU);
+        }
+    }
+
+    #[test]
+    fn cylinder_serde_rejects_bad_axis_radius_and_orthogonality() {
+        let bad_axis: CylinderRepr = serde_json::from_value(json!({
+            "axis_origin": [1.0, 2.0, 3.0],
+            "axis_dir": [2.0, 0.0, 0.0],
+            "radius": 2.5,
+            "x_axis": [0.0, 1.0, 0.0]
+        }))
+        .unwrap();
+        assert_eq!(
+            Cylinder::try_from(bad_axis),
+            Err(ConstructionError::DegenerateAxis)
+        );
+
+        let bad_frame: CylinderRepr = serde_json::from_value(json!({
+            "axis_origin": [1.0, 2.0, 3.0],
+            "axis_dir": [1.0, 0.0, 0.0],
+            "radius": 2.5,
+            "x_axis": [1.0, 0.0, 0.0]
+        }))
+        .unwrap();
+        assert_eq!(
+            Cylinder::try_from(bad_frame),
+            Err(ConstructionError::DependentAxes)
+        );
+
+        let bad_radius: CylinderRepr = serde_json::from_value(json!({
+            "axis_origin": [1.0, 2.0, 3.0],
+            "axis_dir": [0.0, 0.0, 1.0],
+            "radius": 0.0,
+            "x_axis": [1.0, 0.0, 0.0]
+        }))
+        .unwrap();
+        assert_eq!(
+            Cylinder::try_from(bad_radius),
+            Err(ConstructionError::NotPositive)
+        );
+    }
+
+    #[test]
+    fn cylinder_serde_rejects_nan_and_inf_fields() {
+        assert!(serde_json::from_str::<Cylinder>(
+            r#"{"axis_origin":[NaN,0.0,0.0],"axis_dir":[0.0,0.0,1.0],"radius":1.0,"x_axis":[1.0,0.0,0.0]}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<Cylinder>(
+            r#"{"axis_origin":[0.0,0.0,0.0],"axis_dir":[Infinity,0.0,1.0],"radius":1.0,"x_axis":[1.0,0.0,0.0]}"#
+        )
+        .is_err());
     }
 }

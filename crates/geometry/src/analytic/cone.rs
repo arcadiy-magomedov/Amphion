@@ -40,7 +40,7 @@
     clippy::similar_names
 )]
 
-use std::f64::consts::TAU;
+use std::f64::consts::{PI, TAU};
 
 use amphion_foundation::{Point3, ToleranceContext, Vector3};
 use serde::{Deserialize, Serialize};
@@ -54,8 +54,8 @@ use crate::{
 use super::{
     ConstructionError,
     helpers::{
-        add3, all_finite3, angle_to_full_turn, cross3, dot3, in_range, mag3, normalize3, scale3,
-        sub3,
+        ILL_COND_THRESH, add3, all_finite3, angle_to_full_turn, cross3, dot3, in_range, mag3,
+        normalize3, scale3, sub3, validate_orthogonal3, validate_unit3, widened_distance_bound3,
     },
 };
 
@@ -104,6 +104,8 @@ impl Cone {
     /// - [`ConstructionError::DegenerateAxis`] — zero-length `axis` or `x_axis`
     /// - [`ConstructionError::InvalidHalfAngle`] — `half_angle ∉ (0, π/2)`
     /// - [`ConstructionError::DependentAxes`] — `x_axis` parallel to `axis`
+    /// - [`ConstructionError::IllConditionedAxes`] — `x_axis` nearly parallel
+    ///   to `axis`
     pub fn try_new(
         apex: Point3,
         axis: Vector3,
@@ -124,11 +126,21 @@ impl Cone {
         // Orthogonalize x against axis.
         let dot_xa = dot3(x_norm, a_unit);
         let x_perp = sub3(x_norm, scale3(a_unit, dot_xa));
+        let perp_mag = mag3(x_perp);
+        if perp_mag == 0.0 {
+            return Err(ConstructionError::DependentAxes);
+        }
+        if perp_mag < ILL_COND_THRESH {
+            return Err(ConstructionError::IllConditionedAxes);
+        }
         let x_unit = normalize3(x_perp).ok_or(ConstructionError::DependentAxes)?;
         Ok(Self {
+            // unreachable: validated above
             apex: Point3::try_new(ap[0], ap[1], ap[2]).expect("apex validated finite"),
+            // unreachable: validated above
             axis: Vector3::try_new(a_unit[0], a_unit[1], a_unit[2]).expect("unit axis is finite"),
             half_angle,
+            // unreachable: validated above
             x_axis: Vector3::try_new(x_unit[0], x_unit[1], x_unit[2])
                 .expect("unit x_axis is finite"),
         })
@@ -171,7 +183,28 @@ impl Cone {
 impl TryFrom<ConeRepr> for Cone {
     type Error = ConstructionError;
     fn try_from(repr: ConeRepr) -> Result<Self, Self::Error> {
-        Self::try_new(repr.apex, repr.axis, repr.half_angle, repr.x_axis)
+        let apex = repr.apex.into_array();
+        let axis = repr.axis.into_array();
+        let x_axis = repr.x_axis.into_array();
+        if !all_finite3(apex)
+            || !all_finite3(axis)
+            || !repr.half_angle.is_finite()
+            || !all_finite3(x_axis)
+        {
+            return Err(ConstructionError::NonFiniteInput);
+        }
+        if repr.half_angle <= 0.0 || repr.half_angle >= std::f64::consts::FRAC_PI_2 {
+            return Err(ConstructionError::InvalidHalfAngle);
+        }
+        validate_unit3(axis)?;
+        validate_unit3(x_axis)?;
+        validate_orthogonal3(axis, x_axis)?;
+        Ok(Self {
+            apex: repr.apex,
+            axis: repr.axis,
+            half_angle: repr.half_angle,
+            x_axis: repr.x_axis,
+        })
     }
 }
 
@@ -292,7 +325,7 @@ impl SurfaceEvaluator for Cone {
     fn project_into(
         &self,
         point: Point3,
-        _tolerance: &ToleranceContext,
+        tolerance: &ToleranceContext,
         output: &mut Vec<SurfaceProjection>,
     ) -> Result<(), GeometryError> {
         output.clear();
@@ -309,8 +342,7 @@ impl SurfaceEvaluator for Cone {
         let radial_vec = sub3(d, scale3(a, h)); // radial component vector
         let r = mag3(radial_vec);
 
-        if r == 0.0 {
-            // Point is on the cone axis; every u is equidistant.
+        if r < tolerance.absolute_length() {
             return Err(GeometryError::Singular);
         }
 
@@ -323,10 +355,14 @@ impl SurfaceEvaluator for Cone {
         let t1 = h * cos_a + r * sin_a; // projection parameter on nappe 1
         let t2 = -h * cos_a + r * sin_a; // projection parameter on nappe 2
 
-        let mut push_nappe = |t: f64, sign: f64| -> Result<(), GeometryError> {
-            // v = sign * t * cos_a  (sign distinguishes nappes)
+        let project_nappe = |t: f64, sign: f64| -> Result<SurfaceProjection, GeometryError> {
             let v_val = sign * t * cos_a;
-            let (cos_u, sin_u) = (u_val.cos(), u_val.sin());
+            let u_proj = if sign.is_sign_positive() {
+                u_val
+            } else {
+                angle_to_full_turn(u_val + PI)
+            };
+            let (cos_u, sin_u) = (u_proj.cos(), u_proj.sin());
             let radial_dir = add3(scale3(x, cos_u), scale3(y, sin_u));
             let proj_arr = add3(
                 ap,
@@ -337,14 +373,11 @@ impl SurfaceEvaluator for Cone {
                     reason: "cone projection point is non-finite".to_owned(),
                 }
             })?;
-            // Numerically stable perpendicular distance in the axial-radial half-plane.
-            // For nappe 1 (sign=+1): dist = |h·sin α − r·cos α|
-            // For nappe 2 (sign=−1): dist = |h·sin α + r·cos α|
-            // Both collapse to zero for points already on the respective nappe,
-            // avoiding the catastrophic cancellation in sqrt(|d|²−t²).
-            let dist = (h * sin_a - sign * r * cos_a).abs();
-            output.push(SurfaceProjection {
-                u: ParameterValue::try_new(u_val).map_err(|_| GeometryError::Uncertified {
+            let stable_dist = (h * sin_a - sign * r * cos_a).abs();
+            let widened_dist = widened_distance_bound3(q, proj_arr);
+            let dist = stable_dist.max(widened_dist);
+            Ok(SurfaceProjection {
+                u: ParameterValue::try_new(u_proj).map_err(|_| GeometryError::Uncertified {
                     reason: "cone u is non-finite".to_owned(),
                 })?,
                 v: ParameterValue::try_new(v_val).map_err(|_| GeometryError::Uncertified {
@@ -356,27 +389,37 @@ impl SurfaceEvaluator for Cone {
                         reason: "cone distance is non-finite or negative".to_owned(),
                     }
                 })?,
-            });
-            Ok(())
+            })
         };
 
+        let mut local = Vec::with_capacity(2);
         match (t1 > 0.0, t2 > 0.0) {
             (true, true) => {
-                // t1 == t2 iff h == 0: equatorial point, both nappes equidistant.
-                if t1 >= t2 {
-                    push_nappe(t1, 1.0)?;
-                }
-                if t2 >= t1 {
-                    push_nappe(t2, -1.0)?;
+                let cand1 = project_nappe(t1, 1.0)?;
+                let cand2 = project_nappe(t2, -1.0)?;
+                let dist1 = cand1.distance_bound.get();
+                let dist2 = cand2.distance_bound.get();
+                let dist_tol = tolerance.absolute_length();
+                if dist1 < dist2 - dist_tol {
+                    local.push(cand1);
+                } else if dist2 < dist1 - dist_tol {
+                    local.push(cand2);
+                } else {
+                    local.push(cand1);
+                    local.push(cand2);
                 }
             }
-            (true, false) => push_nappe(t1, 1.0)?,
-            (false, true) => push_nappe(t2, -1.0)?,
-            (false, false) => {
-                // Both projections land at the apex (impossible for r > 0).
-                return Err(GeometryError::Singular);
-            }
+            (true, false) => local.push(project_nappe(t1, 1.0)?),
+            (false, true) => local.push(project_nappe(t2, -1.0)?),
+            (false, false) => return Err(GeometryError::Singular),
         }
+        local.sort_by(|lhs, rhs| {
+            lhs.u
+                .get()
+                .total_cmp(&rhs.u.get())
+                .then(lhs.v.get().total_cmp(&rhs.v.get()))
+        });
+        output.extend(local);
         Ok(())
     }
 }
@@ -388,14 +431,28 @@ mod tests {
     use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};
 
     use amphion_foundation::{Point3, ToleranceContext, Vector3};
+    use serde_json::json;
 
+    use crate::analytic::helpers::ILL_COND_THRESH;
     use crate::traits::SurfaceEvaluator;
     use crate::{DerivativeOrder, GeometryError};
 
-    use super::{Cone, ConstructionError};
+    use super::{Cone, ConeRepr, ConstructionError};
 
     fn tol() -> ToleranceContext {
         ToleranceContext::try_new(1e-9, 1e-8, 1e-10, 1e-12).unwrap()
+    }
+
+    fn dist3(a: Point3, b: Point3) -> f64 {
+        let [ax, ay, az] = a.into_array();
+        let [bx, by, bz] = b.into_array();
+        (ax - bx).hypot((ay - by).hypot(az - bz))
+    }
+
+    fn angle_error(actual: f64, expected: f64) -> f64 {
+        let tau = TAU;
+        let delta = (actual - expected).rem_euclid(tau);
+        delta.min(tau - delta)
     }
 
     fn std_cone() -> Cone {
@@ -459,6 +516,18 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, ConstructionError::DependentAxes);
+    }
+
+    #[test]
+    fn cone_construction_rejects_ill_conditioned_axes() {
+        let err = Cone::try_new(
+            Point3::try_new(0.0, 0.0, 0.0).unwrap(),
+            Vector3::try_new(0.0, 0.0, 1.0).unwrap(),
+            FRAC_PI_4,
+            Vector3::try_new(ILL_COND_THRESH / 2.0, 0.0, 1.0).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(err, ConstructionError::IllConditionedAxes);
     }
 
     #[test]
@@ -645,45 +714,64 @@ mod tests {
     fn cone_projection_round_trip_nappe1() {
         let c = std_cone();
         for (u0, v0) in [(0.0_f64, 1.0), (1.0, 2.0), (PI, 0.5), (5.0, 3.0)] {
-            let pt = c
+            let q = c
                 .evaluate(u0, v0, DerivativeOrder::Position)
                 .unwrap()
                 .position;
-            let projs = c.project(pt, &tol()).unwrap();
-            assert!(!projs.is_empty(), "u={u0} v={v0}");
-            // Find the projection with v closest to v0.
-            let best = projs
-                .iter()
-                .min_by(|a, b| {
-                    (a.v.get() - v0)
-                        .abs()
-                        .partial_cmp(&(b.v.get() - v0).abs())
-                        .unwrap()
-                })
-                .unwrap();
-            assert!((best.u.get() - u0).abs() < 1e-10, "u round-trip u={u0}");
-            assert!((best.v.get() - v0).abs() < 1e-10, "v round-trip v={v0}");
-            assert!(best.distance_bound.get() < 1e-10);
+            let proj = c.project(q, &tol()).unwrap().remove(0);
+            assert!(angle_error(proj.u.get(), u0) < 1e-10, "u={u0}");
+            assert!((proj.v.get() - v0).abs() < 1e-10, "v={v0}");
+            assert!(dist3(q, proj.point) <= proj.distance_bound.get());
         }
     }
 
     #[test]
-    fn cone_projection_equatorial_returns_two() {
-        // Point in the equatorial plane (h = 0) projects to both nappes equally.
+    fn cone_projection_round_trip_negative_nappe() {
         let c = std_cone();
-        // p at u=0, v=1 is (1, 0, 1). Radial at h=0, r=1:
-        // project (0, 1) to nappe1 t1 = 0*cos(π/4) + 1*sin(π/4) = 1/√2 > 0
-        // t2 = 0*cos(π/4) + 1*sin(π/4) = 1/√2 > 0 and t1==t2
-        let q = Point3::try_new(1.0, 0.0, 0.0).unwrap(); // h=0, r=1
+        for u0 in [0.0_f64, FRAC_PI_2, PI, 3.0 * PI / 2.0] {
+            for v0 in [-0.5_f64, -1.0, -3.0] {
+                let q = c
+                    .evaluate(u0, v0, DerivativeOrder::Position)
+                    .unwrap()
+                    .position;
+                let proj = c
+                    .project(q, &tol())
+                    .unwrap()
+                    .into_iter()
+                    .find(|candidate| (candidate.v.get() - v0).abs() < 1e-10)
+                    .unwrap();
+                assert!(angle_error(proj.u.get(), u0) < 1e-10, "u={u0}");
+                assert!((proj.v.get() - v0).abs() < 1e-10, "v={v0}");
+                let eval = c
+                    .evaluate(proj.u.get(), proj.v.get(), DerivativeOrder::Position)
+                    .unwrap();
+                assert!(dist3(eval.position, q) < 1e-11, "u={u0} v={v0}");
+                assert!(proj.distance_bound.get() < 1e-10);
+            }
+        }
+    }
+
+    #[test]
+    fn cone_projection_equatorial_returns_correct_two_points() {
+        let c = std_cone();
+        let q = Point3::try_new(1.0, 0.0, 0.0).unwrap();
         let projs = c.project(q, &tol()).unwrap();
-        assert_eq!(projs.len(), 2, "equatorial point should give 2 projections");
-        // Both should have same distance bound.
-        let d0 = projs[0].distance_bound.get();
-        let d1 = projs[1].distance_bound.get();
-        assert!(
-            (d0 - d1).abs() < 1e-12,
-            "both projections should be equidistant"
-        );
+        assert_eq!(projs.len(), 2);
+        let sin_a = FRAC_PI_4.sin();
+        let cos_a = FRAC_PI_4.cos();
+        let expected = [
+            [sin_a * sin_a, 0.0, sin_a * cos_a],
+            [sin_a * sin_a, 0.0, -sin_a * cos_a],
+        ];
+        for (proj, expected_point) in projs.iter().zip(expected) {
+            let actual = proj.point.into_array();
+            for i in 0..3 {
+                assert!((actual[i] - expected_point[i]).abs() < 1e-12);
+            }
+            assert!(dist3(q, proj.point) <= proj.distance_bound.get());
+        }
+        assert!(projs[0].u.get() < projs[1].u.get());
+        assert!((projs[0].distance_bound.get() - projs[1].distance_bound.get()).abs() < 1e-9);
     }
 
     #[test]
@@ -691,6 +779,8 @@ mod tests {
         let c = std_cone();
         let q = Point3::try_new(0.0, 0.0, 5.0).unwrap();
         assert_eq!(c.project(q, &tol()), Err(GeometryError::Singular));
+        let near_axis = Point3::try_new(0.5e-9, 0.0, 5.0).unwrap();
+        assert_eq!(c.project(near_axis, &tol()), Err(GeometryError::Singular));
     }
 
     #[test]
@@ -723,13 +813,186 @@ mod tests {
     fn cone_serde_round_trip() {
         let c = Cone::try_new(
             Point3::try_new(1.0, 2.0, 3.0).unwrap(),
-            Vector3::try_new(0.0, 0.0, 1.0).unwrap(),
+            Vector3::try_new(
+                1.0 / 3.0_f64.sqrt(),
+                1.0 / 3.0_f64.sqrt(),
+                1.0 / 3.0_f64.sqrt(),
+            )
+            .unwrap(),
             0.5,
-            Vector3::try_new(1.0, 0.0, 0.0).unwrap(),
+            Vector3::try_new(1.0 / 2.0_f64.sqrt(), -1.0 / 2.0_f64.sqrt(), 0.0).unwrap(),
         )
         .unwrap();
         let json = serde_json::to_string(&c).unwrap();
         let decoded: Cone = serde_json::from_str(&json).unwrap();
         assert_eq!(c, decoded);
+    }
+
+    #[test]
+    fn cone_projection_round_trip_negative_nappe_in_rotated_frame() {
+        let c = Cone::try_new(
+            Point3::try_new(1.0, -2.0, 0.5).unwrap(),
+            Vector3::try_new(1.0, 1.0, 1.0).unwrap(),
+            0.5,
+            Vector3::try_new(1.0, -1.0, 0.0).unwrap(),
+        )
+        .unwrap();
+        let u0 = PI / 3.0;
+        let v0 = -2.0;
+        let q = c
+            .evaluate(u0, v0, DerivativeOrder::Position)
+            .unwrap()
+            .position;
+        let proj = c
+            .project(q, &tol())
+            .unwrap()
+            .into_iter()
+            .find(|candidate| (candidate.v.get() - v0).abs() < 1e-10)
+            .unwrap();
+        assert!(angle_error(proj.u.get(), u0) < 1e-10);
+        assert!((proj.v.get() - v0).abs() < 1e-10);
+        assert!(dist3(q, proj.point) <= proj.distance_bound.get());
+    }
+
+    #[test]
+    fn cone_distance_bounds_certify_actual_distance_at_extreme_scales() {
+        let tiny_tol = ToleranceContext::try_new(1e-15, 1e-8, 1e-10, 1e-12).unwrap();
+        let unit = std_cone();
+        let tiny = Cone::try_new(
+            Point3::try_new(0.0, 0.0, 0.0).unwrap(),
+            Vector3::try_new(0.0, 0.0, 1.0).unwrap(),
+            FRAC_PI_4,
+            Vector3::try_new(1.0, 0.0, 0.0).unwrap(),
+        )
+        .unwrap();
+        for (cone, query, tolerance) in [
+            (
+                unit.clone(),
+                unit.evaluate(0.25, 2.0, DerivativeOrder::Position)
+                    .unwrap()
+                    .position,
+                tol(),
+            ),
+            (unit.clone(), Point3::try_new(2.0, 0.0, 3.0).unwrap(), tol()),
+            (
+                unit.clone(),
+                Point3::try_new(1.0e12, 1.0, 1.0e12).unwrap(),
+                tol(),
+            ),
+            (
+                tiny.clone(),
+                Point3::try_new(2.0e-12, 0.0, 1.0e-12).unwrap(),
+                tiny_tol,
+            ),
+            (
+                unit.clone(),
+                Point3::try_new(1.0, 1.0e-12, 1.0 + 1.0e-12).unwrap(),
+                tol(),
+            ),
+        ] {
+            let projections = cone.project(query, &tolerance).unwrap();
+            for projection in projections {
+                let actual = dist3(query, projection.point);
+                assert!(actual <= projection.distance_bound.get(), "{query:?}");
+                assert!(projection.distance_bound.get() >= 0.0);
+                assert!(projection.u.get() < TAU);
+            }
+        }
+    }
+
+    #[test]
+    fn cone_projection_near_equator_returns_two_when_distances_tie() {
+        let c = std_cone();
+        let q = Point3::try_new(1.0, 0.0, 1.0e-12).unwrap();
+        let projs = c.project(q, &tol()).unwrap();
+        assert_eq!(projs.len(), 2);
+    }
+
+    #[test]
+    fn cone_projection_handles_apex_adjacent_queries() {
+        let c = std_cone();
+        let q = Point3::try_new(1.0e-6, 0.0, 1.0e-9).unwrap();
+        let projs = c.project(q, &tol()).unwrap();
+        assert!(!projs.is_empty());
+        for projection in projs {
+            assert!(projection.distance_bound.get() >= 0.0);
+        }
+    }
+
+    #[test]
+    fn cone_project_into_clears_output_on_error() {
+        let c = std_cone();
+        let mut output = c
+            .project(Point3::try_new(1.0, 0.0, 1.0).unwrap(), &tol())
+            .unwrap();
+        let err = c.project_into(Point3::try_new(0.0, 0.0, 5.0).unwrap(), &tol(), &mut output);
+        assert_eq!(err, Err(GeometryError::Singular));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn cone_projection_seam_stays_in_range() {
+        let c = std_cone();
+        let eps = 1e-12_f64;
+        for u in [TAU - eps, eps] {
+            let q = c
+                .evaluate(u, 2.0, DerivativeOrder::Position)
+                .unwrap()
+                .position;
+            let projection = c.project(q, &tol()).unwrap().remove(0);
+            assert!(projection.u.get() >= 0.0);
+            assert!(projection.u.get() < TAU);
+        }
+    }
+
+    #[test]
+    fn cone_serde_rejects_bad_axis_angle_and_orthogonality() {
+        let bad_axis: ConeRepr = serde_json::from_value(json!({
+            "apex": [1.0, 2.0, 3.0],
+            "axis": [2.0, 0.0, 0.0],
+            "half_angle": 0.5,
+            "x_axis": [0.0, 1.0, 0.0]
+        }))
+        .unwrap();
+        assert_eq!(
+            Cone::try_from(bad_axis),
+            Err(ConstructionError::DegenerateAxis)
+        );
+
+        let bad_frame: ConeRepr = serde_json::from_value(json!({
+            "apex": [1.0, 2.0, 3.0],
+            "axis": [1.0, 0.0, 0.0],
+            "half_angle": 0.5,
+            "x_axis": [1.0, 0.0, 0.0]
+        }))
+        .unwrap();
+        assert_eq!(
+            Cone::try_from(bad_frame),
+            Err(ConstructionError::DependentAxes)
+        );
+
+        let bad_angle: ConeRepr = serde_json::from_value(json!({
+            "apex": [1.0, 2.0, 3.0],
+            "axis": [0.0, 0.0, 1.0],
+            "half_angle": 0.0,
+            "x_axis": [1.0, 0.0, 0.0]
+        }))
+        .unwrap();
+        assert_eq!(
+            Cone::try_from(bad_angle),
+            Err(ConstructionError::InvalidHalfAngle)
+        );
+    }
+
+    #[test]
+    fn cone_serde_rejects_nan_and_inf_fields() {
+        assert!(serde_json::from_str::<Cone>(
+            r#"{"apex":[NaN,0.0,0.0],"axis":[0.0,0.0,1.0],"half_angle":0.5,"x_axis":[1.0,0.0,0.0]}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<Cone>(
+            r#"{"apex":[0.0,0.0,0.0],"axis":[Infinity,0.0,1.0],"half_angle":0.5,"x_axis":[1.0,0.0,0.0]}"#
+        )
+        .is_err());
     }
 }

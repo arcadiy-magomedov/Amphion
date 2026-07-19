@@ -35,7 +35,10 @@ use crate::{
 
 use super::{
     ConstructionError,
-    helpers::{add3, all_finite3, cross3, dot3, mag3, normalize3, scale3, sub3},
+    helpers::{
+        ILL_COND_THRESH, add3, all_finite3, cross3, dot3, mag3, normalize3, scale3, sub3,
+        validate_orthogonal3, validate_unit3, widened_distance_bound3,
+    },
 };
 
 fn unbounded_range() -> ParameterRange {
@@ -72,6 +75,8 @@ impl Plane {
     /// - [`ConstructionError::NonFiniteInput`] — any NaN/Inf component
     /// - [`ConstructionError::DegenerateAxis`] — zero-length `u_axis` or `v_axis`
     /// - [`ConstructionError::DependentAxes`] — `u_axis` parallel to `v_axis`
+    /// - [`ConstructionError::IllConditionedAxes`] — `v_axis` nearly parallel
+    ///   to `u_axis`
     pub fn try_new(
         origin: Point3,
         u_axis: Vector3,
@@ -88,11 +93,21 @@ impl Plane {
         // Orthogonalize v against u.
         let dot_vu = dot3(v_norm, u_unit);
         let v_perp = sub3(v_norm, scale3(u_unit, dot_vu));
+        let perp_mag = mag3(v_perp);
+        if perp_mag == 0.0 {
+            return Err(ConstructionError::DependentAxes);
+        }
+        if perp_mag < ILL_COND_THRESH {
+            return Err(ConstructionError::IllConditionedAxes);
+        }
         let v_unit = normalize3(v_perp).ok_or(ConstructionError::DependentAxes)?;
         Ok(Self {
+            // unreachable: validated above
             origin: Point3::try_new(o[0], o[1], o[2]).expect("origin validated finite"),
+            // unreachable: validated above
             u_axis: Vector3::try_new(u_unit[0], u_unit[1], u_unit[2])
                 .expect("unit u_axis is finite"),
+            // unreachable: validated above
             v_axis: Vector3::try_new(v_unit[0], v_unit[1], v_unit[2])
                 .expect("unit v_axis is finite"),
         })
@@ -129,7 +144,20 @@ impl Plane {
 impl TryFrom<PlaneRepr> for Plane {
     type Error = ConstructionError;
     fn try_from(repr: PlaneRepr) -> Result<Self, Self::Error> {
-        Self::try_new(repr.origin, repr.u_axis, repr.v_axis)
+        let origin = repr.origin.into_array();
+        let u_axis = repr.u_axis.into_array();
+        let v_axis = repr.v_axis.into_array();
+        if !all_finite3(origin) || !all_finite3(u_axis) || !all_finite3(v_axis) {
+            return Err(ConstructionError::NonFiniteInput);
+        }
+        validate_unit3(u_axis)?;
+        validate_unit3(v_axis)?;
+        validate_orthogonal3(u_axis, v_axis)?;
+        Ok(Self {
+            origin: repr.origin,
+            u_axis: repr.u_axis,
+            v_axis: repr.v_axis,
+        })
     }
 }
 
@@ -235,10 +263,7 @@ impl SurfaceEvaluator for Plane {
                 reason: "plane projection point is non-finite".to_owned(),
             }
         })?;
-        // Distance = |(q - proj)| = |component along normal|
-        let delta = sub3(q, proj_arr);
-        let dist = mag3(delta);
-        output.push(SurfaceProjection {
+        let local = SurfaceProjection {
             u: ParameterValue::try_new(u_val).map_err(|_| GeometryError::Uncertified {
                 reason: "plane projection u is non-finite".to_owned(),
             })?,
@@ -246,12 +271,13 @@ impl SurfaceEvaluator for Plane {
                 reason: "plane projection v is non-finite".to_owned(),
             })?,
             point: proj,
-            distance_bound: DistanceBound::try_new(dist).map_err(|_| {
-                GeometryError::Uncertified {
+            distance_bound: DistanceBound::try_new(widened_distance_bound3(q, proj_arr)).map_err(
+                |_| GeometryError::Uncertified {
                     reason: "plane projection distance is non-finite or negative".to_owned(),
-                }
-            })?,
-        });
+                },
+            )?,
+        };
+        output.push(local);
         Ok(())
     }
 }
@@ -261,14 +287,22 @@ impl SurfaceEvaluator for Plane {
 #[cfg(test)]
 mod tests {
     use amphion_foundation::{Point3, ToleranceContext, Vector3};
+    use serde_json::json;
 
     use crate::traits::SurfaceEvaluator;
     use crate::{DerivativeOrder, GeometryError};
 
-    use super::{ConstructionError, Plane};
+    use super::{ConstructionError, Plane, PlaneRepr};
+    use crate::analytic::helpers::ILL_COND_THRESH;
 
     fn tol() -> ToleranceContext {
         ToleranceContext::try_new(1e-9, 1e-8, 1e-10, 1e-12).unwrap()
+    }
+
+    fn dist3(a: Point3, b: Point3) -> f64 {
+        let [ax, ay, az] = a.into_array();
+        let [bx, by, bz] = b.into_array();
+        (ax - bx).hypot((ay - by).hypot(az - bz))
     }
 
     fn xy_plane() -> Plane {
@@ -319,6 +353,17 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, ConstructionError::DependentAxes);
+    }
+
+    #[test]
+    fn plane_construction_rejects_ill_conditioned_axes() {
+        let err = Plane::try_new(
+            Point3::try_new(0.0, 0.0, 0.0).unwrap(),
+            Vector3::try_new(0.0, 0.0, 1.0).unwrap(),
+            Vector3::try_new(ILL_COND_THRESH / 2.0, 0.0, 1.0).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(err, ConstructionError::IllConditionedAxes);
     }
 
     #[test]
@@ -419,7 +464,27 @@ mod tests {
         assert_eq!(projs.len(), 1);
         assert!((projs[0].u.get() - 3.0).abs() < 1e-12);
         assert!((projs[0].v.get() - 4.0).abs() < 1e-12);
-        assert!((projs[0].distance_bound.get() - 5.0).abs() < 1e-12);
+        assert!(5.0 <= projs[0].distance_bound.get());
+    }
+
+    #[test]
+    fn plane_distance_bounds_certify_actual_distance_at_extreme_scales() {
+        let plane = xy_plane();
+        for query in [
+            plane
+                .evaluate(3.0, 4.0, DerivativeOrder::Position)
+                .unwrap()
+                .position,
+            Point3::try_new(3.0, 4.0, 5.0).unwrap(),
+            Point3::try_new(1.0e12, -1.0e12, 7.0).unwrap(),
+            Point3::try_new(1.0e-12, -2.0e-12, 3.0e-12).unwrap(),
+            Point3::try_new(10.0, 11.0, 1.0e-12).unwrap(),
+        ] {
+            let projection = plane.project(query, &tol()).unwrap().remove(0);
+            let actual = dist3(query, projection.point);
+            assert!(actual <= projection.distance_bound.get(), "{query:?}");
+            assert!(projection.distance_bound.get() >= 0.0);
+        }
     }
 
     #[test]
@@ -435,12 +500,58 @@ mod tests {
     fn plane_serde_round_trip() {
         let p = Plane::try_new(
             Point3::try_new(1.0, 2.0, 3.0).unwrap(),
-            Vector3::try_new(1.0, 0.0, 0.0).unwrap(),
-            Vector3::try_new(0.0, 1.0, 0.0).unwrap(),
+            Vector3::try_new(
+                1.0 / 3.0_f64.sqrt(),
+                1.0 / 3.0_f64.sqrt(),
+                1.0 / 3.0_f64.sqrt(),
+            )
+            .unwrap(),
+            Vector3::try_new(1.0 / 2.0_f64.sqrt(), -1.0 / 2.0_f64.sqrt(), 0.0).unwrap(),
         )
         .unwrap();
         let json = serde_json::to_string(&p).unwrap();
         let decoded: Plane = serde_json::from_str(&json).unwrap();
         assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn plane_serde_rejects_non_unit_axes() {
+        let repr: PlaneRepr = serde_json::from_value(json!({
+            "origin": [1.0, 2.0, 3.0],
+            "u_axis": [2.0, 0.0, 0.0],
+            "v_axis": [0.0, 1.0, 0.0]
+        }))
+        .unwrap();
+        assert_eq!(
+            Plane::try_from(repr),
+            Err(ConstructionError::DegenerateAxis)
+        );
+    }
+
+    #[test]
+    fn plane_serde_rejects_non_orthogonal_axes() {
+        let repr: PlaneRepr = serde_json::from_value(json!({
+            "origin": [1.0, 2.0, 3.0],
+            "u_axis": [1.0, 0.0, 0.0],
+            "v_axis": [1.0, 0.0, 0.0]
+        }))
+        .unwrap();
+        assert_eq!(Plane::try_from(repr), Err(ConstructionError::DependentAxes));
+    }
+
+    #[test]
+    fn plane_serde_rejects_nan_and_inf_fields() {
+        assert!(
+            serde_json::from_str::<Plane>(
+                r#"{"origin":[NaN,0.0,0.0],"u_axis":[1.0,0.0,0.0],"v_axis":[0.0,1.0,0.0]}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<Plane>(
+                r#"{"origin":[0.0,0.0,0.0],"u_axis":[Infinity,0.0,0.0],"v_axis":[0.0,1.0,0.0]}"#
+            )
+            .is_err()
+        );
     }
 }

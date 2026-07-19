@@ -12,6 +12,9 @@ pub enum ConstructionError {
     /// A direction, axis, or normal vector has zero length and cannot be
     /// normalized.
     DegenerateAxis,
+    /// Two provided axes are nearly dependent, making orthogonalization
+    /// numerically unreliable.
+    IllConditionedAxes,
     /// A scalar parameter that must be strictly positive (radius, etc.) was
     /// zero or negative.
     NotPositive,
@@ -28,6 +31,9 @@ impl fmt::Display for ConstructionError {
             Self::NonFiniteInput => "analytic geometry input contains NaN or infinity",
             Self::DegenerateAxis => {
                 "direction, axis, or normal vector has zero length and cannot be normalized"
+            }
+            Self::IllConditionedAxes => {
+                "provided axes are too close to dependent for stable orthogonalization"
             }
             Self::NotPositive => {
                 "scalar geometry parameter (e.g. radius) must be strictly positive"

@@ -42,8 +42,10 @@ use crate::{
 use super::{
     ConstructionError,
     helpers::{
-        add2, add3, all_finite2, all_finite3, angle_to_full_turn, cross3, dot2, dot3, in_range,
-        mag2, mag2_sq, mag3, normalize2, normalize3, perp2, scale2, scale3, sub2, sub3,
+        ILL_COND_THRESH, add2, add3, all_finite2, all_finite3, angle_to_full_turn, cross3, dot2,
+        dot3, in_range, mag2, mag3, normalize2, normalize3, perp2, scale2, scale3, sub2, sub3,
+        validate_orthogonal3, validate_unit2, validate_unit3, widened_distance_bound2,
+        widened_distance_bound3,
     },
 };
 
@@ -98,7 +100,9 @@ impl Circle2 {
         }
         let x_unit = normalize2(x).ok_or(ConstructionError::DegenerateAxis)?;
         Ok(Self {
+            // unreachable: validated above
             center: Point2::try_new(c[0], c[1]).expect("center validated finite"),
+            // unreachable: validated above
             radius,
             x_axis: Vector2::try_new(x_unit[0], x_unit[1]).expect("unit x_axis is finite"),
         })
@@ -134,7 +138,20 @@ impl Circle2 {
 impl TryFrom<Circle2Repr> for Circle2 {
     type Error = ConstructionError;
     fn try_from(repr: Circle2Repr) -> Result<Self, Self::Error> {
-        Self::try_new(repr.center, repr.radius, repr.x_axis)
+        let center = repr.center.into_array();
+        let x_axis = repr.x_axis.into_array();
+        if !all_finite2(center) || !repr.radius.is_finite() || !all_finite2(x_axis) {
+            return Err(ConstructionError::NonFiniteInput);
+        }
+        if repr.radius <= 0.0 {
+            return Err(ConstructionError::NotPositive);
+        }
+        validate_unit2(x_axis)?;
+        Ok(Self {
+            center: repr.center,
+            radius: repr.radius,
+            x_axis: repr.x_axis,
+        })
     }
 }
 
@@ -213,7 +230,7 @@ impl Curve2Evaluator for Circle2 {
     fn project_into(
         &self,
         point: Point2,
-        _tolerance: &ToleranceContext,
+        tolerance: &ToleranceContext,
         output: &mut Vec<CurveProjection2>,
     ) -> Result<(), GeometryError> {
         output.clear();
@@ -223,11 +240,9 @@ impl Curve2Evaluator for Circle2 {
         let y = perp2(x);
         let r = self.radius;
         let diff = sub2(q, c);
-        // A point at exactly the center maps to all circle points simultaneously.
-        if mag2_sq(diff) == 0.0 {
+        if mag2(diff) < tolerance.absolute_length() {
             return Err(GeometryError::Singular);
         }
-        let diff_len = mag2(diff);
         let theta = angle_to_full_turn(dot2(diff, y).atan2(dot2(diff, x)));
         let (cos_t, sin_t) = (theta.cos(), theta.sin());
         let proj_arr = add2(c, add2(scale2(x, r * cos_t), scale2(y, r * sin_t)));
@@ -235,17 +250,16 @@ impl Curve2Evaluator for Circle2 {
             Point2::try_new(proj_arr[0], proj_arr[1]).map_err(|_| GeometryError::Uncertified {
                 reason: "circle projection point is non-finite".to_owned(),
             })?;
-        let dist = (diff_len - r).abs();
         output.push(CurveProjection2 {
             parameter: ParameterValue::try_new(theta).map_err(|_| GeometryError::Uncertified {
                 reason: "circle projection parameter is non-finite".to_owned(),
             })?,
             point: proj,
-            distance_bound: DistanceBound::try_new(dist).map_err(|_| {
-                GeometryError::Uncertified {
+            distance_bound: DistanceBound::try_new(widened_distance_bound2(q, proj_arr)).map_err(
+                |_| GeometryError::Uncertified {
                     reason: "circle projection distance is non-finite or negative".to_owned(),
-                }
-            })?,
+                },
+            )?,
         });
         Ok(())
     }
@@ -291,6 +305,8 @@ impl Circle3 {
     /// - [`ConstructionError::DegenerateAxis`] — zero-length `normal` or `x_axis`
     /// - [`ConstructionError::NotPositive`] — `radius <= 0`
     /// - [`ConstructionError::DependentAxes`] — `x_axis` parallel to `normal`
+    /// - [`ConstructionError::IllConditionedAxes`] — `x_axis` nearly parallel
+    ///   to `normal`
     pub fn try_new(
         center: Point3,
         radius: f64,
@@ -311,12 +327,22 @@ impl Circle3 {
         // Orthogonalize x against n.
         let dot_xn = dot3(x_norm, n_unit);
         let x_perp = sub3(x_norm, scale3(n_unit, dot_xn));
+        let perp_mag = mag3(x_perp);
+        if perp_mag == 0.0 {
+            return Err(ConstructionError::DependentAxes);
+        }
+        if perp_mag < ILL_COND_THRESH {
+            return Err(ConstructionError::IllConditionedAxes);
+        }
         let x_unit = normalize3(x_perp).ok_or(ConstructionError::DependentAxes)?;
         Ok(Self {
+            // unreachable: validated above
             center: Point3::try_new(c[0], c[1], c[2]).expect("center validated finite"),
             radius,
+            // unreachable: validated above
             normal: Vector3::try_new(n_unit[0], n_unit[1], n_unit[2])
                 .expect("normal unit vector is finite"),
+            // unreachable: validated above
             x_axis: Vector3::try_new(x_unit[0], x_unit[1], x_unit[2])
                 .expect("x_axis unit vector is finite"),
         })
@@ -359,7 +385,28 @@ impl Circle3 {
 impl TryFrom<Circle3Repr> for Circle3 {
     type Error = ConstructionError;
     fn try_from(repr: Circle3Repr) -> Result<Self, Self::Error> {
-        Self::try_new(repr.center, repr.radius, repr.normal, repr.x_axis)
+        let center = repr.center.into_array();
+        let normal = repr.normal.into_array();
+        let x_axis = repr.x_axis.into_array();
+        if !all_finite3(center)
+            || !repr.radius.is_finite()
+            || !all_finite3(normal)
+            || !all_finite3(x_axis)
+        {
+            return Err(ConstructionError::NonFiniteInput);
+        }
+        if repr.radius <= 0.0 {
+            return Err(ConstructionError::NotPositive);
+        }
+        validate_unit3(normal)?;
+        validate_unit3(x_axis)?;
+        validate_orthogonal3(normal, x_axis)?;
+        Ok(Self {
+            center: repr.center,
+            radius: repr.radius,
+            normal: repr.normal,
+            x_axis: repr.x_axis,
+        })
     }
 }
 
@@ -439,7 +486,7 @@ impl Curve3Evaluator for Circle3 {
     fn project_into(
         &self,
         point: Point3,
-        _tolerance: &ToleranceContext,
+        tolerance: &ToleranceContext,
         output: &mut Vec<CurveProjection3>,
     ) -> Result<(), GeometryError> {
         output.clear();
@@ -452,8 +499,7 @@ impl Curve3Evaluator for Circle3 {
         let diff = sub3(q, c);
         // In-plane component (project off the normal direction).
         let diff_in_plane = sub3(diff, scale3(n, dot3(diff, n)));
-        if mag3(diff_in_plane) == 0.0 {
-            // Point is on the circle's axis; every θ is equidistant.
+        if mag3(diff_in_plane) < tolerance.absolute_length() {
             return Err(GeometryError::Singular);
         }
         let proj_x = dot3(diff_in_plane, x);
@@ -466,20 +512,18 @@ impl Curve3Evaluator for Circle3 {
                 reason: "circle projection point is non-finite".to_owned(),
             }
         })?;
-        // Distance from q to proj.
-        let delta = sub3(q, proj_arr);
-        let dist = mag3(delta);
-        output.push(CurveProjection3 {
+        let local = CurveProjection3 {
             parameter: ParameterValue::try_new(theta).map_err(|_| GeometryError::Uncertified {
                 reason: "circle projection parameter is non-finite".to_owned(),
             })?,
             point: proj,
-            distance_bound: DistanceBound::try_new(dist).map_err(|_| {
-                GeometryError::Uncertified {
+            distance_bound: DistanceBound::try_new(widened_distance_bound3(q, proj_arr)).map_err(
+                |_| GeometryError::Uncertified {
                     reason: "circle projection distance is non-finite or negative".to_owned(),
-                }
-            })?,
-        });
+                },
+            )?,
+        };
+        output.push(local);
         Ok(())
     }
 }
@@ -491,14 +535,28 @@ mod tests {
     use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU};
 
     use amphion_foundation::{Point2, Point3, ToleranceContext, Vector2, Vector3};
+    use serde_json::json;
 
+    use crate::analytic::helpers::ILL_COND_THRESH;
     use crate::traits::{Curve2Evaluator, Curve3Evaluator};
     use crate::{DerivativeOrder, GeometryError};
 
-    use super::{Circle2, Circle3, ConstructionError};
+    use super::{Circle2, Circle2Repr, Circle3, Circle3Repr, ConstructionError};
 
     fn tol() -> ToleranceContext {
         ToleranceContext::try_new(1e-9, 1e-8, 1e-10, 1e-12).unwrap()
+    }
+
+    fn dist2(a: Point2, b: Point2) -> f64 {
+        let [ax, ay] = a.into_array();
+        let [bx, by] = b.into_array();
+        (ax - bx).hypot(ay - by)
+    }
+
+    fn dist3(a: Point3, b: Point3) -> f64 {
+        let [ax, ay, az] = a.into_array();
+        let [bx, by, bz] = b.into_array();
+        (ax - bx).hypot((ay - by).hypot(az - bz))
     }
 
     // ── Circle2 ──────────────────────────────────────────────────────────────
@@ -693,6 +751,8 @@ mod tests {
         .unwrap();
         let center = c.center();
         assert_eq!(c.project(center, &tol()), Err(GeometryError::Singular));
+        let near_center = Point2::try_new(0.5e-9, 0.0).unwrap();
+        assert_eq!(c.project(near_center, &tol()), Err(GeometryError::Singular));
     }
 
     #[test]
@@ -718,12 +778,93 @@ mod tests {
         let c = Circle2::try_new(
             Point2::try_new(1.0, -2.0).unwrap(),
             3.5,
-            Vector2::try_new(0.0, 1.0).unwrap(),
+            Vector2::try_new(1.0, 1.0).unwrap(),
         )
         .unwrap();
         let json = serde_json::to_string(&c).unwrap();
         let decoded: Circle2 = serde_json::from_str(&json).unwrap();
         assert_eq!(c, decoded);
+    }
+
+    #[test]
+    fn circle2_distance_bounds_certify_actual_distance_at_extreme_scales() {
+        let tiny_tol = ToleranceContext::try_new(1e-15, 1e-8, 1e-10, 1e-12).unwrap();
+        let unit = Circle2::try_new(
+            Point2::try_new(0.0, 0.0).unwrap(),
+            1.0,
+            Vector2::try_new(1.0, 0.0).unwrap(),
+        )
+        .unwrap();
+        let tiny = Circle2::try_new(
+            Point2::try_new(0.0, 0.0).unwrap(),
+            1.0e-12,
+            Vector2::try_new(1.0, 0.0).unwrap(),
+        )
+        .unwrap();
+        for (circle, query, tolerance) in [
+            (
+                unit.clone(),
+                unit.evaluate(0.25, DerivativeOrder::Position)
+                    .unwrap()
+                    .position,
+                tol(),
+            ),
+            (unit.clone(), Point2::try_new(1.0, 5.0).unwrap(), tol()),
+            (unit.clone(), Point2::try_new(1.0e12, 1.0).unwrap(), tol()),
+            (
+                tiny.clone(),
+                Point2::try_new(2.0e-12, 0.0).unwrap(),
+                tiny_tol,
+            ),
+            (unit.clone(), Point2::try_new(1.0, 1.0e-12).unwrap(), tol()),
+        ] {
+            let projection = circle.project(query, &tolerance).unwrap().remove(0);
+            let actual = dist2(query, projection.point);
+            assert!(actual <= projection.distance_bound.get(), "{query:?}");
+            assert!(projection.distance_bound.get() >= 0.0);
+            assert!(projection.parameter.get() < TAU);
+        }
+    }
+
+    #[test]
+    fn circle2_serde_rejects_bad_radius_or_axis() {
+        let bad_axis: Circle2Repr = serde_json::from_value(json!({
+            "center": [1.0, 2.0],
+            "radius": 3.0,
+            "x_axis": [2.0, 0.0]
+        }))
+        .unwrap();
+        assert_eq!(
+            Circle2::try_from(bad_axis),
+            Err(ConstructionError::DegenerateAxis)
+        );
+
+        let bad_radius: Circle2Repr = serde_json::from_value(json!({
+            "center": [1.0, 2.0],
+            "radius": 0.0,
+            "x_axis": [1.0, 0.0]
+        }))
+        .unwrap();
+        assert_eq!(
+            Circle2::try_from(bad_radius),
+            Err(ConstructionError::NotPositive)
+        );
+    }
+
+    #[test]
+    fn circle2_serde_rejects_nan_and_inf_fields() {
+        assert!(
+            serde_json::from_str::<Circle2>(
+                r#"{"center":[NaN,0.0],"radius":1.0,"x_axis":[1.0,0.0]}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<Circle2>(
+                r#"{"center":[0.0,0.0],"radius":1.0,"x_axis":[Infinity,0.0]}"#
+            )
+            .is_err()
+        );
     }
 
     // ── Circle3 ──────────────────────────────────────────────────────────────
@@ -750,6 +891,18 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, ConstructionError::DependentAxes);
+    }
+
+    #[test]
+    fn circle3_construction_rejects_ill_conditioned_axes() {
+        let err = Circle3::try_new(
+            Point3::try_new(0.0, 0.0, 0.0).unwrap(),
+            1.0,
+            Vector3::try_new(0.0, 0.0, 1.0).unwrap(),
+            Vector3::try_new(ILL_COND_THRESH / 2.0, 0.0, 1.0).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(err, ConstructionError::IllConditionedAxes);
     }
 
     #[test]
@@ -901,8 +1054,7 @@ mod tests {
         let projs = c.project(q, &tol()).unwrap();
         assert_eq!(projs.len(), 1);
         assert!((projs[0].parameter.get()).abs() < 1e-11);
-        // distance = sqrt((1-1)^2 + 0^2 + 5^2) = 5
-        assert!((projs[0].distance_bound.get() - 5.0).abs() < 1e-11);
+        assert!(5.0 <= projs[0].distance_bound.get());
     }
 
     #[test]
@@ -917,6 +1069,8 @@ mod tests {
         // Point exactly on the Z-axis: all θ equidistant.
         let q = Point3::try_new(0.0, 0.0, 3.0).unwrap();
         assert_eq!(c.project(q, &tol()), Err(GeometryError::Singular));
+        let near_axis = Point3::try_new(0.5e-9, 0.0, 3.0).unwrap();
+        assert_eq!(c.project(near_axis, &tol()), Err(GeometryError::Singular));
     }
 
     #[test]
@@ -924,12 +1078,137 @@ mod tests {
         let c = Circle3::try_new(
             Point3::try_new(1.0, 2.0, 3.0).unwrap(),
             4.0,
-            Vector3::try_new(0.0, 0.0, 1.0).unwrap(),
-            Vector3::try_new(1.0, 0.0, 0.0).unwrap(),
+            Vector3::try_new(
+                1.0 / 3.0_f64.sqrt(),
+                1.0 / 3.0_f64.sqrt(),
+                1.0 / 3.0_f64.sqrt(),
+            )
+            .unwrap(),
+            Vector3::try_new(1.0 / 2.0_f64.sqrt(), -1.0 / 2.0_f64.sqrt(), 0.0).unwrap(),
         )
         .unwrap();
         let json = serde_json::to_string(&c).unwrap();
         let decoded: Circle3 = serde_json::from_str(&json).unwrap();
         assert_eq!(c, decoded);
+    }
+
+    #[test]
+    fn circle3_distance_bounds_certify_actual_distance_at_extreme_scales() {
+        let tiny_tol = ToleranceContext::try_new(1e-15, 1e-8, 1e-10, 1e-12).unwrap();
+        let unit = Circle3::try_new(
+            Point3::try_new(0.0, 0.0, 0.0).unwrap(),
+            1.0,
+            Vector3::try_new(0.0, 0.0, 1.0).unwrap(),
+            Vector3::try_new(1.0, 0.0, 0.0).unwrap(),
+        )
+        .unwrap();
+        let tiny = Circle3::try_new(
+            Point3::try_new(0.0, 0.0, 0.0).unwrap(),
+            1.0e-12,
+            Vector3::try_new(0.0, 0.0, 1.0).unwrap(),
+            Vector3::try_new(1.0, 0.0, 0.0).unwrap(),
+        )
+        .unwrap();
+        for (circle, query, tolerance) in [
+            (
+                unit.clone(),
+                unit.evaluate(0.25, DerivativeOrder::Position)
+                    .unwrap()
+                    .position,
+                tol(),
+            ),
+            (unit.clone(), Point3::try_new(1.0, 0.0, 5.0).unwrap(), tol()),
+            (
+                unit.clone(),
+                Point3::try_new(1.0e12, 1.0, 0.0).unwrap(),
+                tol(),
+            ),
+            (
+                tiny.clone(),
+                Point3::try_new(2.0e-12, 0.0, 0.0).unwrap(),
+                tiny_tol,
+            ),
+            (
+                unit.clone(),
+                Point3::try_new(1.0, 1.0e-12, 0.0).unwrap(),
+                tol(),
+            ),
+        ] {
+            let projection = circle.project(query, &tolerance).unwrap().remove(0);
+            let actual = dist3(query, projection.point);
+            assert!(actual <= projection.distance_bound.get(), "{query:?}");
+            assert!(projection.distance_bound.get() >= 0.0);
+            assert!(projection.parameter.get() < TAU);
+        }
+    }
+
+    #[test]
+    fn circle3_project_into_clears_output_on_error() {
+        let c = Circle3::try_new(
+            Point3::try_new(0.0, 0.0, 0.0).unwrap(),
+            1.0,
+            Vector3::try_new(0.0, 0.0, 1.0).unwrap(),
+            Vector3::try_new(1.0, 0.0, 0.0).unwrap(),
+        )
+        .unwrap();
+        let mut output = vec![
+            c.project(Point3::try_new(1.0, 0.0, 0.0).unwrap(), &tol())
+                .unwrap()[0]
+                .clone(),
+        ];
+        let err = c.project_into(Point3::try_new(0.0, 0.0, 3.0).unwrap(), &tol(), &mut output);
+        assert_eq!(err, Err(GeometryError::Singular));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn circle3_serde_rejects_bad_axis_radius_and_orthogonality() {
+        let bad_axis: Circle3Repr = serde_json::from_value(json!({
+            "center": [1.0, 2.0, 3.0],
+            "radius": 4.0,
+            "normal": [2.0, 0.0, 0.0],
+            "x_axis": [0.0, 1.0, 0.0]
+        }))
+        .unwrap();
+        assert_eq!(
+            Circle3::try_from(bad_axis),
+            Err(ConstructionError::DegenerateAxis)
+        );
+
+        let bad_frame: Circle3Repr = serde_json::from_value(json!({
+            "center": [1.0, 2.0, 3.0],
+            "radius": 4.0,
+            "normal": [1.0, 0.0, 0.0],
+            "x_axis": [1.0, 0.0, 0.0]
+        }))
+        .unwrap();
+        assert_eq!(
+            Circle3::try_from(bad_frame),
+            Err(ConstructionError::DependentAxes)
+        );
+
+        let bad_radius: Circle3Repr = serde_json::from_value(json!({
+            "center": [1.0, 2.0, 3.0],
+            "radius": 0.0,
+            "normal": [0.0, 0.0, 1.0],
+            "x_axis": [1.0, 0.0, 0.0]
+        }))
+        .unwrap();
+        assert_eq!(
+            Circle3::try_from(bad_radius),
+            Err(ConstructionError::NotPositive)
+        );
+    }
+
+    #[test]
+    fn circle3_serde_rejects_nan_and_inf_fields() {
+        assert!(serde_json::from_str::<Circle3>(
+            r#"{"center":[NaN,0.0,0.0],"radius":1.0,"normal":[0.0,0.0,1.0],"x_axis":[1.0,0.0,0.0]}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<Circle3>(
+            r#"{"center":[0.0,0.0,0.0],"radius":1.0,"normal":[Infinity,0.0,1.0],"x_axis":[1.0,0.0,0.0]}"#
+        )
+        .is_err());
     }
 }
