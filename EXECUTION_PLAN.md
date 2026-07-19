@@ -16,6 +16,12 @@ The first proof milestone is:
 - permanent minimized regression cases for every discovered failure;
 - no panics, silent healing, or success-shaped fallback results.
 
+This file covers the first kernel proof milestone. The browser client,
+interaction-compatibility target, capability inventory schema, sketch/product
+tracks, and human-visible demonstrations are defined in
+[PRODUCT_PLAN.md](PRODUCT_PLAN.md). Product work may proceed in parallel where
+its declared kernel dependencies are already satisfied.
+
 ## Repository boundaries
 
 Use one monorepo with independent libraries and one-way dependencies:
