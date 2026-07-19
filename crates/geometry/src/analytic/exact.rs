@@ -44,12 +44,12 @@ pub(super) fn f64_to_rat(x: f64) -> BigRational {
         significand
     };
     if power >= 0 {
-        let shift =
-            usize::try_from(power).expect("f64 exponent shift is bounded and non-negative here");
+        #[allow(clippy::cast_sign_loss)]
+        let shift = power as usize;
         BigRational::from_integer(numer << shift)
     } else {
-        let shift =
-            usize::try_from(-power).expect("f64 exponent shift is bounded and non-negative here");
+        #[allow(clippy::cast_sign_loss)]
+        let shift = (-power) as usize;
         BigRational::new(numer, BigInt::one() << shift)
     }
 }
@@ -69,14 +69,14 @@ pub(super) fn rat_to_f64_up(r: &BigRational) -> f64 {
         return if r.is_positive() {
             f64::INFINITY
         } else {
-            f64::NEG_INFINITY
+            -f64::MAX
         };
     };
     if !candidate.is_finite() {
         return if r.is_positive() {
             f64::INFINITY
         } else {
-            candidate
+            -f64::MAX
         };
     }
     // Exact comparison: convert candidate back to BigRational.
@@ -98,14 +98,14 @@ pub(super) fn rat_to_f64_down(r: &BigRational) -> f64 {
         return if r.is_negative() {
             f64::NEG_INFINITY
         } else {
-            f64::INFINITY
+            f64::MAX
         };
     };
     if !candidate.is_finite() {
         return if r.is_negative() {
             f64::NEG_INFINITY
         } else {
-            candidate
+            f64::MAX
         };
     }
     let c_rat = f64_to_rat(candidate);
@@ -129,6 +129,60 @@ pub(super) fn rat_to_f64(r: &BigRational) -> f64 {
     })
 }
 
+fn bigint_isqrt(n: &BigInt) -> BigInt {
+    if n.is_zero() {
+        return BigInt::zero();
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let mut x = BigInt::one() << (n.bits().div_ceil(2) as usize);
+    loop {
+        let x1 = (&x + n / &x) >> 1usize;
+        if x1 >= x {
+            break;
+        }
+        x = x1;
+    }
+    x
+}
+
+fn sqrt_search_up(sq_rat: &BigRational, lower_hint: &BigRational, upper_hint: &BigRational) -> f64 {
+    let mut lo = rat_to_f64_down(lower_hint).to_bits();
+    let mut hi = rat_to_f64_up(upper_hint).to_bits();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let candidate = f64::from_bits(mid);
+        let candidate_rat = f64_to_rat(candidate);
+        let candidate_sq = &candidate_rat * &candidate_rat;
+        if candidate_sq >= *sq_rat {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    f64::from_bits(lo)
+}
+
+fn sqrt_search_down(
+    sq_rat: &BigRational,
+    lower_hint: &BigRational,
+    upper_hint: &BigRational,
+) -> f64 {
+    let mut lo = rat_to_f64_down(lower_hint).to_bits();
+    let mut hi = rat_to_f64_up(upper_hint).to_bits();
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        let candidate = f64::from_bits(mid);
+        let candidate_rat = f64_to_rat(candidate);
+        let candidate_sq = &candidate_rat * &candidate_rat;
+        if candidate_sq <= *sq_rat {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    f64::from_bits(lo)
+}
+
 /// Returns a certified upper bound on √`sq_rat` (the non-negative square root).
 ///
 /// Since IEEE 754 mandates correctly-rounded sqrt (§5.4), `fl(√x).next_up()`
@@ -144,18 +198,39 @@ pub(super) fn sqrt_up(sq_rat: &BigRational) -> Result<f64, ()> {
     if sq_rat.is_zero() {
         return Ok(0.0_f64);
     }
-    // Round sq_rat itself upward first (sqrt is monotone increasing):
-    let sq_hi = rat_to_f64_up(sq_rat);
-    if sq_hi == f64::INFINITY {
+    let max = f64_to_rat(f64::MAX);
+    let max_sq = &max * &max;
+    if sq_rat > &max_sq {
         return Ok(f64::INFINITY);
     }
-    // sqrt(sq_hi) is correctly rounded → it is the nearest f64 to √sq_hi.
-    let sqrt_hi = sq_hi.sqrt();
-    // Since sqrt_hi = fl(√sq_hi) is within 0.5 ULP of the true √sq_hi
-    // (IEEE 754 correctly-rounded guarantee), and sq_hi ≥ sq_rat, we have
-    // √sq_hi ≥ √sq_rat; one further next_up() absorbs the ≤0.5 ULP rounding
-    // gap, certifying sqrt_hi.next_up() ≥ √sq_rat.
-    Ok(sqrt_hi.next_up())
+    if sq_rat <= &max {
+        let sq_hi = rat_to_f64_up(sq_rat);
+        if sq_hi == f64::INFINITY {
+            return Ok(f64::INFINITY);
+        }
+        let candidate = sq_hi.sqrt();
+        let candidate_rat = f64_to_rat(candidate);
+        let candidate_sq = &candidate_rat * &candidate_rat;
+        return Ok(if candidate_sq >= *sq_rat {
+            candidate
+        } else {
+            candidate.next_up()
+        });
+    }
+
+    let p = sq_rat.numer();
+    let q = sq_rat.denom();
+    let isqrt_p = bigint_isqrt(p);
+    let isqrt_q = bigint_isqrt(q);
+    let p_is_square = &isqrt_p * &isqrt_p == *p;
+    let q_is_square = &isqrt_q * &isqrt_q == *q;
+    if p_is_square && q_is_square {
+        return Ok(rat_to_f64_up(&BigRational::new_raw(isqrt_p, isqrt_q)));
+    }
+
+    let upper_rat = BigRational::new_raw(isqrt_p.clone() + BigInt::one(), isqrt_q.clone());
+    let lower_rat = BigRational::new_raw(isqrt_p, isqrt_q + BigInt::one());
+    Ok(sqrt_search_up(sq_rat, &lower_rat, &upper_rat))
 }
 
 /// Returns a certified lower bound on √`sq_rat`.
@@ -170,14 +245,39 @@ pub(super) fn sqrt_down(sq_rat: &BigRational) -> Result<f64, ()> {
     if sq_rat.is_zero() {
         return Ok(0.0_f64);
     }
-    let sq_lo = rat_to_f64_down(sq_rat);
-    if sq_lo <= 0.0_f64 {
-        return Ok(0.0_f64);
+    let max = f64_to_rat(f64::MAX);
+    let max_sq = &max * &max;
+    if sq_rat > &max_sq {
+        return Ok(f64::MAX);
     }
-    let sqrt_lo = sq_lo.sqrt();
-    // sqrt_lo = fl(√sq_lo) is within 0.5 ULP of the true √sq_lo, and
-    // sq_lo ≤ sq_rat, so sqrt_lo.next_down() ≤ √sq_rat (conservative).
-    Ok(sqrt_lo.next_down())
+    if sq_rat <= &max {
+        let sq_lo = rat_to_f64_down(sq_rat);
+        if sq_lo <= 0.0_f64 {
+            return Ok(0.0_f64);
+        }
+        let candidate = sq_lo.sqrt();
+        let candidate_rat = f64_to_rat(candidate);
+        let candidate_sq = &candidate_rat * &candidate_rat;
+        return Ok(if candidate_sq <= *sq_rat {
+            candidate
+        } else {
+            candidate.next_down()
+        });
+    }
+
+    let p = sq_rat.numer();
+    let q = sq_rat.denom();
+    let isqrt_p = bigint_isqrt(p);
+    let isqrt_q = bigint_isqrt(q);
+    let p_is_square = &isqrt_p * &isqrt_p == *p;
+    let q_is_square = &isqrt_q * &isqrt_q == *q;
+    if p_is_square && q_is_square {
+        return Ok(rat_to_f64_down(&BigRational::new_raw(isqrt_p, isqrt_q)));
+    }
+
+    let upper_rat = BigRational::new_raw(isqrt_p.clone() + BigInt::one(), isqrt_q.clone());
+    let lower_rat = BigRational::new_raw(isqrt_p, isqrt_q + BigInt::one());
+    Ok(sqrt_search_down(sq_rat, &lower_rat, &upper_rat))
 }
 
 #[cfg(test)]
@@ -188,6 +288,7 @@ mod tests {
     #![allow(clippy::float_cmp)]
 
     use num_bigint::BigInt;
+    use num_rational::BigRational;
     use num_traits::One;
 
     use super::{f64_to_rat, rat_to_f64, rat_to_f64_down, rat_to_f64_up, sqrt_down, sqrt_up};
@@ -223,11 +324,24 @@ mod tests {
 
     #[test]
     fn rat_to_f64_down_is_lower_bound() {
-        use num_rational::BigRational;
         let r = BigRational::new(BigInt::one(), BigInt::from(3i64));
         let down = rat_to_f64_down(&r);
         let down_rat = f64_to_rat(down);
         assert!(down_rat <= r, "rat_to_f64_down is not a lower bound");
+    }
+
+    #[test]
+    fn rat_to_f64_up_large_negative_returns_neg_max() {
+        let max = f64_to_rat(f64::MAX);
+        let r = -(&max * BigRational::from_integer(BigInt::from(2i64)));
+        assert_eq!(rat_to_f64_up(&r), -f64::MAX);
+    }
+
+    #[test]
+    fn rat_to_f64_down_large_positive_returns_max() {
+        let max = f64_to_rat(f64::MAX);
+        let r = &max * BigRational::from_integer(BigInt::from(2i64));
+        assert_eq!(rat_to_f64_down(&r), f64::MAX);
     }
 
     #[test]
@@ -244,6 +358,26 @@ mod tests {
     fn sqrt_up_of_zero_is_zero() {
         assert_eq!(sqrt_up(&f64_to_rat(0.0)).unwrap(), 0.0);
         assert_eq!(sqrt_down(&f64_to_rat(0.0)).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn sqrt_up_huge_radicand_returns_finite() {
+        let sq_rat = BigRational::from_integer(BigInt::one() << 1100usize);
+        let up = sqrt_up(&sq_rat).unwrap();
+        assert!(up.is_finite());
+        let up_rat = f64_to_rat(up);
+        let up_sq = &up_rat * &up_rat;
+        assert!(up_sq >= sq_rat);
+    }
+
+    #[test]
+    fn sqrt_down_huge_radicand() {
+        let sq_rat = BigRational::from_integer(BigInt::one() << 1100usize);
+        let down = sqrt_down(&sq_rat).unwrap();
+        assert!(down.is_finite());
+        let down_rat = f64_to_rat(down);
+        let down_sq = &down_rat * &down_rat;
+        assert!(down_sq <= sq_rat);
     }
 
     #[test]

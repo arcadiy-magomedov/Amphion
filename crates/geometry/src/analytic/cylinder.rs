@@ -47,33 +47,33 @@ use crate::{
 use super::{
     ConstructionError, TransformError,
     helpers::{
-        ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite3, check_tolerance, dot3, exact_cylinder_eval,
-        exact_cylinder_project, in_range, mag3, normalization_to_construction, scale3, sub3,
+        ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite3, check_angular_tolerance, check_tolerance,
+        dot3, exact_cylinder_eval, exact_cylinder_project, in_range, mag3,
+        normalization_to_construction, scale3, sub3,
     },
     transform::similarity_scale,
 };
 
 fn angular_range() -> ParameterRange {
-    // (0.0, TAU, TAU) is a compile-time constant with lo < hi; this is not
-    // an input-dependent path, so a static-invariant `expect` is acceptable
-    // here (see CONTRACTS.md).
-    ParameterRange::try_new(Some(0.0), Some(TAU), Some(TAU))
-        .expect("angular [0, 2π) domain is always valid")
+    match ParameterRange::try_new(Some(0.0), Some(TAU), Some(TAU)) {
+        Ok(range) => range,
+        Err(error) => panic!("cylinder angular domain is a static invariant: {error:?}"),
+    }
 }
 
 fn unbounded_range() -> ParameterRange {
-    // (None, None, None) is a compile-time constant and always valid; this
-    // is not an input-dependent path, so a static-invariant `expect` is
-    // acceptable here (see CONTRACTS.md).
-    ParameterRange::try_new(None, None, None).expect("unbounded domain is always valid")
+    match ParameterRange::try_new(None, None, None) {
+        Ok(range) => range,
+        Err(error) => panic!("cylinder v-domain is a static invariant: {error:?}"),
+    }
 }
 
 #[derive(Serialize, Deserialize)]
 struct CylinderRepr {
     axis_origin: Point3,
-    axis_dir: Vector3,
+    axis_dir: UnitVector3,
     radius: f64,
-    x_axis: Vector3,
+    x_axis: UnitVector3,
 }
 
 /// A right circular cylinder surface.
@@ -223,10 +223,8 @@ impl TryFrom<CylinderRepr> for Cylinder {
         if repr.radius <= 0.0 {
             return Err(ConstructionError::NotPositive);
         }
-        let a_unit =
-            UnitVector3::try_normalize(repr.axis_dir).map_err(normalization_to_construction)?;
-        let x_unit =
-            UnitVector3::try_normalize(repr.x_axis).map_err(normalization_to_construction)?;
+        let a_unit = repr.axis_dir;
+        let x_unit = repr.x_axis;
         if a_unit.dot(x_unit).abs() > UNIT_VECTOR_TOL {
             return Err(ConstructionError::DependentAxes);
         }
@@ -246,9 +244,9 @@ impl From<Cylinder> for CylinderRepr {
     fn from(c: Cylinder) -> Self {
         Self {
             axis_origin: c.axis_origin,
-            axis_dir: c.axis_dir.as_vector(),
+            axis_dir: c.axis_dir,
             radius: c.radius,
-            x_axis: c.x_axis.as_vector(),
+            x_axis: c.x_axis,
         }
     }
 }
@@ -400,6 +398,8 @@ impl SurfaceEvaluator for Cylinder {
         let result = exact_cylinder_project(context.budget, q, o, ad, self.radius, x_ax, y_ax)?;
         let scale = mag3(q) + mag3(result.point);
         check_tolerance(&context.tolerance, result.point_residual_bound, scale)?;
+        check_angular_tolerance(&context.tolerance, result.u_error_bound)?;
+        check_tolerance(&context.tolerance, result.v_error_bound, 1.0)?;
 
         let proj =
             Point3::try_new(result.point[0], result.point[1], result.point[2]).map_err(|_| {
@@ -436,6 +436,8 @@ impl SurfaceEvaluator for Cylinder {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp)]
+
     use amphion_foundation::{Point3, ToleranceContext, Vector3};
     use serde_json::json;
 
@@ -649,24 +651,17 @@ mod tests {
         let json = serde_json::to_string(&c).unwrap();
         let decoded: Cylinder = serde_json::from_str(&json).unwrap();
         assert_eq!(c, decoded);
+        assert_eq!(c.axis_dir().into_array(), decoded.axis_dir().into_array());
+        assert_eq!(c.x_axis().into_array(), decoded.x_axis().into_array());
     }
 
     #[test]
-    fn cylinder_serde_normalizes_axis_and_rejects_dependent_axes_and_bad_radius() {
-        // Foundation's UnitVector3::try_normalize is lenient: a non-unit but
-        // finite, non-zero axis_dir is silently renormalized rather than
-        // rejected.
-        let normalized_axis: CylinderRepr = serde_json::from_value(json!({
-            "axis_origin": [1.0, 2.0, 3.0],
-            "axis_dir": [2.0, 0.0, 0.0],
-            "radius": 2.5,
-            "x_axis": [0.0, 1.0, 0.0]
-        }))
-        .unwrap();
-        let cylinder = Cylinder::try_from(normalized_axis).unwrap();
-        assert_eq!(
-            cylinder.axis_dir(),
-            Vector3::try_new(1.0, 0.0, 0.0).unwrap()
+    fn cylinder_serde_rejects_non_unit_axis_and_bad_radius() {
+        assert!(
+            serde_json::from_str::<Cylinder>(
+                r#"{"axis_origin":[1.0,2.0,3.0],"axis_dir":[2.0,0.0,0.0],"radius":2.5,"x_axis":[0.0,1.0,0.0]}"#
+            )
+            .is_err()
         );
 
         let bad_frame: CylinderRepr = serde_json::from_value(json!({

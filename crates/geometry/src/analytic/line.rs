@@ -45,10 +45,10 @@ use super::{
 
 /// Infinite line domain: no bounds, no period.
 fn line_domain() -> ParameterRange {
-    // (None, None, None) is a compile-time constant and always valid; this
-    // is not an input-dependent path, so a static-invariant `expect` is
-    // acceptable here (see CONTRACTS.md).
-    ParameterRange::try_new(None, None, None).expect("unbounded domain is always valid")
+    match ParameterRange::try_new(None, None, None) {
+        Ok(range) => range,
+        Err(error) => panic!("line domain is a static invariant: {error:?}"),
+    }
 }
 
 // ─── Line2 ───────────────────────────────────────────────────────────────────
@@ -56,7 +56,7 @@ fn line_domain() -> ParameterRange {
 #[derive(Serialize, Deserialize)]
 struct Line2Repr {
     origin: Point2,
-    direction: Vector2,
+    direction: UnitVector2,
 }
 
 /// A directed straight line in two-dimensional parameter space.
@@ -111,11 +111,9 @@ impl TryFrom<Line2Repr> for Line2 {
         if !all_finite2(origin) {
             return Err(ConstructionError::NonFiniteInput);
         }
-        let direction =
-            UnitVector2::try_normalize(repr.direction).map_err(normalization_to_construction)?;
         Ok(Self {
             origin: repr.origin,
-            direction,
+            direction: repr.direction,
         })
     }
 }
@@ -124,7 +122,7 @@ impl From<Line2> for Line2Repr {
     fn from(line: Line2) -> Self {
         Self {
             origin: line.origin,
-            direction: line.direction.as_vector(),
+            direction: line.direction,
         }
     }
 }
@@ -224,6 +222,7 @@ impl Curve2Evaluator for Line2 {
         let result = exact_line_project2(context.budget, q, o, d)?;
         let scale = mag2(q) + mag2(result.point);
         check_tolerance(&context.tolerance, result.point_residual_bound, scale)?;
+        check_tolerance(&context.tolerance, result.parameter_error_bound, 1.0)?;
 
         let proj = Point2::try_new(result.point[0], result.point[1]).map_err(|_| {
             GeometryError::Uncertified {
@@ -259,7 +258,7 @@ impl Curve2Evaluator for Line2 {
 #[derive(Serialize, Deserialize)]
 struct Line3Repr {
     origin: Point3,
-    direction: Vector3,
+    direction: UnitVector3,
 }
 
 /// A directed straight line in three-dimensional model space.
@@ -337,11 +336,9 @@ impl TryFrom<Line3Repr> for Line3 {
         if !all_finite3(origin) {
             return Err(ConstructionError::NonFiniteInput);
         }
-        let direction =
-            UnitVector3::try_normalize(repr.direction).map_err(normalization_to_construction)?;
         Ok(Self {
             origin: repr.origin,
-            direction,
+            direction: repr.direction,
         })
     }
 }
@@ -350,7 +347,7 @@ impl From<Line3> for Line3Repr {
     fn from(line: Line3) -> Self {
         Self {
             origin: line.origin,
-            direction: line.direction.as_vector(),
+            direction: line.direction,
         }
     }
 }
@@ -450,6 +447,7 @@ impl Curve3Evaluator for Line3 {
         let result = exact_line_project3(context.budget, q, o, d)?;
         let scale = mag3(q) + mag3(result.point);
         check_tolerance(&context.tolerance, result.point_residual_bound, scale)?;
+        check_tolerance(&context.tolerance, result.parameter_error_bound, 1.0)?;
 
         let proj =
             Point3::try_new(result.point[0], result.point[1], result.point[2]).map_err(|_| {
@@ -485,17 +483,17 @@ impl Curve3Evaluator for Line3 {
 
 #[cfg(test)]
 mod tests {
-    use std::f64::consts::SQRT_2;
+    #![allow(clippy::float_cmp)]
 
-    use amphion_foundation::{Point2, Point3, ToleranceContext, Vector2, Vector3};
-    use num_bigint::BigInt;
-    use num_rational::BigRational;
-    use serde_json::json;
+    use std::f64::consts::SQRT_2;
 
     use crate::traits::{Curve2Evaluator, Curve3Evaluator};
     use crate::{DerivativeOrder, EvaluationContext, GeometryError};
+    use amphion_foundation::{Point2, Point3, ToleranceContext, Vector2, Vector3};
+    use num_bigint::BigInt;
+    use num_rational::BigRational;
 
-    use super::{ConstructionError, Line2, Line2Repr, Line3, Line3Repr};
+    use super::{ConstructionError, Line2, Line3};
 
     fn tol() -> ToleranceContext {
         ToleranceContext::try_new(1e-9, 1e-8, 1e-10, 1e-12).unwrap()
@@ -701,6 +699,8 @@ mod tests {
             Vector2::try_new(1.0, 1.0).unwrap(),
         )
         .unwrap();
+        let permissive =
+            EvaluationContext::new(ToleranceContext::try_new(1.0, 0.0, 1e-10, 1e-12).unwrap());
         for query in [
             line.evaluate(3.0, DerivativeOrder::Position, &ctx())
                 .unwrap()
@@ -710,7 +710,7 @@ mod tests {
             Point2::try_new(1.0e-12, -2.0e-12).unwrap(),
             Point2::try_new(10.0, 10.0 + 1.0e-12).unwrap(),
         ] {
-            let projection = line.project(query, &ctx()).unwrap().remove(0);
+            let projection = line.project(query, &permissive).unwrap().remove(0);
             let actual = dist2(query, projection.point);
             assert!(actual <= projection.distance_bound.get(), "{query:?}");
             assert!(projection.distance_bound.get() >= 0.0);
@@ -858,34 +858,24 @@ mod tests {
         let json = serde_json::to_string(&line).unwrap();
         let decoded: Line2 = serde_json::from_str(&json).unwrap();
         assert_eq!(line, decoded);
+        assert_eq!(
+            line.direction().into_array(),
+            decoded.direction().into_array()
+        );
     }
 
     #[test]
-    fn line2_serde_normalizes_non_unit_direction() {
-        // Foundation's UnitVector2::try_normalize is lenient: any finite,
-        // non-zero direction is silently renormalized rather than rejected.
-        let repr: Line2Repr = serde_json::from_value(json!({
-            "origin": [1.0, 2.0],
-            "direction": [2.0, 0.0]
-        }))
-        .unwrap();
-        let line = Line2::try_from(repr).unwrap();
-        assert_eq!(line.direction(), Vector2::try_new(1.0, 0.0).unwrap());
+    fn line2_serde_rejects_non_unit_direction() {
+        assert!(
+            serde_json::from_str::<Line2>(r#"{"origin":[1.0,2.0],"direction":[2.0,0.0]}"#).is_err()
+        );
     }
 
     #[test]
-    fn line2_serde_normalizes_marginally_non_unit_direction() {
-        // `1.000_000_000_000_000_9` is 4 ULPs above 1.0; foundation's lenient
-        // `try_normalize` accepts and renormalizes any finite non-zero input,
-        // unlike the old strict `validate_unit2` (which rejected deviations
-        // beyond `UNIT_VECTOR_TOL`).
-        let repr: Line2Repr = serde_json::from_value(json!({
-            "origin": [1.0, 2.0],
-            "direction": [1.000_000_000_000_000_9, 0.0]
-        }))
-        .unwrap();
-        let line = Line2::try_from(repr).unwrap();
-        assert_eq!(line.direction(), Vector2::try_new(1.0, 0.0).unwrap());
+    fn line2_serde_rejects_marginally_non_unit_direction() {
+        assert!(
+            serde_json::from_str::<Line2>(r#"{"origin":[1.0,2.0],"direction":[1.1,0.0]}"#).is_err()
+        );
     }
 
     #[test]
@@ -1009,6 +999,10 @@ mod tests {
         let json = serde_json::to_string(&line).unwrap();
         let decoded: Line3 = serde_json::from_str(&json).unwrap();
         assert_eq!(line, decoded);
+        assert_eq!(
+            line.direction().into_array(),
+            decoded.direction().into_array()
+        );
     }
 
     #[test]
@@ -1018,6 +1012,8 @@ mod tests {
             Vector3::try_new(1.0, 1.0, 1.0).unwrap(),
         )
         .unwrap();
+        let permissive =
+            EvaluationContext::new(ToleranceContext::try_new(1.0, 0.0, 1e-10, 1e-12).unwrap());
         for query in [
             line.evaluate(-4.0, DerivativeOrder::Position, &ctx())
                 .unwrap()
@@ -1027,7 +1023,7 @@ mod tests {
             Point3::try_new(1.0e-12, -2.0e-12, 3.0e-12).unwrap(),
             Point3::try_new(10.0, 10.0 + 1.0e-12, 10.0 - 1.0e-12).unwrap(),
         ] {
-            let projection = line.project(query, &ctx()).unwrap().remove(0);
+            let projection = line.project(query, &permissive).unwrap().remove(0);
             let actual = dist3(query, projection.point);
             assert!(actual <= projection.distance_bound.get(), "{query:?}");
             assert!(projection.distance_bound.get() >= 0.0);
@@ -1035,29 +1031,19 @@ mod tests {
     }
 
     #[test]
-    fn line3_serde_normalizes_non_unit_direction() {
-        let repr: Line3Repr = serde_json::from_value(json!({
-            "origin": [1.0, 2.0, 3.0],
-            "direction": [2.0, 0.0, 0.0]
-        }))
-        .unwrap();
-        let line = Line3::try_from(repr).unwrap();
-        assert_eq!(line.direction(), Vector3::try_new(1.0, 0.0, 0.0).unwrap());
+    fn line3_serde_rejects_non_unit_direction() {
+        assert!(
+            serde_json::from_str::<Line3>(r#"{"origin":[1.0,2.0,3.0],"direction":[2.0,0.0,0.0]}"#)
+                .is_err()
+        );
     }
 
     #[test]
-    fn line3_serde_normalizes_marginally_non_unit_direction() {
-        // See `line2_serde_normalizes_marginally_non_unit_direction`:
-        // foundation's lenient `try_normalize` accepts and renormalizes any
-        // finite non-zero input, including directions a few ULPs from unit
-        // length.
-        let repr: Line3Repr = serde_json::from_value(json!({
-            "origin": [1.0, 2.0, 3.0],
-            "direction": [1.000_000_000_000_000_9, 0.0, 0.0]
-        }))
-        .unwrap();
-        let line = Line3::try_from(repr).unwrap();
-        assert_eq!(line.direction(), Vector3::try_new(1.0, 0.0, 0.0).unwrap());
+    fn line3_serde_rejects_marginally_non_unit_direction() {
+        assert!(
+            serde_json::from_str::<Line3>(r#"{"origin":[1.0,2.0,3.0],"direction":[1.1,0.0,0.0]}"#)
+                .is_err()
+        );
     }
 
     #[test]

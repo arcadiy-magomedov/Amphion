@@ -21,7 +21,12 @@
 
 #![allow(clippy::many_single_char_names, clippy::similar_names)]
 
-use amphion_foundation::{Transform3, Vector3};
+use amphion_foundation::Transform3;
+use num_bigint::BigInt;
+use num_rational::BigRational;
+use num_traits::{One, Signed};
+
+use super::exact::{f64_to_rat, sqrt_up};
 
 /// A failure from applying a `Transform3` to an analytic primitive.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,12 +44,6 @@ pub enum TransformError {
     DegenerateResult,
 }
 
-/// Relative tolerance used to classify a transform's linear part as a
-/// similarity (equal per-axis scale, mutual orthogonality, positive
-/// determinant). This is a heuristic threshold, not a certified bound; see
-/// the module-level documentation.
-const SIMILARITY_TOL: f64 = 1e-10;
-
 /// Computes the uniform scale factor of a transform's linear part and
 /// verifies it is a similarity: equal-magnitude, mutually orthogonal
 /// columns, non-zero scale, and a positive determinant (no reflection).
@@ -53,36 +52,111 @@ const SIMILARITY_TOL: f64 = 1e-10;
 /// otherwise.
 pub(super) fn similarity_scale(transform: &Transform3) -> Option<f64> {
     let m = transform.into_row_major();
-    // Extract columns of the linear part as Vector3 (using checked constructor).
-    let c0 = Vector3::try_new(m[0], m[4], m[8]).ok()?;
-    let c1 = Vector3::try_new(m[1], m[5], m[9]).ok()?;
-    let c2 = Vector3::try_new(m[2], m[6], m[10]).ok()?;
-    let s0 = c0.try_magnitude().ok()?;
-    let s1 = c1.try_magnitude().ok()?;
-    let s2 = c2.try_magnitude().ok()?;
-    if s0 < 1e-300 {
+    let lin = [m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10]];
+    if !lin.iter().all(|value| value.is_finite()) {
         return None;
     }
-    let tol = SIMILARITY_TOL;
-    // Equal scale across all three columns.
-    if (s0 - s1).abs() > tol * s0 || (s0 - s2).abs() > tol * s0 {
+
+    let col = |j: usize| -> [BigRational; 3] {
+        [f64_to_rat(m[j]), f64_to_rat(m[4 + j]), f64_to_rat(m[8 + j])]
+    };
+    let c0 = col(0);
+    let c1 = col(1);
+    let c2 = col(2);
+
+    let dot = |a: &[BigRational; 3], b: &[BigRational; 3]| -> BigRational {
+        &a[0] * &b[0] + &a[1] * &b[1] + &a[2] * &b[2]
+    };
+
+    let n0 = dot(&c0, &c0);
+    let n1 = dot(&c1, &c1);
+    let n2 = dot(&c2, &c2);
+    if !n0.is_positive() || !n1.is_positive() || !n2.is_positive() {
         return None;
     }
-    // Mutual orthogonality using checked dot products.
-    if c0.try_dot(c1).ok()?.abs() > tol * s0 * s1 {
+
+    let eps4 = BigRational::new(BigInt::from(4i64), BigInt::one() << 52usize);
+    let tol_n = &eps4 * &n0;
+    if (&n0 - &n1).abs() > tol_n || (&n0 - &n2).abs() > tol_n {
         return None;
     }
-    if c0.try_dot(c2).ok()?.abs() > tol * s0 * s2 {
+
+    let d01 = dot(&c0, &c1);
+    let d02 = dot(&c0, &c2);
+    let d12 = dot(&c1, &c2);
+    if d01.abs() > tol_n || d02.abs() > tol_n || d12.abs() > tol_n {
         return None;
     }
-    if c1.try_dot(c2).ok()?.abs() > tol * s1 * s2 {
+
+    let det = &c0[0] * (&c1[1] * &c2[2] - &c1[2] * &c2[1])
+        - &c0[1] * (&c1[0] * &c2[2] - &c1[2] * &c2[0])
+        + &c0[2] * (&c1[0] * &c2[1] - &c1[1] * &c2[0]);
+    if !det.is_positive() {
         return None;
     }
-    // Positive determinant (no reflection).
-    let det = m[0] * (m[5] * m[10] - m[9] * m[6]) - m[1] * (m[4] * m[10] - m[8] * m[6])
-        + m[2] * (m[4] * m[9] - m[8] * m[5]);
-    if det < 0.0 {
+
+    let scale = sqrt_up(&n0).ok()?;
+    if !scale.is_finite() || scale <= 0.0 {
         return None;
     }
-    Some(s0)
+    Some(scale)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::float_cmp)]
+
+    use amphion_foundation::Transform3;
+
+    use super::similarity_scale;
+
+    #[test]
+    fn exact_similarity_accepts_identity() {
+        assert_eq!(similarity_scale(&Transform3::IDENTITY), Some(1.0));
+    }
+
+    #[test]
+    fn exact_similarity_accepts_large_scale_rotation() {
+        let scale = 1.0e200;
+        let transform = Transform3::try_from_row_major([
+            0.0, -scale, 0.0, 0.0, //
+            scale, 0.0, 0.0, 0.0, //
+            0.0, 0.0, scale, 0.0,
+        ])
+        .unwrap();
+        assert_eq!(similarity_scale(&transform), Some(scale));
+    }
+
+    #[test]
+    fn exact_similarity_rejects_shear_at_unit_scale() {
+        let transform = Transform3::try_from_row_major([
+            1.0, 1.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0,
+        ])
+        .unwrap();
+        assert_eq!(similarity_scale(&transform), None);
+    }
+
+    #[test]
+    fn exact_similarity_rejects_reflection() {
+        let transform = Transform3::try_from_row_major([
+            -1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0,
+        ])
+        .unwrap();
+        assert_eq!(similarity_scale(&transform), None);
+    }
+
+    #[test]
+    fn exact_similarity_rejects_singular() {
+        let transform = Transform3::try_from_row_major([
+            0.0, 0.0, 0.0, 0.0, //
+            0.0, 0.0, 0.0, 0.0, //
+            0.0, 0.0, 0.0, 0.0,
+        ])
+        .unwrap();
+        assert_eq!(similarity_scale(&transform), None);
+    }
 }

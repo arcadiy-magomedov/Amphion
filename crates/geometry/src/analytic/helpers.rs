@@ -39,10 +39,12 @@
 //! this reason.
 #![allow(clippy::similar_names, clippy::many_single_char_names)]
 
+use std::f64::consts::TAU;
+
 use amphion_foundation::{NormalizationError, ToleranceContext};
 use num_bigint::BigInt;
 use num_rational::BigRational;
-use num_traits::{Signed, Zero};
+use num_traits::{One, Signed, Zero};
 
 use crate::{CertificationBudget, GeometryError, ParameterRange};
 
@@ -798,6 +800,13 @@ fn ratio_by_bracket(
     }
 }
 
+/// Maps any finite angle to a canonical representative in `[0, τ)`.
+#[must_use]
+pub(super) fn angle_to_full_turn(angle: f64) -> f64 {
+    let r = angle.rem_euclid(TAU);
+    if r >= TAU { 0.0 } else { r + 0.0 }
+}
+
 /// Certified projection of `query` onto a 2-D circle
 /// `center + r·cos(θ)·x_axis + r·sin(θ)·y_axis`.
 ///
@@ -841,10 +850,26 @@ pub(super) fn exact_circle_project2(
     }
     check_rational_budget(budget, &sq_inplane)?;
 
-    let mag_down = sqrt_down(&sq_inplane).map_err(|()| GeometryError::Uncertified {
+    let gxx = &xa[0] * &xa[0] + &xa[1] * &xa[1];
+    let gyy = &ya[0] * &ya[0] + &ya[1] * &ya[1];
+    let gxy = &xa[0] * &ya[0] + &xa[1] * &ya[1];
+    let det_g = &gxx * &gyy - &gxy * &gxy;
+    if !det_g.is_positive() {
+        return Err(GeometryError::Uncertified {
+            reason: "circle frame Gram determinant non-positive".to_owned(),
+        });
+    }
+    let gram_s = (&gyy * &cx - &gxy * &cy) / &det_g;
+    let gram_t = (&gxx * &cy - &gxy * &cx) / &det_g;
+    let in_plane_sq = &cx * &gram_s + &cy * &gram_t;
+    check_rational_budget(budget, &gram_s)?;
+    check_rational_budget(budget, &gram_t)?;
+    check_rational_budget(budget, &in_plane_sq)?;
+
+    let mag_down = sqrt_down(&in_plane_sq).map_err(|()| GeometryError::Uncertified {
         reason: "circle projection in-plane magnitude is negative (unreachable)".to_owned(),
     })?;
-    let mag_up = sqrt_up(&sq_inplane).map_err(|()| GeometryError::Uncertified {
+    let mag_up = sqrt_up(&in_plane_sq).map_err(|()| GeometryError::Uncertified {
         reason: "circle projection in-plane magnitude is negative (unreachable)".to_owned(),
     })?;
     let mag_down_r = f64_to_rat(mag_down);
@@ -871,8 +896,8 @@ pub(super) fn exact_circle_project2(
     check_rational_budget(budget, &max_abs_dev)?;
     let distance_bound = rat_to_f64_up(&max_abs_dev);
 
-    let ux_interval = ratio_by_bracket(&cx, &mag_down_r, &mag_up_r);
-    let uy_interval = ratio_by_bracket(&cy, &mag_down_r, &mag_up_r);
+    let ux_interval = ratio_by_bracket(&gram_s, &mag_down_r, &mag_up_r);
+    let uy_interval = ratio_by_bracket(&gram_t, &mag_down_r, &mag_up_r);
     let point_x = RatInterval::point(c[0].clone()).add(&ux_interval.scale(&(&r * &xa[0])));
     let point_x = point_x.add(&uy_interval.scale(&(&r * &ya[0])));
     let point_y = RatInterval::point(c[1].clone()).add(&ux_interval.scale(&(&r * &xa[1])));
@@ -895,6 +920,7 @@ pub(super) fn exact_circle_project2(
         theta_interval
     };
     let (theta, theta_err) = interval_to_f64_bound(&theta_final);
+    let theta = angle_to_full_turn(theta);
 
     Ok(ExactCircleProjection {
         parameter: theta,
@@ -943,10 +969,26 @@ pub(super) fn exact_circle_project3(
     }
     check_rational_budget(budget, &sq_inplane)?;
 
-    let mag_down = sqrt_down(&sq_inplane).map_err(|()| GeometryError::Uncertified {
+    let gxx = &xa[0] * &xa[0] + &xa[1] * &xa[1] + &xa[2] * &xa[2];
+    let gyy = &ya[0] * &ya[0] + &ya[1] * &ya[1] + &ya[2] * &ya[2];
+    let gxy = &xa[0] * &ya[0] + &xa[1] * &ya[1] + &xa[2] * &ya[2];
+    let det_g = &gxx * &gyy - &gxy * &gxy;
+    if !det_g.is_positive() {
+        return Err(GeometryError::Uncertified {
+            reason: "circle frame Gram determinant non-positive".to_owned(),
+        });
+    }
+    let gram_s = (&gyy * &cx - &gxy * &cy) / &det_g;
+    let gram_t = (&gxx * &cy - &gxy * &cx) / &det_g;
+    let in_plane_sq = &cx * &gram_s + &cy * &gram_t;
+    check_rational_budget(budget, &gram_s)?;
+    check_rational_budget(budget, &gram_t)?;
+    check_rational_budget(budget, &in_plane_sq)?;
+
+    let mag_down = sqrt_down(&in_plane_sq).map_err(|()| GeometryError::Uncertified {
         reason: "circle projection in-plane magnitude is negative (unreachable)".to_owned(),
     })?;
-    let mag_up = sqrt_up(&sq_inplane).map_err(|()| GeometryError::Uncertified {
+    let mag_up = sqrt_up(&in_plane_sq).map_err(|()| GeometryError::Uncertified {
         reason: "circle projection in-plane magnitude is negative (unreachable)".to_owned(),
     })?;
     let mag_down_r = f64_to_rat(mag_down);
@@ -972,8 +1014,8 @@ pub(super) fn exact_circle_project3(
         reason: "circle projection distance is negative (unreachable)".to_owned(),
     })?;
 
-    let ux_interval = ratio_by_bracket(&cx, &mag_down_r, &mag_up_r);
-    let uy_interval = ratio_by_bracket(&cy, &mag_down_r, &mag_up_r);
+    let ux_interval = ratio_by_bracket(&gram_s, &mag_down_r, &mag_up_r);
+    let uy_interval = ratio_by_bracket(&gram_t, &mag_down_r, &mag_up_r);
     let point_x = RatInterval::point(c[0].clone()).add(&ux_interval.scale(&(&r * &xa[0])));
     let point_x = point_x.add(&uy_interval.scale(&(&r * &ya[0])));
     let point_y = RatInterval::point(c[1].clone()).add(&ux_interval.scale(&(&r * &xa[1])));
@@ -1000,6 +1042,7 @@ pub(super) fn exact_circle_project3(
         theta_interval
     };
     let (theta, theta_err) = interval_to_f64_bound(&theta_final);
+    let theta = angle_to_full_turn(theta);
 
     Ok(ExactCircleProjection {
         parameter: theta,
@@ -1116,6 +1159,8 @@ pub(super) fn exact_cylinder_eval(
 pub(super) struct ExactCylinderProjection {
     pub u: f64,
     pub v: f64,
+    pub u_error_bound: f64,
+    pub v_error_bound: f64,
     pub parameter_error_bound: f64,
     pub point: [f64; 3],
     pub point_residual_bound: f64,
@@ -1136,6 +1181,7 @@ pub(super) struct ExactCylinderProjection {
 /// [`GeometryError::Uncertified`] if the certified trig computation exceeds
 /// its budget, the in-plane magnitude underflows the smallest positive
 /// `f64`, or any intermediate value overflows `f64` range.
+#[allow(clippy::too_many_lines)]
 pub(super) fn exact_cylinder_project(
     budget: CertificationBudget,
     query: [f64; 3],
@@ -1168,10 +1214,26 @@ pub(super) fn exact_cylinder_project(
     }
     check_rational_budget(budget, &sq_inplane)?;
 
-    let mag_down = sqrt_down(&sq_inplane).map_err(|()| GeometryError::Uncertified {
+    let gxx = &xa[0] * &xa[0] + &xa[1] * &xa[1] + &xa[2] * &xa[2];
+    let gyy = &ya[0] * &ya[0] + &ya[1] * &ya[1] + &ya[2] * &ya[2];
+    let gxy = &xa[0] * &ya[0] + &xa[1] * &ya[1] + &xa[2] * &ya[2];
+    let det_g = &gxx * &gyy - &gxy * &gxy;
+    if !det_g.is_positive() {
+        return Err(GeometryError::Uncertified {
+            reason: "cylinder frame Gram determinant non-positive".to_owned(),
+        });
+    }
+    let gram_s = (&gyy * &cx - &gxy * &cy) / &det_g;
+    let gram_t = (&gxx * &cy - &gxy * &cx) / &det_g;
+    let in_plane_sq = &cx * &gram_s + &cy * &gram_t;
+    check_rational_budget(budget, &gram_s)?;
+    check_rational_budget(budget, &gram_t)?;
+    check_rational_budget(budget, &in_plane_sq)?;
+
+    let mag_down = sqrt_down(&in_plane_sq).map_err(|()| GeometryError::Uncertified {
         reason: "cylinder projection in-plane magnitude is negative (unreachable)".to_owned(),
     })?;
-    let mag_up = sqrt_up(&sq_inplane).map_err(|()| GeometryError::Uncertified {
+    let mag_up = sqrt_up(&in_plane_sq).map_err(|()| GeometryError::Uncertified {
         reason: "cylinder projection in-plane magnitude is negative (unreachable)".to_owned(),
     })?;
     let mag_down_r = f64_to_rat(mag_down);
@@ -1194,8 +1256,8 @@ pub(super) fn exact_cylinder_project(
     check_rational_budget(budget, &max_abs_dev)?;
     let distance_bound = rat_to_f64_up(&max_abs_dev);
 
-    let ux_interval = ratio_by_bracket(&cx, &mag_down_r, &mag_up_r);
-    let uy_interval = ratio_by_bracket(&cy, &mag_down_r, &mag_up_r);
+    let ux_interval = ratio_by_bracket(&gram_s, &mag_down_r, &mag_up_r);
+    let uy_interval = ratio_by_bracket(&gram_t, &mag_down_r, &mag_up_r);
     let base_x = &o[0] + &v_exact * &ad[0];
     let base_y = &o[1] + &v_exact * &ad[1];
     let base_z = &o[2] + &v_exact * &ad[2];
@@ -1225,6 +1287,7 @@ pub(super) fn exact_cylinder_project(
         theta_interval
     };
     let (u, u_err) = interval_to_f64_bound(&theta_final);
+    let u = angle_to_full_turn(u);
     let parameter_error_bound = u_err.max(v_err);
     finite_or_uncertified(
         &[u, v],
@@ -1234,6 +1297,8 @@ pub(super) fn exact_cylinder_project(
     Ok(ExactCylinderProjection {
         u,
         v,
+        u_error_bound: u_err,
+        v_error_bound: v_err,
         parameter_error_bound,
         point: [px, py, pz],
         point_residual_bound,
@@ -1404,24 +1469,27 @@ pub(super) fn exact_cone_eval(
 pub(super) struct ExactConeProjection {
     pub u: f64,
     pub v: f64,
+    pub u_error_bound: f64,
+    pub v_error_bound: f64,
     pub parameter_error_bound: f64,
     pub point: [f64; 3],
     pub point_residual_bound: f64,
     pub distance_bound: f64,
 }
 
+pub(super) struct ExactConeProjectionPair {
+    pub primary: ExactConeProjection,
+    pub secondary: Option<ExactConeProjection>,
+}
+
 /// Certified projection of `query` onto a cone surface (either nappe).
 ///
 /// # Nappe selection
 ///
-/// The correct nappe (sign of the reported `v`) is always `s = sign(h)`,
-/// where `h = (q − apex)·axis` is the exact axial coordinate of `query`
-/// relative to the apex (`s = +1` by convention when `h = 0`). This follows
-/// from comparing the (unclamped) foot-of-perpendicular arclength
-/// parameter `t* = |h|·cos(α) + radial·sin(α)` on both candidate rays in
-/// the meridian half-plane containing `query`: the nearer foot always lies
-/// on the ray whose nappe matches `sign(h)`, so no clamping or two-way
-/// distance comparison is ever required.
+/// The correct nappe (sign of the reported `v`) is `s = sign(h)`, where
+/// `h = (q − apex)·axis` is the exact axial coordinate of `query`
+/// relative to the apex. When `h = 0` exactly, both nappes are equidistant
+/// and this helper returns both certified projections.
 ///
 /// # Errors
 ///
@@ -1432,7 +1500,7 @@ pub(super) struct ExactConeProjection {
 /// smallest positive `f64`, or any intermediate value overflows `f64`
 /// range.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub(super) fn exact_cone_project(
+fn exact_cone_project_nappe(
     budget: CertificationBudget,
     query: [f64; 3],
     apex: [f64; 3],
@@ -1440,6 +1508,7 @@ pub(super) fn exact_cone_project(
     half_angle: f64,
     x_axis: [f64; 3],
     y_axis: [f64; 3],
+    s_positive: bool,
 ) -> Result<ExactConeProjection, GeometryError> {
     let q = to_rat3(query);
     let ap = to_rat3(apex);
@@ -1462,10 +1531,26 @@ pub(super) fn exact_cone_project(
     }
     check_rational_budget(budget, &radial_sq)?;
 
-    let mag_down = sqrt_down(&radial_sq).map_err(|()| GeometryError::Uncertified {
+    let gxx = &xa[0] * &xa[0] + &xa[1] * &xa[1] + &xa[2] * &xa[2];
+    let gyy = &ya[0] * &ya[0] + &ya[1] * &ya[1] + &ya[2] * &ya[2];
+    let gxy = &xa[0] * &ya[0] + &xa[1] * &ya[1] + &xa[2] * &ya[2];
+    let det_g = &gxx * &gyy - &gxy * &gxy;
+    if !det_g.is_positive() {
+        return Err(GeometryError::Uncertified {
+            reason: "cone frame Gram determinant non-positive".to_owned(),
+        });
+    }
+    let gram_s = (&gyy * &cx - &gxy * &cy) / &det_g;
+    let gram_t = (&gxx * &cy - &gxy * &cx) / &det_g;
+    let in_plane_sq = &cx * &gram_s + &cy * &gram_t;
+    check_rational_budget(budget, &gram_s)?;
+    check_rational_budget(budget, &gram_t)?;
+    check_rational_budget(budget, &in_plane_sq)?;
+
+    let mag_down = sqrt_down(&in_plane_sq).map_err(|()| GeometryError::Uncertified {
         reason: "cone projection in-plane magnitude is negative (unreachable)".to_owned(),
     })?;
-    let mag_up = sqrt_up(&radial_sq).map_err(|()| GeometryError::Uncertified {
+    let mag_up = sqrt_up(&in_plane_sq).map_err(|()| GeometryError::Uncertified {
         reason: "cone projection in-plane magnitude is negative (unreachable)".to_owned(),
     })?;
     let mag_down_r = f64_to_rat(mag_down);
@@ -1488,10 +1573,10 @@ pub(super) fn exact_cone_project(
     let t_star = cos_a.scale(&h_abs).add(&sin_a.mul(&radial_mag));
     check_interval_budget(budget, &t_star)?;
 
-    let s_val: BigRational = if h.is_negative() {
-        -BigRational::from_integer(BigInt::from(1i64))
+    let s_val = if s_positive {
+        BigRational::one()
     } else {
-        BigRational::from_integer(BigInt::from(1i64))
+        -BigRational::one()
     };
 
     let v_interval = t_star.mul(&cos_a).scale(&s_val);
@@ -1499,8 +1584,8 @@ pub(super) fn exact_cone_project(
     check_interval_budget(budget, &v_interval)?;
     check_interval_budget(budget, &rho)?;
 
-    let ux = ratio_by_bracket(&cx, &mag_down_r, &mag_up_r);
-    let uy = ratio_by_bracket(&cy, &mag_down_r, &mag_up_r);
+    let ux = ratio_by_bracket(&gram_s, &mag_down_r, &mag_up_r);
+    let uy = ratio_by_bracket(&gram_t, &mag_down_r, &mag_up_r);
 
     let point_x = RatInterval::point(ap[0].clone())
         .add(&v_interval.scale(&ax[0]))
@@ -1522,7 +1607,7 @@ pub(super) fn exact_cone_project(
     let (pz, ez) = interval_to_f64_bound(&point_z);
     let point_residual_bound = combine3_bounds(ex, ey, ez);
 
-    let sq_dist_exact = &h * &h + &radial_sq;
+    let sq_dist_exact = &h * &h + &in_plane_sq;
     let t_star_sq = t_star.mul(&t_star);
     let sq_dist_interval = RatInterval::point(sq_dist_exact).sub(&t_star_sq);
     check_interval_budget(budget, &sq_dist_interval)?;
@@ -1555,6 +1640,7 @@ pub(super) fn exact_cone_project(
         theta_interval
     };
     let (u, u_err) = interval_to_f64_bound(&theta_final);
+    let u = angle_to_full_turn(u);
     let (v, v_err) = interval_to_f64_bound(&v_interval);
     let parameter_error_bound = u_err.max(v_err);
     finite_or_uncertified(&[u, v], "cone projection parameter overflowed f64 range")?;
@@ -1562,11 +1648,51 @@ pub(super) fn exact_cone_project(
     Ok(ExactConeProjection {
         u,
         v,
+        u_error_bound: u_err,
+        v_error_bound: v_err,
         parameter_error_bound,
         point: [px, py, pz],
         point_residual_bound,
         distance_bound,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn exact_cone_project(
+    budget: CertificationBudget,
+    query: [f64; 3],
+    apex: [f64; 3],
+    axis: [f64; 3],
+    half_angle: f64,
+    x_axis: [f64; 3],
+    y_axis: [f64; 3],
+) -> Result<ExactConeProjectionPair, GeometryError> {
+    let q = to_rat3(query);
+    let ap = to_rat3(apex);
+    let ax = to_rat3(axis);
+    let diff = [&q[0] - &ap[0], &q[1] - &ap[1], &q[2] - &ap[2]];
+    let h = &diff[0] * &ax[0] + &diff[1] * &ax[1] + &diff[2] * &ax[2];
+    check_rational_budget(budget, &h)?;
+
+    let primary = exact_cone_project_nappe(
+        budget,
+        query,
+        apex,
+        axis,
+        half_angle,
+        x_axis,
+        y_axis,
+        !h.is_negative(),
+    )?;
+    let secondary = if h.is_zero() {
+        Some(exact_cone_project_nappe(
+            budget, query, apex, axis, half_angle, x_axis, y_axis, false,
+        )?)
+    } else {
+        None
+    };
+
+    Ok(ExactConeProjectionPair { primary, secondary })
 }
 
 /// Checks a certified position/distance bound against the effective
@@ -1592,6 +1718,14 @@ pub(super) fn check_tolerance(
     Ok(())
 }
 
+/// Checks an angular parameter error bound using a unit-radius angular scale.
+pub(super) fn check_angular_tolerance(
+    tolerance: &ToleranceContext,
+    bound_radians: f64,
+) -> Result<(), GeometryError> {
+    check_tolerance(tolerance, bound_radians, 1.0)
+}
+
 #[cfg(test)]
 mod tests {
     // These tests assert exact results of certified rational arithmetic
@@ -1599,15 +1733,17 @@ mod tests {
     // the intended assertion, not an approximate floating-point comparison.
     #![allow(clippy::float_cmp)]
 
+    use std::f64::consts::TAU;
+
     use amphion_foundation::{NormalizationError, ToleranceContext, Vector2, Vector3};
     use num_bigint::BigInt;
     use num_rational::BigRational;
     use num_traits::One;
 
     use super::{
-        UNIT_VECTOR_TOL, check_tolerance, exact_affine_eval2, exact_affine_eval3,
-        exact_line_project2, exact_line_project3, exact_plane_project3,
-        normalization_to_construction, rounding_error_bound,
+        UNIT_VECTOR_TOL, angle_to_full_turn, check_angular_tolerance, check_tolerance,
+        exact_affine_eval2, exact_affine_eval3, exact_line_project2, exact_line_project3,
+        exact_plane_project3, normalization_to_construction, rounding_error_bound,
     };
     use crate::CertificationBudget;
     use crate::analytic::ConstructionError;
@@ -1712,6 +1848,23 @@ mod tests {
     fn check_tolerance_rejects_bound_exceeding_effective_tolerance() {
         assert!(check_tolerance(&tol(), 1.0, 1.0).is_err());
         assert!(check_tolerance(&tol(), 1e-15, 1.0).is_ok());
+    }
+
+    #[test]
+    fn check_angular_tolerance_uses_unit_scale() {
+        assert!(check_angular_tolerance(&tol(), 1.0).is_err());
+        assert!(check_angular_tolerance(&tol(), 1e-15).is_ok());
+    }
+
+    #[test]
+    fn angle_to_full_turn_seam_cases() {
+        assert_eq!(angle_to_full_turn(TAU), 0.0);
+        assert_eq!(angle_to_full_turn(0.0), 0.0);
+        assert!(angle_to_full_turn(-f64::MIN_POSITIVE) >= 0.0);
+        assert!(angle_to_full_turn(-f64::MIN_POSITIVE) < TAU);
+        let theta = angle_to_full_turn(TAU.next_down());
+        assert!(theta < TAU);
+        assert!(theta >= 0.0);
     }
 
     #[test]

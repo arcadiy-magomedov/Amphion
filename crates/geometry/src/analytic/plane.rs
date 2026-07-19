@@ -43,17 +43,17 @@ use super::{
 };
 
 fn unbounded_range() -> ParameterRange {
-    // (None, None, None) is a compile-time constant and always valid; this
-    // is not an input-dependent path, so a static-invariant `expect` is
-    // acceptable here (see CONTRACTS.md).
-    ParameterRange::try_new(None, None, None).expect("unbounded domain is always valid")
+    match ParameterRange::try_new(None, None, None) {
+        Ok(range) => range,
+        Err(error) => panic!("plane domain is a static invariant: {error:?}"),
+    }
 }
 
 #[derive(Serialize, Deserialize)]
 struct PlaneRepr {
     origin: Point3,
-    u_axis: Vector3,
-    v_axis: Vector3,
+    u_axis: UnitVector3,
+    v_axis: UnitVector3,
 }
 
 /// An infinite analytic plane surface.
@@ -179,10 +179,8 @@ impl TryFrom<PlaneRepr> for Plane {
         if !all_finite3(origin) {
             return Err(ConstructionError::NonFiniteInput);
         }
-        let u_unit =
-            UnitVector3::try_normalize(repr.u_axis).map_err(normalization_to_construction)?;
-        let v_unit =
-            UnitVector3::try_normalize(repr.v_axis).map_err(normalization_to_construction)?;
+        let u_unit = repr.u_axis;
+        let v_unit = repr.v_axis;
         if u_unit.dot(v_unit).abs() > UNIT_VECTOR_TOL {
             return Err(ConstructionError::DependentAxes);
         }
@@ -201,8 +199,8 @@ impl From<Plane> for PlaneRepr {
     fn from(p: Plane) -> Self {
         Self {
             origin: p.origin,
-            u_axis: p.u_axis.as_vector(),
-            v_axis: p.v_axis.as_vector(),
+            u_axis: p.u_axis,
+            v_axis: p.v_axis,
         }
     }
 }
@@ -331,6 +329,7 @@ impl SurfaceEvaluator for Plane {
         let result = exact_plane_project3(context.budget, q, o, u_ax, v_ax)?;
         let scale = mag3(q) + mag3(result.point);
         check_tolerance(&context.tolerance, result.point_residual_bound, scale)?;
+        check_tolerance(&context.tolerance, result.parameter_error_bound, 1.0)?;
 
         let proj =
             Point3::try_new(result.point[0], result.point[1], result.point[2]).map_err(|_| {
@@ -368,6 +367,8 @@ impl SurfaceEvaluator for Plane {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp)]
+
     use amphion_foundation::{Point3, ToleranceContext, Vector3};
     use serde_json::json;
 
@@ -611,21 +612,18 @@ mod tests {
         let json = serde_json::to_string(&p).unwrap();
         let decoded: Plane = serde_json::from_str(&json).unwrap();
         assert_eq!(p, decoded);
+        assert_eq!(p.u_axis().into_array(), decoded.u_axis().into_array());
+        assert_eq!(p.v_axis().into_array(), decoded.v_axis().into_array());
     }
 
     #[test]
-    fn plane_serde_normalizes_non_unit_axes() {
-        // Foundation's UnitVector3::try_normalize is lenient: a non-unit but
-        // finite, non-zero axis is silently renormalized rather than
-        // rejected.
-        let repr: PlaneRepr = serde_json::from_value(json!({
-            "origin": [1.0, 2.0, 3.0],
-            "u_axis": [2.0, 0.0, 0.0],
-            "v_axis": [0.0, 1.0, 0.0]
-        }))
-        .unwrap();
-        let plane = Plane::try_from(repr).unwrap();
-        assert_eq!(plane.u_axis(), Vector3::try_new(1.0, 0.0, 0.0).unwrap());
+    fn plane_serde_rejects_non_unit_axes() {
+        assert!(
+            serde_json::from_str::<Plane>(
+                r#"{"origin":[1.0,2.0,3.0],"u_axis":[2.0,0.0,0.0],"v_axis":[0.0,1.0,0.0]}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

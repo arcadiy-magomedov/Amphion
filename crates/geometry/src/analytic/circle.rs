@@ -43,19 +43,19 @@ use crate::{
 use super::{
     ConstructionError, TransformError,
     helpers::{
-        ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite2, all_finite3, check_tolerance, dot3,
-        exact_circle_eval2, exact_circle_eval3, exact_circle_project2, exact_circle_project3,
-        in_range, mag2, mag3, normalization_to_construction, perp2, scale3, sub3,
+        ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite2, all_finite3, check_angular_tolerance,
+        check_tolerance, dot3, exact_circle_eval2, exact_circle_eval3, exact_circle_project2,
+        exact_circle_project3, in_range, mag2, mag3, normalization_to_construction, perp2, scale3,
+        sub3,
     },
     transform::similarity_scale,
 };
 
 fn circle_domain() -> ParameterRange {
-    // (0.0, TAU, TAU) is a compile-time constant with lo < hi; this is not
-    // an input-dependent path, so a static-invariant `expect` is acceptable
-    // here (see CONTRACTS.md).
-    ParameterRange::try_new(Some(0.0), Some(TAU), Some(TAU))
-        .expect("circle domain [0, 2π) is always valid")
+    match ParameterRange::try_new(Some(0.0), Some(TAU), Some(TAU)) {
+        Ok(range) => range,
+        Err(error) => panic!("circle domain is a static invariant: {error:?}"),
+    }
 }
 
 // ─── Circle2 ─────────────────────────────────────────────────────────────────
@@ -64,7 +64,7 @@ fn circle_domain() -> ParameterRange {
 struct Circle2Repr {
     center: Point2,
     radius: f64,
-    x_axis: Vector2,
+    x_axis: UnitVector2,
 }
 
 /// A circular arc in two-dimensional parameter space.
@@ -151,8 +151,7 @@ impl TryFrom<Circle2Repr> for Circle2 {
         if repr.radius <= 0.0 {
             return Err(ConstructionError::NotPositive);
         }
-        let x_unit =
-            UnitVector2::try_normalize(repr.x_axis).map_err(normalization_to_construction)?;
+        let x_unit = repr.x_axis;
         let y_arr = perp2(x_unit.into_array());
         let y_unit = UnitVector2::try_normalize(
             Vector2::try_new(y_arr[0], y_arr[1]).map_err(|_| ConstructionError::NonFiniteInput)?,
@@ -172,7 +171,7 @@ impl From<Circle2> for Circle2Repr {
         Self {
             center: c.center,
             radius: c.radius,
-            x_axis: c.x_axis.as_vector(),
+            x_axis: c.x_axis,
         }
     }
 }
@@ -286,6 +285,7 @@ impl Curve2Evaluator for Circle2 {
         let result = exact_circle_project2(context.budget, q, c, self.radius, x_ax, y_ax)?;
         let scale = mag2(q) + mag2(result.point);
         check_tolerance(&context.tolerance, result.point_residual_bound, scale)?;
+        check_angular_tolerance(&context.tolerance, result.parameter_error_bound)?;
 
         let proj = Point2::try_new(result.point[0], result.point[1]).map_err(|_| {
             GeometryError::Uncertified {
@@ -322,8 +322,8 @@ impl Curve2Evaluator for Circle2 {
 struct Circle3Repr {
     center: Point3,
     radius: f64,
-    normal: Vector3,
-    x_axis: Vector3,
+    normal: UnitVector3,
+    x_axis: UnitVector3,
 }
 
 /// A circular arc in three-dimensional model space.
@@ -474,10 +474,8 @@ impl TryFrom<Circle3Repr> for Circle3 {
         if repr.radius <= 0.0 {
             return Err(ConstructionError::NotPositive);
         }
-        let n_unit =
-            UnitVector3::try_normalize(repr.normal).map_err(normalization_to_construction)?;
-        let x_unit =
-            UnitVector3::try_normalize(repr.x_axis).map_err(normalization_to_construction)?;
+        let n_unit = repr.normal;
+        let x_unit = repr.x_axis;
         if n_unit.dot(x_unit).abs() > UNIT_VECTOR_TOL {
             return Err(ConstructionError::DependentAxes);
         }
@@ -498,8 +496,8 @@ impl From<Circle3> for Circle3Repr {
         Self {
             center: c.center,
             radius: c.radius,
-            normal: c.normal.as_vector(),
-            x_axis: c.x_axis.as_vector(),
+            normal: c.normal,
+            x_axis: c.x_axis,
         }
     }
 }
@@ -614,6 +612,7 @@ impl Curve3Evaluator for Circle3 {
         let result = exact_circle_project3(context.budget, q, c, self.radius, x_ax, y_ax, n_ax)?;
         let scale = mag3(q) + mag3(result.point);
         check_tolerance(&context.tolerance, result.point_residual_bound, scale)?;
+        check_angular_tolerance(&context.tolerance, result.parameter_error_bound)?;
 
         let proj =
             Point3::try_new(result.point[0], result.point[1], result.point[2]).map_err(|_| {
@@ -649,6 +648,8 @@ impl Curve3Evaluator for Circle3 {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp)]
+
     use std::f64::consts::{FRAC_PI_2, TAU};
 
     use amphion_foundation::{Point2, Point3, ToleranceContext, Vector2, Vector3};
@@ -841,17 +842,22 @@ mod tests {
     }
 
     #[test]
+    fn circle2_serde_bitexact_roundtrip() {
+        let c = Circle2::try_new(
+            Point2::try_new(0.0, 0.0).unwrap(),
+            1.0,
+            Vector2::try_new(0.6, 0.8).unwrap(),
+        )
+        .unwrap();
+        let json = serde_json::to_string(&c).unwrap();
+        let decoded: Circle2 = serde_json::from_str(&json).unwrap();
+        assert_eq!(c.x_axis().into_array(), decoded.x_axis().into_array());
+    }
+
+    #[test]
     fn circle2_distance_bound_large_radius_is_valid_upper_bound_or_uncertified() {
-        // Concrete counterexample from review: Circle2(radius=2^53), query=(1,1),
-        // tol.abs=1. The old local-scale (`|query - center|`) formula certified a
-        // bound (≈9007199254740990.0) that was numerically *below* the true
-        // Euclidean distance (≈9007199254740990.586), violating the DistanceBound
-        // contract. Circle projection now derives its bound from exact
-        // BigRational arithmetic and certified directed sqrt rounding, so it is
-        // either a genuine upper bound or an honest `Uncertified` — never a
-        // numerically-too-small bound.
         let tol_1m = ToleranceContext::try_new(1.0, 0.0, 1e-10, 1e-12).unwrap();
-        let radius = f64::powi(2.0, 53); // 2^53
+        let radius = f64::powi(2.0, 53);
         let c = Circle2::try_new(
             Point2::try_new(0.0, 0.0).unwrap(),
             radius,
@@ -861,18 +867,11 @@ mod tests {
         let q = Point2::try_new(1.0, 1.0).unwrap();
         let result = c.project(q, &EvaluationContext::new(tol_1m));
         match result {
-            Err(GeometryError::Uncertified { .. }) => {
-                // Correctly identified as uncertifiable at this scale/tolerance.
-            }
+            Err(GeometryError::Uncertified { .. }) => {}
             Ok(projs) => {
-                // If a bound is returned, it MUST be a valid upper bound.
                 for p in &projs {
                     let actual = dist2(q, p.point);
-                    assert!(
-                        actual <= p.distance_bound.get(),
-                        "distance_bound={} < actual_distance={actual}",
-                        p.distance_bound.get()
-                    );
+                    assert!(actual <= p.distance_bound.get());
                 }
             }
             Err(other) => panic!("unexpected error: {other:?}"),
@@ -880,18 +879,13 @@ mod tests {
     }
 
     #[test]
-    fn circle2_serde_normalizes_axis_and_rejects_bad_radius() {
-        // Foundation's UnitVector2::try_normalize is lenient: a non-unit but
-        // finite, non-zero x_axis is silently renormalized rather than
-        // rejected.
-        let normalized_axis: Circle2Repr = serde_json::from_value(json!({
-            "center": [1.0, 2.0],
-            "radius": 3.0,
-            "x_axis": [2.0, 0.0]
-        }))
-        .unwrap();
-        let circle = Circle2::try_from(normalized_axis).unwrap();
-        assert_eq!(circle.x_axis(), Vector2::try_new(1.0, 0.0).unwrap());
+    fn circle2_serde_rejects_non_unit_axis() {
+        assert!(
+            serde_json::from_str::<Circle2>(
+                r#"{"center":[0.0,0.0],"radius":1.0,"x_axis":[2.0,0.0]}"#
+            )
+            .is_err()
+        );
 
         let bad_radius: Circle2Repr = serde_json::from_value(json!({
             "center": [1.0, 2.0],
@@ -1100,22 +1094,18 @@ mod tests {
         let json = serde_json::to_string(&c).unwrap();
         let decoded: Circle3 = serde_json::from_str(&json).unwrap();
         assert_eq!(c, decoded);
+        assert_eq!(c.normal().into_array(), decoded.normal().into_array());
+        assert_eq!(c.x_axis().into_array(), decoded.x_axis().into_array());
     }
 
     #[test]
-    fn circle3_serde_normalizes_axis_and_rejects_dependent_axes_and_bad_radius() {
-        // Foundation's UnitVector3::try_normalize is lenient: a non-unit but
-        // finite, non-zero normal is silently renormalized rather than
-        // rejected.
-        let normalized_axis: Circle3Repr = serde_json::from_value(json!({
-            "center": [1.0, 2.0, 3.0],
-            "radius": 4.0,
-            "normal": [2.0, 0.0, 0.0],
-            "x_axis": [0.0, 1.0, 0.0]
-        }))
-        .unwrap();
-        let circle = Circle3::try_from(normalized_axis).unwrap();
-        assert_eq!(circle.normal(), Vector3::try_new(1.0, 0.0, 0.0).unwrap());
+    fn circle3_serde_rejects_non_unit_axis_and_bad_radius() {
+        assert!(
+            serde_json::from_str::<Circle3>(
+                r#"{"center":[1.0,2.0,3.0],"radius":4.0,"normal":[2.0,0.0,0.0],"x_axis":[0.0,1.0,0.0]}"#
+            )
+            .is_err()
+        );
 
         let bad_frame: Circle3Repr = serde_json::from_value(json!({
             "center": [1.0, 2.0, 3.0],

@@ -28,13 +28,11 @@
 //! ∂²p/∂v²  =  0
 //! ```
 //!
-//! Projection: the correct nappe (sign of the reported `v`) is always
-//! `s = sign(h)` where `h = (q − apex)·axis`, proven by comparing the
-//! foot-of-perpendicular arclength parameter on both candidate rays in the
-//! meridian half-plane containing the query point; no clamping or
-//! two-candidate distance comparison is required.  Returns
-//! [`GeometryError::Singular`] when the query lies exactly on the cone's
-//! axis (no unique nearest point or azimuthal angle).
+//! Projection: the correct nappe (sign of the reported `v`) is `s = sign(h)`
+//! where `h = (q − apex)·axis`; on the equatorial plane (`h = 0`) both
+//! nappes are equidistant and both certified solutions are returned.
+//! Returns [`GeometryError::Singular`] when the query lies exactly on the
+//! cone's axis (no unique nearest point or azimuthal angle).
 
 #![allow(
     clippy::many_single_char_names,
@@ -57,33 +55,33 @@ use crate::{
 use super::{
     ConstructionError, TransformError,
     helpers::{
-        ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite3, check_tolerance, dot3, exact_cone_eval,
-        exact_cone_project, in_range, mag3, normalization_to_construction, scale3, sub3,
+        ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite3, check_angular_tolerance, check_tolerance,
+        dot3, exact_cone_eval, exact_cone_project, in_range, mag3, normalization_to_construction,
+        scale3, sub3,
     },
     transform::similarity_scale,
 };
 
 fn angular_range() -> ParameterRange {
-    // (0.0, TAU, TAU) is a compile-time constant with lo < hi; this is not
-    // an input-dependent path, so a static-invariant `expect` is acceptable
-    // here (see CONTRACTS.md).
-    ParameterRange::try_new(Some(0.0), Some(TAU), Some(TAU))
-        .expect("angular [0, 2π) domain is always valid")
+    match ParameterRange::try_new(Some(0.0), Some(TAU), Some(TAU)) {
+        Ok(range) => range,
+        Err(error) => panic!("cone angular domain is a static invariant: {error:?}"),
+    }
 }
 
 fn unbounded_range() -> ParameterRange {
-    // (None, None, None) is a compile-time constant and always valid; this
-    // is not an input-dependent path, so a static-invariant `expect` is
-    // acceptable here (see CONTRACTS.md).
-    ParameterRange::try_new(None, None, None).expect("unbounded domain is always valid")
+    match ParameterRange::try_new(None, None, None) {
+        Ok(range) => range,
+        Err(error) => panic!("cone v-domain is a static invariant: {error:?}"),
+    }
 }
 
 #[derive(Serialize, Deserialize)]
 struct ConeRepr {
     apex: Point3,
-    axis: Vector3,
+    axis: UnitVector3,
     half_angle: f64,
-    x_axis: Vector3,
+    x_axis: UnitVector3,
 }
 
 /// A right circular cone surface, including both nappes.
@@ -235,10 +233,8 @@ impl TryFrom<ConeRepr> for Cone {
         if repr.half_angle <= 0.0 || repr.half_angle >= std::f64::consts::FRAC_PI_2 {
             return Err(ConstructionError::InvalidHalfAngle);
         }
-        let a_unit =
-            UnitVector3::try_normalize(repr.axis).map_err(normalization_to_construction)?;
-        let x_unit =
-            UnitVector3::try_normalize(repr.x_axis).map_err(normalization_to_construction)?;
+        let a_unit = repr.axis;
+        let x_unit = repr.x_axis;
         if a_unit.dot(x_unit).abs() > UNIT_VECTOR_TOL {
             return Err(ConstructionError::DependentAxes);
         }
@@ -258,9 +254,9 @@ impl From<Cone> for ConeRepr {
     fn from(c: Cone) -> Self {
         Self {
             apex: c.apex,
-            axis: c.axis.as_vector(),
+            axis: c.axis,
             half_angle: c.half_angle,
-            x_axis: c.x_axis.as_vector(),
+            x_axis: c.x_axis,
         }
     }
 }
@@ -427,36 +423,50 @@ impl SurfaceEvaluator for Cone {
         let ya = self.y_axis.into_array();
 
         let result = exact_cone_project(context.budget, q, ap, ax, self.half_angle, xa, ya)?;
-        let scale = mag3(q) + mag3(result.point);
-        check_tolerance(&context.tolerance, result.point_residual_bound, scale)?;
+        let mut certified = Vec::new();
+        for projection in [Some(result.primary), result.secondary]
+            .into_iter()
+            .flatten()
+        {
+            let scale = mag3(q) + mag3(projection.point);
+            check_tolerance(&context.tolerance, projection.point_residual_bound, scale)?;
+            check_angular_tolerance(&context.tolerance, projection.u_error_bound)?;
+            check_tolerance(&context.tolerance, projection.v_error_bound, 1.0)?;
 
-        let proj =
-            Point3::try_new(result.point[0], result.point[1], result.point[2]).map_err(|_| {
-                GeometryError::Uncertified {
-                    reason: "cone projection point is non-finite".to_owned(),
-                }
+            let proj = Point3::try_new(
+                projection.point[0],
+                projection.point[1],
+                projection.point[2],
+            )
+            .map_err(|_| GeometryError::Uncertified {
+                reason: "cone projection point is non-finite".to_owned(),
             })?;
-        output.push(SurfaceProjection {
-            u: ParameterValue::try_new(result.u).map_err(|_| GeometryError::Uncertified {
-                reason: "cone projection u is non-finite".to_owned(),
-            })?,
-            v: ParameterValue::try_new(result.v).map_err(|_| GeometryError::Uncertified {
-                reason: "cone projection v is non-finite".to_owned(),
-            })?,
-            point: proj,
-            distance_bound: DistanceBound::try_new(result.distance_bound).map_err(|_| {
-                GeometryError::Uncertified {
-                    reason: "cone projection distance is non-finite or negative".to_owned(),
-                }
-            })?,
-            parameter_error_bound: result.parameter_error_bound,
-            point_residual_bound: PositionBound::try_new(result.point_residual_bound).map_err(
-                |_| GeometryError::Uncertified {
-                    reason: "cone projection point residual bound is non-finite or negative"
-                        .to_owned(),
-                },
-            )?,
-        });
+            certified.push(SurfaceProjection {
+                u: ParameterValue::try_new(projection.u).map_err(|_| {
+                    GeometryError::Uncertified {
+                        reason: "cone projection u is non-finite".to_owned(),
+                    }
+                })?,
+                v: ParameterValue::try_new(projection.v).map_err(|_| {
+                    GeometryError::Uncertified {
+                        reason: "cone projection v is non-finite".to_owned(),
+                    }
+                })?,
+                point: proj,
+                distance_bound: DistanceBound::try_new(projection.distance_bound).map_err(
+                    |_| GeometryError::Uncertified {
+                        reason: "cone projection distance is non-finite or negative".to_owned(),
+                    },
+                )?,
+                parameter_error_bound: projection.parameter_error_bound,
+                point_residual_bound: PositionBound::try_new(projection.point_residual_bound)
+                    .map_err(|_| GeometryError::Uncertified {
+                        reason: "cone projection point residual bound is non-finite or negative"
+                            .to_owned(),
+                    })?,
+            });
+        }
+        output.extend(certified);
         Ok(())
     }
 }
@@ -465,6 +475,8 @@ impl SurfaceEvaluator for Cone {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp)]
+
     use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, TAU};
 
     use amphion_foundation::{Point3, ToleranceContext, Vector3};
@@ -677,6 +689,16 @@ mod tests {
     }
 
     #[test]
+    fn cone_project_equatorial_returns_two_solutions() {
+        let c = std_cone();
+        let q = Point3::try_new(2.0, 0.0, 0.0).unwrap();
+        let projs = c.project(q, &ctx()).unwrap();
+        assert_eq!(projs.len(), 2);
+        assert!(projs[0].v.get() > 0.0);
+        assert!(projs[1].v.get() < 0.0);
+    }
+
+    #[test]
     fn cone_project_into_clears_output_on_error() {
         // Querying exactly on the cone axis is singular: the in-plane
         // offset is zero, so there is no unique nearest point / azimuthal
@@ -705,22 +727,18 @@ mod tests {
         let json = serde_json::to_string(&c).unwrap();
         let decoded: Cone = serde_json::from_str(&json).unwrap();
         assert_eq!(c, decoded);
+        assert_eq!(c.axis().into_array(), decoded.axis().into_array());
+        assert_eq!(c.x_axis().into_array(), decoded.x_axis().into_array());
     }
 
     #[test]
-    fn cone_serde_normalizes_axis_and_rejects_dependent_axes_and_bad_angle() {
-        // Foundation's UnitVector3::try_normalize is lenient: a non-unit but
-        // finite, non-zero axis is silently renormalized rather than
-        // rejected.
-        let normalized_axis: ConeRepr = serde_json::from_value(json!({
-            "apex": [1.0, 2.0, 3.0],
-            "axis": [2.0, 0.0, 0.0],
-            "half_angle": 0.5,
-            "x_axis": [0.0, 1.0, 0.0]
-        }))
-        .unwrap();
-        let cone = Cone::try_from(normalized_axis).unwrap();
-        assert_eq!(cone.axis(), Vector3::try_new(1.0, 0.0, 0.0).unwrap());
+    fn cone_serde_rejects_non_unit_axis_and_bad_angle() {
+        assert!(
+            serde_json::from_str::<Cone>(
+                r#"{"apex":[1.0,2.0,3.0],"axis":[2.0,0.0,0.0],"half_angle":0.5,"x_axis":[0.0,1.0,0.0]}"#
+            )
+            .is_err()
+        );
 
         let bad_frame: ConeRepr = serde_json::from_value(json!({
             "apex": [1.0, 2.0, 3.0],

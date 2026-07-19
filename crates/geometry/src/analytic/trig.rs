@@ -45,9 +45,8 @@ use num_bigint::{BigInt, Sign};
 use num_rational::BigRational;
 use num_traits::{One, Signed, Zero};
 
-use super::exact::rat_to_f64;
 #[cfg(test)]
-use super::exact::rat_to_f64_up;
+use super::exact::{rat_to_f64, rat_to_f64_up};
 use crate::CertificationBudget;
 
 /// Error from the certified trig module.
@@ -144,16 +143,16 @@ impl RatInterval {
             &self.hi * &rhs.lo,
             &self.hi * &rhs.hi,
         ];
-        let lo = products
-            .iter()
-            .min()
-            .expect("four-element array always has a minimum")
-            .clone();
-        let hi = products
-            .iter()
-            .max()
-            .expect("four-element array always has a maximum")
-            .clone();
+        let mut lo = products[0].clone();
+        let mut hi = products[0].clone();
+        for product in &products[1..] {
+            if *product < lo {
+                lo = product.clone();
+            }
+            if *product > hi {
+                hi = product.clone();
+            }
+        }
         RatInterval { lo, hi }
     }
 
@@ -204,16 +203,16 @@ impl RatInterval {
             &self.hi / &rhs.lo,
             &self.hi / &rhs.hi,
         ];
-        let lo = quotients
-            .iter()
-            .min()
-            .expect("four-element array always has a minimum")
-            .clone();
-        let hi = quotients
-            .iter()
-            .max()
-            .expect("four-element array always has a maximum")
-            .clone();
+        let mut lo = quotients[0].clone();
+        let mut hi = quotients[0].clone();
+        for quotient in &quotients[1..] {
+            if *quotient < lo {
+                lo = quotient.clone();
+            }
+            if *quotient > hi {
+                hi = quotient.clone();
+            }
+        }
         Ok(RatInterval { lo, hi })
     }
 
@@ -507,6 +506,7 @@ fn sin_cos_at_rational(
     let pi_mid = (&pi.lo + &pi.hi) / &two;
     let half_pi_mid = &pi_mid / &two;
     let quarter_pi_mid = &pi_mid / BigRational::from_integer(BigInt::from(4i64));
+    let pi_half_width = (&pi.hi - &pi.lo) / &two;
 
     // Handle negative x: sin(-x) = -sin(x), cos(-x) = cos(x)
     if *x < zero {
@@ -518,21 +518,25 @@ fn sin_cos_at_rational(
     if *x > pi_mid {
         let x_reduced = x - &pi_mid;
         let (s, c) = sin_cos_at_rational(&x_reduced, budget, pi)?;
-        return Ok((s.neg(), c.neg()));
+        return Ok((s.neg().widen(&pi_half_width), c.neg().widen(&pi_half_width)));
     }
 
     // Now x ∈ [0, π]. Reduce to [0, π/2]: sin(π - x) = sin(x), cos(π - x) = -cos(x)
     if *x > half_pi_mid {
         let x_reduced = &pi_mid - x;
         let (s, c) = sin_cos_at_rational(&x_reduced, budget, pi)?;
-        return Ok((s, c.neg()));
+        return Ok((s.widen(&pi_half_width), c.neg().widen(&pi_half_width)));
     }
 
     // Now x ∈ [0, π/2]. Reduce to [0, π/4]: cos(π/2 - x) = sin(x), sin(π/2 - x) = cos(x)
     if *x > quarter_pi_mid {
         let x_reduced = &half_pi_mid - x;
         let (s, c) = sin_cos_at_rational(&x_reduced, budget, pi)?;
-        return Ok((c, s));
+        let quarter_pi_half_width = &pi_half_width / &two;
+        return Ok((
+            c.widen(&quarter_pi_half_width),
+            s.widen(&quarter_pi_half_width),
+        ));
     }
 
     // x ∈ [0, π/4]: apply the Taylor series directly.
@@ -562,34 +566,21 @@ pub fn sin_cos_interval(
     let pi2_lo = &pi.lo * &two; // 2π lower bound
     let pi2_hi = &pi.hi * &two; // 2π upper bound
 
-    // Reduce x modulo 2π: find k such that x - k*2π ∈ [0, 2π), using an f64
-    // approximation of x/(2π) to pick k (k itself needs no certification —
-    // any nearby integer works, since the interval arithmetic below
-    // certifies the reduced-argument enclosure regardless of k's exactness,
-    // as long as it keeps `x_red` bounded to values `sin_cos_at_rational`
-    // handles, which it does for any finite rational).
-    let pi_mid_f64 = rat_to_f64(&((&pi.lo + &pi.hi) / &two));
-    let two_pi_mid = 2.0_f64 * pi_mid_f64;
-    let x_f64 = rat_to_f64(x);
-    let k = if two_pi_mid.is_finite() && two_pi_mid != 0.0 && x_f64.is_finite() {
-        // Saturating f64->i64 cast: `k` is only a reduction hint (see the
-        // comment above) and any finite value — even a saturated one for
-        // pathologically huge `x` — still yields a valid, if wide, certified
-        // enclosure from the interval arithmetic below.
-        #[allow(clippy::cast_possible_truncation)]
-        let k_hint = (x_f64 / two_pi_mid).floor() as i64;
-        k_hint
+    // Compute k = floor(x / tau_hi) exactly. Since tau_hi ≥ τ, this keeps the
+    // reduced lower bound non-negative without saturating on huge arguments.
+    let k = bigrat_floor(&(x / &pi2_hi));
+    let (x_red_lo, x_red_hi) = if k.sign() == Sign::Minus {
+        let k_abs = BigRational::from_integer(-k);
+        (x + &k_abs * &pi2_lo, x + &k_abs * &pi2_hi)
     } else {
-        0
-    };
-
-    let (x_red_lo, x_red_hi) = if k >= 0 {
-        let k_rat = BigRational::from_integer(BigInt::from(k));
+        let k_rat = BigRational::from_integer(k);
         (x - &k_rat * &pi2_hi, x - &k_rat * &pi2_lo)
-    } else {
-        let k_rat = BigRational::from_integer(BigInt::from(-k));
-        (x + &k_rat * &pi2_lo, x + &k_rat * &pi2_hi)
     };
+    check_budget(budget, &x_red_lo)?;
+    check_budget(budget, &x_red_hi)?;
+    if &x_red_hi - &x_red_lo > pi2_hi {
+        return Err(TrigError::BudgetExhausted);
+    }
 
     let x_mid = (&x_red_lo + &x_red_hi) / &two;
     let interval_half_width = (&x_red_hi - &x_red_lo) / &two;
@@ -602,6 +593,19 @@ pub fn sin_cos_interval(
     let cos_result = cos_mid.widen(&interval_half_width);
 
     Ok((sin_result, cos_result))
+}
+
+fn bigrat_floor(r: &BigRational) -> BigInt {
+    if r.is_integer() {
+        r.numer().clone()
+    } else {
+        let q = r.numer() / r.denom();
+        if r.is_negative() {
+            q - BigInt::one()
+        } else {
+            q
+        }
+    }
 }
 
 #[cfg(test)]
@@ -717,6 +721,27 @@ mod tests {
         let (s3, c3) = sin_cos_interval(&pi_mid, budget).unwrap();
         assert!(s3.midpoint_f64().abs() < 1e-6);
         assert!((c3.midpoint_f64() + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sin_cos_pi_midpoint_not_zero_interval() {
+        let budget = CertificationBudget::default();
+        let pi = pi_interval(budget).unwrap();
+        let pi_mid = (&pi.lo + &pi.hi) / BigRational::from_integer(2.into());
+        let (s, _) = sin_cos_interval(&pi_mid, budget).unwrap();
+        assert!(s.lo < s.hi, "sin(pi_mid) interval must have positive width");
+        assert!(s.lo <= BigRational::zero() && BigRational::zero() <= s.hi);
+    }
+
+    #[test]
+    fn sin_cos_huge_argument_terminates() {
+        let budget = CertificationBudget::default();
+        let x = f64_to_rat(f64::MAX);
+        let result = sin_cos_interval(&x, budget);
+        match result {
+            Ok(_) | Err(TrigError::BudgetExhausted) => {}
+            Err(e) => panic!("unexpected error: {e:?}"),
+        }
     }
 
     #[test]
