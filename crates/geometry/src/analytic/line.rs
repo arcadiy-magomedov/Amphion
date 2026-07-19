@@ -29,15 +29,16 @@ use crate::traits::{Curve2Evaluator, Curve3Evaluator};
 use crate::{
     CurveEvaluation2, CurveEvaluation3, CurveKind, CurveProjection2, CurveProjection3,
     DerivativeOrder, DistanceBound, EvaluationContext, FirstDerivativeBound, GeometryError,
-    ParameterRange, ParameterValue, PositionBound, SecondDerivativeBound,
+    LinearParameterBound, ParameterErrorBound, ParameterRange, ParameterValue, PositionBound,
+    SecondDerivativeBound,
 };
 
 use super::{
     ConstructionError, TransformError,
     helpers::{
-        all_finite2, all_finite3, check_tolerance, exact_affine_eval2, exact_affine_eval3,
-        exact_line_project2, exact_line_project3, mag2, mag3, normalization_to_construction,
-        scale2, scale3,
+        all_finite2, all_finite3, check_parametric_tolerance, check_tolerance, exact_affine_eval2,
+        exact_affine_eval3, exact_line_project2, exact_line_project3, mag2, mag3,
+        normalization_to_construction, scale2, scale3,
     },
 };
 
@@ -55,6 +56,8 @@ fn line_domain() -> ParameterRange {
 
 #[derive(Serialize, Deserialize)]
 struct Line2Repr {
+    #[serde(default)]
+    version: u32,
     origin: Point2,
     direction: UnitVector2,
 }
@@ -107,6 +110,9 @@ impl Line2 {
 impl TryFrom<Line2Repr> for Line2 {
     type Error = ConstructionError;
     fn try_from(repr: Line2Repr) -> Result<Self, Self::Error> {
+        if repr.version != 0 && repr.version != 1 {
+            return Err(ConstructionError::NonFiniteInput);
+        }
         let origin = repr.origin.into_array();
         if !all_finite2(origin) {
             return Err(ConstructionError::NonFiniteInput);
@@ -121,6 +127,7 @@ impl TryFrom<Line2Repr> for Line2 {
 impl From<Line2> for Line2Repr {
     fn from(line: Line2) -> Self {
         Self {
+            version: 1,
             origin: line.origin,
             direction: line.direction,
         }
@@ -222,13 +229,19 @@ impl Curve2Evaluator for Line2 {
         let result = exact_line_project2(context.budget, q, o, d)?;
         let scale = mag2(q) + mag2(result.point);
         check_tolerance(&context.tolerance, result.point_residual_bound, scale)?;
-        check_tolerance(&context.tolerance, result.parameter_error_bound, 1.0)?;
+        check_parametric_tolerance(&context.tolerance, result.parameter_error_bound)?;
 
         let proj = Point2::try_new(result.point[0], result.point[1]).map_err(|_| {
             GeometryError::Uncertified {
                 reason: "line projection point is non-finite".to_owned(),
             }
         })?;
+        let lin_bound =
+            LinearParameterBound::try_new(result.parameter_error_bound).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "line2 linear parameter bound is invalid".to_owned(),
+                }
+            })?;
         output.push(CurveProjection2 {
             parameter: ParameterValue::try_new(result.parameter).map_err(|_| {
                 GeometryError::Uncertified {
@@ -241,7 +254,7 @@ impl Curve2Evaluator for Line2 {
                     reason: "line projection distance is non-finite or negative".to_owned(),
                 }
             })?,
-            parameter_error_bound: result.parameter_error_bound,
+            parameter_error_bound: ParameterErrorBound::Linear(lin_bound),
             point_residual_bound: PositionBound::try_new(result.point_residual_bound).map_err(
                 |_| GeometryError::Uncertified {
                     reason: "line projection point residual bound is non-finite or negative"
@@ -257,6 +270,8 @@ impl Curve2Evaluator for Line2 {
 
 #[derive(Serialize, Deserialize)]
 struct Line3Repr {
+    #[serde(default)]
+    version: u32,
     origin: Point3,
     direction: UnitVector3,
 }
@@ -332,6 +347,9 @@ impl Line3 {
 impl TryFrom<Line3Repr> for Line3 {
     type Error = ConstructionError;
     fn try_from(repr: Line3Repr) -> Result<Self, Self::Error> {
+        if repr.version != 0 && repr.version != 1 {
+            return Err(ConstructionError::NonFiniteInput);
+        }
         let origin = repr.origin.into_array();
         if !all_finite3(origin) {
             return Err(ConstructionError::NonFiniteInput);
@@ -346,6 +364,7 @@ impl TryFrom<Line3Repr> for Line3 {
 impl From<Line3> for Line3Repr {
     fn from(line: Line3) -> Self {
         Self {
+            version: 1,
             origin: line.origin,
             direction: line.direction,
         }
@@ -447,12 +466,18 @@ impl Curve3Evaluator for Line3 {
         let result = exact_line_project3(context.budget, q, o, d)?;
         let scale = mag3(q) + mag3(result.point);
         check_tolerance(&context.tolerance, result.point_residual_bound, scale)?;
-        check_tolerance(&context.tolerance, result.parameter_error_bound, 1.0)?;
+        check_parametric_tolerance(&context.tolerance, result.parameter_error_bound)?;
 
         let proj =
             Point3::try_new(result.point[0], result.point[1], result.point[2]).map_err(|_| {
                 GeometryError::Uncertified {
                     reason: "line projection point is non-finite".to_owned(),
+                }
+            })?;
+        let lin_bound =
+            LinearParameterBound::try_new(result.parameter_error_bound).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "line3 linear parameter bound is invalid".to_owned(),
                 }
             })?;
         output.push(CurveProjection3 {
@@ -467,7 +492,7 @@ impl Curve3Evaluator for Line3 {
                     reason: "line projection distance is non-finite or negative".to_owned(),
                 }
             })?,
-            parameter_error_bound: result.parameter_error_bound,
+            parameter_error_bound: ParameterErrorBound::Linear(lin_bound),
             point_residual_bound: PositionBound::try_new(result.point_residual_bound).map_err(
                 |_| GeometryError::Uncertified {
                     reason: "line projection point residual bound is non-finite or negative"
@@ -671,7 +696,7 @@ mod tests {
         assert_eq!(projections.len(), 1);
         assert!((projections[0].parameter.get() - t0).abs() < 1e-12);
         assert!(projections[0].distance_bound.get() < 1e-12);
-        assert!(projections[0].parameter_error_bound >= 0.0);
+        assert!(projections[0].parameter_error_bound.get() >= 0.0);
         assert!(projections[0].point_residual_bound.get() >= 0.0);
     }
 
@@ -700,7 +725,7 @@ mod tests {
         )
         .unwrap();
         let permissive =
-            EvaluationContext::new(ToleranceContext::try_new(1.0, 0.0, 1e-10, 1e-12).unwrap());
+            EvaluationContext::new(ToleranceContext::try_new(1.0, 0.0, 1e-10, 1.0).unwrap());
         for query in [
             line.evaluate(3.0, DerivativeOrder::Position, &ctx())
                 .unwrap()
@@ -1013,7 +1038,7 @@ mod tests {
         )
         .unwrap();
         let permissive =
-            EvaluationContext::new(ToleranceContext::try_new(1.0, 0.0, 1e-10, 1e-12).unwrap());
+            EvaluationContext::new(ToleranceContext::try_new(1.0, 0.0, 1e-10, 1.0).unwrap());
         for query in [
             line.evaluate(-4.0, DerivativeOrder::Position, &ctx())
                 .unwrap()
@@ -1118,6 +1143,56 @@ mod tests {
         assert_eq!(
             l.try_transform(&t),
             Err(super::TransformError::NonFiniteResult)
+        );
+    }
+
+    // ─── Typed parameter tolerance regression tests ──────────────────────────
+
+    /// Blocker 1 regression: Line2 origin=(0,0), dir=(1,1), q=(1,0),
+    /// `abs_length=1`, `parametric=1e-300` must return `Uncertified` because the
+    /// certified parameter error bound exceeds `1e-300`.
+    #[test]
+    fn line2_parametric_tolerance_regression_uncertified() {
+        use amphion_foundation::ToleranceContext;
+
+        let line = Line2::try_new(
+            Point2::try_new(0.0, 0.0).unwrap(),
+            Vector2::try_new(1.0, 1.0).unwrap(),
+        )
+        .unwrap();
+        let q = Point2::try_new(1.0, 0.0).unwrap();
+        // Very tight parametric tolerance — the certified parameter bound cannot
+        // satisfy this.
+        let tight_ctx =
+            EvaluationContext::new(ToleranceContext::try_new(1.0, 0.0, 1e-10, 1e-300).unwrap());
+        let result = line.project(q, &tight_ctx);
+        assert!(
+            result.is_err(),
+            "expected Uncertified for parametric=1e-300, got {result:?}"
+        );
+        if let Err(GeometryError::Uncertified { .. }) = result {
+        } else {
+            panic!("expected Uncertified, got {result:?}");
+        }
+    }
+
+    /// Blocker 1: permissive parametric tolerance allows the same query.
+    #[test]
+    fn line2_parametric_tolerance_regression_permissive() {
+        use amphion_foundation::ToleranceContext;
+
+        let line = Line2::try_new(
+            Point2::try_new(0.0, 0.0).unwrap(),
+            Vector2::try_new(1.0, 1.0).unwrap(),
+        )
+        .unwrap();
+        let q = Point2::try_new(1.0, 0.0).unwrap();
+        let permissive_ctx =
+            EvaluationContext::new(ToleranceContext::try_new(1.0, 0.0, 1e-10, 1.0).unwrap());
+        let result = line.project(q, &permissive_ctx);
+        assert!(
+            result.is_ok(),
+            "permissive parametric should succeed: {result:?}"
         );
     }
 }

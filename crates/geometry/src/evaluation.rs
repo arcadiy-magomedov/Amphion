@@ -3,6 +3,148 @@
 use amphion_foundation::{Point2, Point3, ToleranceContext, Vector2, Vector3};
 use serde::{Deserialize, Serialize};
 
+/// A non-negative certified upper bound on a periodic (angular) parameter
+/// error, in radians.
+///
+/// A bound of `δ` means the true nearest parameter is within `δ` radians
+/// of the reported parameter **in the periodic sense** — values near the
+/// seam (`u ≈ 0` or `u ≈ 2π`) are equated. This is not a linear distance
+/// across `[0, 2π)` but a circular distance.
+///
+/// Used for circle (`θ`), cylinder (`u`), and cone (`u`) parameters.
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "f64", into = "f64")]
+pub struct AngularParameterBound(f64);
+
+impl AngularParameterBound {
+    /// Creates an angular parameter error bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectionValueError`] when `value` is negative, NaN, or
+    /// infinite.
+    pub fn try_new(value: f64) -> Result<Self, ProjectionValueError> {
+        Self::try_from(value)
+    }
+
+    /// Returns the bound in radians.
+    #[must_use]
+    pub const fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl TryFrom<f64> for AngularParameterBound {
+    type Error = ProjectionValueError;
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        if value.is_finite() && value >= 0.0 {
+            Ok(Self(value))
+        } else {
+            Err(ProjectionValueError)
+        }
+    }
+}
+
+impl From<AngularParameterBound> for f64 {
+    fn from(value: AngularParameterBound) -> Self {
+        value.0
+    }
+}
+
+/// A non-negative certified upper bound on a non-periodic (linear) parameter
+/// error.
+///
+/// Used for line (`t`), plane (`u`, `v`), cylinder (`v`), and cone (`v`)
+/// parameters.
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "f64", into = "f64")]
+pub struct LinearParameterBound(f64);
+
+impl LinearParameterBound {
+    /// Creates a linear parameter error bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectionValueError`] when `value` is negative, NaN, or
+    /// infinite.
+    pub fn try_new(value: f64) -> Result<Self, ProjectionValueError> {
+        Self::try_from(value)
+    }
+
+    /// Returns the bound.
+    #[must_use]
+    pub const fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl TryFrom<f64> for LinearParameterBound {
+    type Error = ProjectionValueError;
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        if value.is_finite() && value >= 0.0 {
+            Ok(Self(value))
+        } else {
+            Err(ProjectionValueError)
+        }
+    }
+}
+
+impl From<LinearParameterBound> for f64 {
+    fn from(value: LinearParameterBound) -> Self {
+        value.0
+    }
+}
+
+/// A dimensionally typed certified upper bound on a curve or surface
+/// parameter error.
+///
+/// The `Angular` variant carries a periodic (circular) bound in radians;
+/// the `Linear` variant carries a non-periodic bound. Both enforce that the
+/// inner value is non-negative and finite.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum ParameterErrorBound {
+    /// A periodic angular bound in radians (circles, cylinder/cone u).
+    Angular(AngularParameterBound),
+    /// A non-periodic linear bound (lines, plane u/v, cylinder/cone v).
+    Linear(LinearParameterBound),
+}
+
+impl ParameterErrorBound {
+    /// Returns the bound as a raw `f64` (non-negative).
+    #[must_use]
+    pub fn get(self) -> f64 {
+        match self {
+            Self::Angular(b) => b.get(),
+            Self::Linear(b) => b.get(),
+        }
+    }
+}
+
+/// Caller-supplied per-slot upper limits on certified derivative error bounds.
+///
+/// Each field is `Some(limit)` to require that the corresponding certified
+/// derivative error bound must not exceed `limit`, or `None` to skip that
+/// check.  The limit units must match those documented on the corresponding
+/// `*DerivativeBound` type (metres per radian for angular-parameter slots,
+/// metres per unit parameter for linear-parameter slots).
+///
+/// Unrequested slots (i.e., derivatives not included in `order`) are not
+/// computed and their limits are never checked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DerivativeLimits {
+    /// Limit for the first derivative of a curve, or `∂p/∂u` for a surface.
+    pub first_or_du: Option<f64>,
+    /// Limit for the second derivative of a curve, or `∂²p/∂u²` for a surface.
+    pub second_or_duu: Option<f64>,
+    /// Limit for `∂p/∂v` for a surface (ignored for curves).
+    pub dv: Option<f64>,
+    /// Limit for `∂²p/∂u∂v` for a surface (ignored for curves).
+    pub duv: Option<f64>,
+    /// Limit for `∂²p/∂v²` for a surface (ignored for curves).
+    pub dvv: Option<f64>,
+}
+
 /// Error returned for an invalid projection parameter or error bound.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProjectionValueError;
@@ -253,7 +395,8 @@ impl Default for CertificationBudget {
 }
 
 /// Combined context for evaluation and projection: tolerance limits plus a
-/// certified rational-arithmetic computation budget.
+/// certified rational-arithmetic computation budget and optional per-slot
+/// derivative limits.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EvaluationContext {
     /// Modeling tolerance used to reject results whose certified error
@@ -262,16 +405,21 @@ pub struct EvaluationContext {
     /// Budget capping certified rational-arithmetic computation (series
     /// terms, intermediate bit-width).
     pub budget: CertificationBudget,
+    /// Per-slot derivative error bound limits.  Defaults to all `None`
+    /// (no derivative bound checking beyond the position/distance bound
+    /// from `tolerance`).
+    pub derivative_limits: DerivativeLimits,
 }
 
 impl EvaluationContext {
     /// Constructs a context from an explicit tolerance and the default
-    /// certification budget.
+    /// certification budget, with no per-slot derivative limits.
     #[must_use]
     pub fn new(tolerance: ToleranceContext) -> Self {
         Self {
             tolerance,
             budget: CertificationBudget::default(),
+            derivative_limits: DerivativeLimits::default(),
         }
     }
 }
@@ -377,10 +525,9 @@ pub struct CurveProjection2 {
     pub point: Point2,
     /// Certified upper bound on projection distance.
     pub distance_bound: DistanceBound,
-    /// Certified upper bound on `|returned_parameter − true_nearest_parameter|`.
-    /// Units: radians for angular parameterizations, dimensionless for
-    /// linear ones.
-    pub parameter_error_bound: f64,
+    /// Dimensionally typed certified upper bound on the parameter error.
+    /// `Angular` for circles, `Linear` for lines.
+    pub parameter_error_bound: ParameterErrorBound,
     /// Certified upper bound on `‖point − true_nearest_point_on_primitive‖`
     /// in metres.
     pub point_residual_bound: PositionBound,
@@ -395,10 +542,9 @@ pub struct CurveProjection3 {
     pub point: Point3,
     /// Certified upper bound on projection distance.
     pub distance_bound: DistanceBound,
-    /// Certified upper bound on `|returned_parameter − true_nearest_parameter|`.
-    /// Units: radians for angular parameterizations, dimensionless for
-    /// linear ones.
-    pub parameter_error_bound: f64,
+    /// Dimensionally typed certified upper bound on the parameter error.
+    /// `Angular` for circles, `Linear` for lines.
+    pub parameter_error_bound: ParameterErrorBound,
     /// Certified upper bound on `‖point − true_nearest_point_on_primitive‖`
     /// in metres.
     pub point_residual_bound: PositionBound,
@@ -415,9 +561,12 @@ pub struct SurfaceProjection {
     pub point: Point3,
     /// Certified upper bound on projection distance.
     pub distance_bound: DistanceBound,
-    /// Certified upper bound on `max(|u − true_u|, |v − true_v|)`. Units:
-    /// radians for angular parameters, dimensionless for linear ones.
-    pub parameter_error_bound: f64,
+    /// Dimensionally typed certified upper bound on the U parameter error.
+    /// `Angular` for cylinder/cone (periodic u ∈ `[0, 2π)`);
+    /// `Linear` for plane (non-periodic).
+    pub u_error_bound: ParameterErrorBound,
+    /// Certified upper bound on the V parameter error (always linear/non-periodic).
+    pub v_error_bound: LinearParameterBound,
     /// Certified upper bound on `‖point − true_nearest_point_on_primitive‖`
     /// in metres.
     pub point_residual_bound: PositionBound,

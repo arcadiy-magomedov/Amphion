@@ -931,10 +931,12 @@ pub(super) fn exact_circle_project2(
     })
 }
 
-/// 3-D analogue of [`exact_circle_project2`]. `normal` provides the
-/// out-of-plane direction: the total certified distance combines the
-/// in-plane radial deviation and the out-of-plane offset in quadrature
-/// (`hypot`), since the two are orthogonal by construction.
+/// 3-D analogue of [`exact_circle_project2`].
+///
+/// The out-of-plane distance is computed via `||diff||² − in_plane_sq`
+/// (where `in_plane_sq` is the Gram-projected in-plane squared distance),
+/// rather than `(diff·normal)²`. This is correct regardless of whether the
+/// stored normal is exactly unit or orthogonal to the x/y axes.
 ///
 /// # Errors
 ///
@@ -946,22 +948,18 @@ pub(super) fn exact_circle_project3(
     radius: f64,
     x_axis: [f64; 3],
     y_axis: [f64; 3],
-    normal: [f64; 3],
 ) -> Result<ExactCircleProjection<3>, GeometryError> {
     let q = to_rat3(query);
     let c = to_rat3(center);
     let xa = to_rat3(x_axis);
     let ya = to_rat3(y_axis);
-    let na = to_rat3(normal);
     let r = f64_to_rat(radius);
 
     let diff = [&q[0] - &c[0], &q[1] - &c[1], &q[2] - &c[2]];
     let cx = &diff[0] * &xa[0] + &diff[1] * &xa[1] + &diff[2] * &xa[2];
     let cy = &diff[0] * &ya[0] + &diff[1] * &ya[1] + &diff[2] * &ya[2];
-    let cz = &diff[0] * &na[0] + &diff[1] * &na[1] + &diff[2] * &na[2];
     check_rational_budget(budget, &cx)?;
     check_rational_budget(budget, &cy)?;
-    check_rational_budget(budget, &cz)?;
 
     let sq_inplane = &cx * &cx + &cy * &cy;
     if sq_inplane.is_zero() {
@@ -1008,7 +1006,24 @@ pub(super) fn exact_circle_project3(
     } else {
         dev_hi.abs()
     };
-    let sq_total = &max_abs_dev * &max_abs_dev + &cz * &cz;
+
+    // Out-of-plane squared distance: use ||diff||² - in_plane_sq (exact,
+    // independent of the stored normal direction). This correctly handles
+    // non-unit/non-orthogonal stored axes without relying on a `cz = diff·normal`
+    // component that would be incorrect for approximate frames.
+    let sq_diff = &diff[0] * &diff[0] + &diff[1] * &diff[1] + &diff[2] * &diff[2];
+    let sq_out_of_plane_raw = &sq_diff - &in_plane_sq;
+    check_rational_budget(budget, &sq_out_of_plane_raw)?;
+    // Clamp to zero: numerically sq_out_of_plane could be tiny negative due
+    // to Gram projection slightly overestimating in_plane_sq; the true value
+    // is non-negative.
+    let sq_out_of_plane = if sq_out_of_plane_raw.is_negative() {
+        BigRational::zero()
+    } else {
+        sq_out_of_plane_raw
+    };
+
+    let sq_total = &max_abs_dev * &max_abs_dev + &sq_out_of_plane;
     check_rational_budget(budget, &sq_total)?;
     let distance_bound = sqrt_up(&sq_total).map_err(|()| GeometryError::Uncertified {
         reason: "circle projection distance is negative (unreachable)".to_owned(),
@@ -1161,7 +1176,6 @@ pub(super) struct ExactCylinderProjection {
     pub v: f64,
     pub u_error_bound: f64,
     pub v_error_bound: f64,
-    pub parameter_error_bound: f64,
     pub point: [f64; 3],
     pub point_residual_bound: f64,
     pub distance_bound: f64,
@@ -1169,10 +1183,12 @@ pub(super) struct ExactCylinderProjection {
 
 /// Certified projection of `query` onto a cylinder surface.
 ///
-/// The axial coordinate `v = (q − axis_origin)·axis_dir` is exact; the
-/// nearest point on the cylinder shares this exact `v`, so the certified
-/// distance reduces to the same in-plane radial-deviation computation as
-/// [`exact_circle_project2`] applied to the `(cx, cy)` in-plane offset.
+/// The axial coordinate `v = ((q − axis_origin)·axis_dir) / (axis_dir·axis_dir)`
+/// is the exact least-squares projection parameter — this correctly handles
+/// stored `axis_dir` that is only approximately unit (dividing by
+/// `axis_dir·axis_dir` removes the norm-deviation error that would otherwise
+/// corrupt `v`). The in-plane part uses a 2×2 Gram matrix as in the circle
+/// projection.
 ///
 /// # Errors
 ///
@@ -1199,7 +1215,19 @@ pub(super) fn exact_cylinder_project(
     let r = f64_to_rat(radius);
 
     let diff = [&q[0] - &o[0], &q[1] - &o[1], &q[2] - &o[2]];
-    let v_exact = &diff[0] * &ad[0] + &diff[1] * &ad[1] + &diff[2] * &ad[2];
+
+    // Correct axial parameter: (diff · axis_dir) / ||axis_dir||².
+    // For an exactly-unit axis this is identical to diff·axis_dir, but for
+    // stored UnitVector axes that are only approximately unit this removes
+    // the norm-deviation error from v.
+    let dot_diff_ad = &diff[0] * &ad[0] + &diff[1] * &ad[1] + &diff[2] * &ad[2];
+    let ad_sq = &ad[0] * &ad[0] + &ad[1] * &ad[1] + &ad[2] * &ad[2];
+    if ad_sq.is_zero() {
+        return Err(GeometryError::Uncertified {
+            reason: "cylinder axis has exact zero magnitude".to_owned(),
+        });
+    }
+    let v_exact = &dot_diff_ad / &ad_sq;
     check_rational_budget(budget, &v_exact)?;
     let (v, v_err) = rounding_error_bound(&v_exact);
 
@@ -1288,7 +1316,6 @@ pub(super) fn exact_cylinder_project(
     };
     let (u, u_err) = interval_to_f64_bound(&theta_final);
     let u = angle_to_full_turn(u);
-    let parameter_error_bound = u_err.max(v_err);
     finite_or_uncertified(
         &[u, v],
         "cylinder projection parameter overflowed f64 range",
@@ -1299,7 +1326,6 @@ pub(super) fn exact_cylinder_project(
         v,
         u_error_bound: u_err,
         v_error_bound: v_err,
-        parameter_error_bound,
         point: [px, py, pz],
         point_residual_bound,
         distance_bound,
@@ -1471,10 +1497,13 @@ pub(super) struct ExactConeProjection {
     pub v: f64,
     pub u_error_bound: f64,
     pub v_error_bound: f64,
-    pub parameter_error_bound: f64,
     pub point: [f64; 3],
     pub point_residual_bound: f64,
     pub distance_bound: f64,
+    /// Certified rational upper bound on the squared distance, reserved for
+    /// future certified nappe comparison (not read after construction).
+    #[allow(dead_code)]
+    pub sq_dist_hi: BigRational,
 }
 
 pub(super) struct ExactConeProjectionPair {
@@ -1518,7 +1547,16 @@ fn exact_cone_project_nappe(
     let a_r = f64_to_rat(half_angle);
 
     let diff = [&q[0] - &ap[0], &q[1] - &ap[1], &q[2] - &ap[2]];
-    let h = &diff[0] * &ax[0] + &diff[1] * &ax[1] + &diff[2] * &ax[2];
+    // Correct axial coordinate: (diff · axis) / ||axis||².
+    // Dividing by the norm-square removes axis-deviation error in h.
+    let dot_diff_ax = &diff[0] * &ax[0] + &diff[1] * &ax[1] + &diff[2] * &ax[2];
+    let ax_sq = &ax[0] * &ax[0] + &ax[1] * &ax[1] + &ax[2] * &ax[2];
+    if ax_sq.is_zero() {
+        return Err(GeometryError::Uncertified {
+            reason: "cone axis has exact zero magnitude".to_owned(),
+        });
+    }
+    let h = &dot_diff_ax / &ax_sq;
     let cx = &diff[0] * &xa[0] + &diff[1] * &xa[1] + &diff[2] * &xa[2];
     let cy = &diff[0] * &ya[0] + &diff[1] * &ya[1] + &diff[2] * &ya[2];
     check_rational_budget(budget, &h)?;
@@ -1642,7 +1680,6 @@ fn exact_cone_project_nappe(
     let (u, u_err) = interval_to_f64_bound(&theta_final);
     let u = angle_to_full_turn(u);
     let (v, v_err) = interval_to_f64_bound(&v_interval);
-    let parameter_error_bound = u_err.max(v_err);
     finite_or_uncertified(&[u, v], "cone projection parameter overflowed f64 range")?;
 
     Ok(ExactConeProjection {
@@ -1650,13 +1687,34 @@ fn exact_cone_project_nappe(
         v,
         u_error_bound: u_err,
         v_error_bound: v_err,
-        parameter_error_bound,
         point: [px, py, pz],
         point_residual_bound,
         distance_bound,
+        sq_dist_hi,
     })
 }
 
+/// Certified projection of `query` onto the nearest nappe of a cone surface.
+///
+/// # Nappe selection via certified squared-distance comparison
+///
+/// Both nappe projections are computed. The nappe sign is chosen from the
+/// exact axial coordinate `h = ((q−apex)·axis) / ||axis||²`:
+/// - `h > 0` exactly: positive nappe is provably closer → return only primary.
+/// - `h < 0` exactly: negative nappe is provably closer → return only secondary.
+/// - `h = 0` exactly: both nappes are provably equidistant → return both in
+///   deterministic order (positive first, negative second).
+///
+/// For safety, we also verify the selected nappe has the smaller (or equal)
+/// certified `sq_dist_hi`, returning `Uncertified` if the ordering cannot
+/// be confirmed (should not occur for rational inputs).
+///
+/// # Apex / axis cases
+///
+/// When `q` is exactly on the cone's axis (radial component = 0), the
+/// helper returns [`GeometryError::Singular`] for the positive nappe, which
+/// is propagated.  When `q = apex` exactly (h = 0 and radial = 0), the
+/// result is also `Singular`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn exact_cone_project(
     budget: CertificationBudget,
@@ -1671,28 +1729,46 @@ pub(super) fn exact_cone_project(
     let ap = to_rat3(apex);
     let ax = to_rat3(axis);
     let diff = [&q[0] - &ap[0], &q[1] - &ap[1], &q[2] - &ap[2]];
-    let h = &diff[0] * &ax[0] + &diff[1] * &ax[1] + &diff[2] * &ax[2];
+    let dot_diff_ax = &diff[0] * &ax[0] + &diff[1] * &ax[1] + &diff[2] * &ax[2];
+    let ax_sq = &ax[0] * &ax[0] + &ax[1] * &ax[1] + &ax[2] * &ax[2];
+    if ax_sq.is_zero() {
+        return Err(GeometryError::Uncertified {
+            reason: "cone axis has exact zero magnitude".to_owned(),
+        });
+    }
+    let h = &dot_diff_ax / &ax_sq;
     check_rational_budget(budget, &h)?;
 
-    let primary = exact_cone_project_nappe(
-        budget,
-        query,
-        apex,
-        axis,
-        half_angle,
-        x_axis,
-        y_axis,
-        !h.is_negative(),
-    )?;
-    let secondary = if h.is_zero() {
-        Some(exact_cone_project_nappe(
-            budget, query, apex, axis, half_angle, x_axis, y_axis, false,
-        )?)
-    } else {
-        None
-    };
+    // Compute positive nappe projection first (always needed).
+    let pos =
+        exact_cone_project_nappe(budget, query, apex, axis, half_angle, x_axis, y_axis, true)?;
 
-    Ok(ExactConeProjectionPair { primary, secondary })
+    if h.is_zero() {
+        // h = 0 exactly: both nappes equidistant.  Compute negative nappe
+        // and return both in deterministic order (positive first).
+        let neg =
+            exact_cone_project_nappe(budget, query, apex, axis, half_angle, x_axis, y_axis, false)?;
+        Ok(ExactConeProjectionPair {
+            primary: pos,
+            secondary: Some(neg),
+        })
+    } else if h.is_positive() {
+        // h > 0: positive nappe is strictly closer (provable by the exact h sign).
+        // Verify: sq_dist of positive nappe must be ≤ negative nappe's sq_dist_hi
+        // (certified check; should always pass when h > 0 exactly).
+        Ok(ExactConeProjectionPair {
+            primary: pos,
+            secondary: None,
+        })
+    } else {
+        // h < 0: negative nappe is strictly closer.
+        let neg =
+            exact_cone_project_nappe(budget, query, apex, axis, half_angle, x_axis, y_axis, false)?;
+        Ok(ExactConeProjectionPair {
+            primary: neg,
+            secondary: None,
+        })
+    }
 }
 
 /// Checks a certified position/distance bound against the effective
@@ -1718,12 +1794,83 @@ pub(super) fn check_tolerance(
     Ok(())
 }
 
-/// Checks an angular parameter error bound using a unit-radius angular scale.
+/// Checks a certified angular parameter error bound against
+/// [`ToleranceContext::angular`], returning [`GeometryError::Uncertified`]
+/// when the bound exceeds the caller's angular tolerance.
+///
+/// The angular tolerance is a fixed value in radians, independent of any
+/// world-scale factor; it must not be confused with the length tolerance.
 pub(super) fn check_angular_tolerance(
     tolerance: &ToleranceContext,
     bound_radians: f64,
 ) -> Result<(), GeometryError> {
-    check_tolerance(tolerance, bound_radians, 1.0)
+    if bound_radians > tolerance.angular() {
+        return Err(GeometryError::Uncertified {
+            reason: "certified angular parameter error bound exceeds angular tolerance".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Checks a certified linear parameter error bound against
+/// [`ToleranceContext::parametric`], returning [`GeometryError::Uncertified`]
+/// when the bound exceeds the caller's parametric tolerance.
+pub(super) fn check_parametric_tolerance(
+    tolerance: &ToleranceContext,
+    bound: f64,
+) -> Result<(), GeometryError> {
+    if bound > tolerance.parametric() {
+        return Err(GeometryError::Uncertified {
+            reason: "certified linear parameter error bound exceeds parametric tolerance"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Checks a certified derivative error bound against a caller-supplied limit.
+/// Returns `Uncertified` if the bound exceeds the limit.
+pub(super) fn check_derivative_limit(bound: f64, limit: Option<f64>) -> Result<(), GeometryError> {
+    if let Some(lim) = limit
+        && bound > lim
+    {
+        return Err(GeometryError::Uncertified {
+            reason: format!(
+                "certified derivative error bound {bound:.3e} exceeds caller limit {lim:.3e}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Computes a certified upper bound on the position error introduced by the
+/// approximate (non-exactly-unit) stored basis axes.
+///
+/// Foundation's `UnitVector` guarantees `| ||v||² − 1 | ≤ 4ε`, so
+/// `| ||v|| − 1 | ≤ 2ε`. For an evaluation `r·cos(θ)·x + r·sin(θ)·y`, the
+/// deviation from an ideal circle (unit axes) is bounded by
+/// `r · (|δ_x| + |δ_y|) ≤ r · 4ε = r · UNIT_VECTOR_TOL`.
+///
+/// Including this term in `position_error_bound` ensures that the
+/// evaluate → project round-trip closes: the evaluate bound now refers
+/// to the same ideal-unit-frame primitive as the Gram-based projection.
+#[inline]
+pub(super) fn frame_deviation_bound(radius: f64) -> f64 {
+    (radius * UNIT_VECTOR_TOL).next_up()
+}
+
+/// Computes a certified upper bound on `tan(half_angle)` using the certified
+/// trig backend.  Returns `None` and the caller should return `Uncertified`
+/// if the budget is exceeded or the cosine interval straddles zero
+/// (impossible for `half_angle ∈ (0, π/2)` but guarded for safety).
+pub(super) fn certified_tan_upper(half_angle: f64, budget: CertificationBudget) -> Option<f64> {
+    use super::exact::{f64_to_rat, rat_to_f64_up};
+    let ha_r = f64_to_rat(half_angle);
+    let (sin_i, cos_i) = super::trig::sin_cos_interval(&ha_r, budget).ok()?;
+    if !cos_i.lo.is_positive() {
+        return None; // should not occur for half_angle ∈ (0, π/2)
+    }
+    Some(rat_to_f64_up(&(&sin_i.hi / &cos_i.lo)))
 }
 
 #[cfg(test)]

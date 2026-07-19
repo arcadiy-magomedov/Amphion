@@ -47,17 +47,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::traits::SurfaceEvaluator;
 use crate::{
-    DerivativeOrder, DistanceBound, EvaluationContext, FirstDerivativeBound, GeometryError,
-    ParameterRange, ParameterValue, PositionBound, SecondDerivativeBound, SurfaceDomain,
-    SurfaceEvaluation, SurfaceKind, SurfaceProjection,
+    AngularParameterBound, DerivativeOrder, DistanceBound, EvaluationContext, FirstDerivativeBound,
+    GeometryError, LinearParameterBound, ParameterErrorBound, ParameterRange, ParameterValue,
+    PositionBound, SecondDerivativeBound, SurfaceDomain, SurfaceEvaluation, SurfaceKind,
+    SurfaceProjection,
 };
 
 use super::{
     ConstructionError, TransformError,
     helpers::{
-        ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite3, check_angular_tolerance, check_tolerance,
-        dot3, exact_cone_eval, exact_cone_project, in_range, mag3, normalization_to_construction,
-        scale3, sub3,
+        ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite3, certified_tan_upper,
+        check_angular_tolerance, check_derivative_limit, check_parametric_tolerance,
+        check_tolerance, dot3, exact_cone_eval, exact_cone_project, frame_deviation_bound,
+        in_range, mag3, normalization_to_construction, scale3, sub3,
     },
     transform::similarity_scale,
 };
@@ -78,6 +80,8 @@ fn unbounded_range() -> ParameterRange {
 
 #[derive(Serialize, Deserialize)]
 struct ConeRepr {
+    #[serde(default)]
+    version: u32,
     apex: Point3,
     axis: UnitVector3,
     half_angle: f64,
@@ -226,6 +230,9 @@ impl Cone {
 impl TryFrom<ConeRepr> for Cone {
     type Error = ConstructionError;
     fn try_from(repr: ConeRepr) -> Result<Self, Self::Error> {
+        if repr.version != 0 && repr.version != 1 {
+            return Err(ConstructionError::NonFiniteInput);
+        }
         let apex = repr.apex.into_array();
         if !all_finite3(apex) || !repr.half_angle.is_finite() {
             return Err(ConstructionError::NonFiniteInput);
@@ -253,6 +260,7 @@ impl TryFrom<ConeRepr> for Cone {
 impl From<Cone> for ConeRepr {
     fn from(c: Cone) -> Self {
         Self {
+            version: 1,
             apex: c.apex,
             axis: c.axis,
             half_angle: c.half_angle,
@@ -307,13 +315,19 @@ impl SurfaceEvaluator for Cone {
                 reason: "cone position is non-finite".to_owned(),
             }
         })?;
+        // Include frame deviation from approximate stored UnitVector axes.
+        let raw_pos_bound =
+            eval.position_error_bound + frame_deviation_bound(v.abs() + self.half_angle.sin());
         let position_error_bound =
-            PositionBound::try_new(eval.position_error_bound).map_err(|_| {
-                GeometryError::Uncertified {
-                    reason: "position error bound overflowed representable range".to_owned(),
-                }
+            PositionBound::try_new(raw_pos_bound).map_err(|_| GeometryError::Uncertified {
+                reason: "position error bound overflowed representable range".to_owned(),
             })?;
-        let eval_scale = mag3(ap) + v.abs() * (1.0 + self.half_angle.tan().abs());
+        // Certified tan(half_angle) upper bound for eval scale; fall back to
+        // host f64 tan if budget exhausted (only used for position tolerance
+        // check, not for the certified result itself).
+        let tan_upper = certified_tan_upper(self.half_angle, context.budget)
+            .unwrap_or_else(|| self.half_angle.tan().abs().next_up());
+        let eval_scale = mag3(ap) + v.abs() * (1.0 + tan_upper);
         check_tolerance(&context.tolerance, position_error_bound.get(), eval_scale)?;
 
         let du_error_bound = FirstDerivativeBound::try_new(eval.du_error_bound).map_err(|_| {
@@ -358,6 +372,11 @@ impl SurfaceEvaluator for Cone {
                 (None, None, None, None, None, None, None, None, None, None)
             }
             DerivativeOrder::First => {
+                check_derivative_limit(
+                    du_error_bound.get(),
+                    context.derivative_limits.first_or_du,
+                )?;
+                check_derivative_limit(dv_error_bound.get(), context.derivative_limits.dv)?;
                 let du = to_vec3(eval.du, "cone first u-derivative")?;
                 let dv = to_vec3(eval.dv, "cone first v-derivative")?;
                 (
@@ -374,6 +393,17 @@ impl SurfaceEvaluator for Cone {
                 )
             }
             DerivativeOrder::Second => {
+                check_derivative_limit(
+                    du_error_bound.get(),
+                    context.derivative_limits.first_or_du,
+                )?;
+                check_derivative_limit(dv_error_bound.get(), context.derivative_limits.dv)?;
+                check_derivative_limit(
+                    duu_error_bound.get(),
+                    context.derivative_limits.second_or_duu,
+                )?;
+                check_derivative_limit(duv_error_bound.get(), context.derivative_limits.duv)?;
+                check_derivative_limit(zero_second_bound.get(), context.derivative_limits.dvv)?;
                 let du = to_vec3(eval.du, "cone first u-derivative")?;
                 let dv = to_vec3(eval.dv, "cone first v-derivative")?;
                 let duu = to_vec3(eval.duu, "cone second u-derivative")?;
@@ -431,7 +461,7 @@ impl SurfaceEvaluator for Cone {
             let scale = mag3(q) + mag3(projection.point);
             check_tolerance(&context.tolerance, projection.point_residual_bound, scale)?;
             check_angular_tolerance(&context.tolerance, projection.u_error_bound)?;
-            check_tolerance(&context.tolerance, projection.v_error_bound, 1.0)?;
+            check_parametric_tolerance(&context.tolerance, projection.v_error_bound)?;
 
             let proj = Point3::try_new(
                 projection.point[0],
@@ -440,6 +470,16 @@ impl SurfaceEvaluator for Cone {
             )
             .map_err(|_| GeometryError::Uncertified {
                 reason: "cone projection point is non-finite".to_owned(),
+            })?;
+            let ang_u = AngularParameterBound::try_new(projection.u_error_bound).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "cone u angular bound is invalid".to_owned(),
+                }
+            })?;
+            let lin_v = LinearParameterBound::try_new(projection.v_error_bound).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "cone v linear bound is invalid".to_owned(),
+                }
             })?;
             certified.push(SurfaceProjection {
                 u: ParameterValue::try_new(projection.u).map_err(|_| {
@@ -458,7 +498,8 @@ impl SurfaceEvaluator for Cone {
                         reason: "cone projection distance is non-finite or negative".to_owned(),
                     },
                 )?,
-                parameter_error_bound: projection.parameter_error_bound,
+                u_error_bound: ParameterErrorBound::Angular(ang_u),
+                v_error_bound: lin_v,
                 point_residual_bound: PositionBound::try_new(projection.point_residual_bound)
                     .map_err(|_| GeometryError::Uncertified {
                         reason: "cone projection point residual bound is non-finite or negative"
@@ -817,5 +858,77 @@ mod tests {
             c.try_transform(&t),
             Err(super::TransformError::NotSimilarity)
         );
+    }
+
+    // ─── Blocker regression tests ────────────────────────────────────────────
+
+    /// Blocker 5: q=(2,0,0), alpha=pi/4 → exactly two ordered solutions.
+    /// Verified via exact h=0 axial coordinate.
+    #[test]
+    fn cone_project_equatorial_two_solutions() {
+        let c = std_cone();
+        // q=(2,0,0) is on the equatorial plane (h=0 for apex at origin with
+        // axis=(0,0,1)).  Both nappes are equidistant.
+        let q = Point3::try_new(2.0, 0.0, 0.0).unwrap();
+        let projs = c.project(q, &ctx()).unwrap();
+        assert_eq!(
+            projs.len(),
+            2,
+            "expected 2 solutions for equatorial query, got {}",
+            projs.len()
+        );
+        // Both u values must be in [0, TAU).
+        for p in &projs {
+            let u = p.u.get();
+            assert!((0.0..TAU).contains(&u), "u={u} out of [0,TAU)");
+        }
+        // Both distance bounds must be positive.
+        for p in &projs {
+            assert!(p.distance_bound.get() >= 0.0);
+        }
+    }
+
+    /// Blocker 5: h-neighbor (h ≠ 0) selects only one solution.
+    #[test]
+    fn cone_project_h_neighbor_one_solution() {
+        let c = std_cone();
+        // Slightly above equatorial plane → positive nappe only.
+        let q_above = Point3::try_new(2.0, 0.0, f64::EPSILON).unwrap();
+        let projs_above = c.project(q_above, &ctx()).unwrap();
+        assert_eq!(projs_above.len(), 1, "h>0 neighbor should give 1 solution");
+        let v_above = projs_above[0].v.get();
+        assert!(v_above > 0.0, "positive nappe: v={v_above} must be > 0");
+
+        // Slightly below equatorial plane → negative nappe only.
+        let q_below = Point3::try_new(2.0, 0.0, -f64::EPSILON).unwrap();
+        let projs_below = c.project(q_below, &ctx()).unwrap();
+        assert_eq!(projs_below.len(), 1, "h<0 neighbor should give 1 solution");
+        let v_below = projs_below[0].v.get();
+        assert!(v_below < 0.0, "negative nappe: v={v_below} must be < 0");
+    }
+
+    /// Blocker 4: Serde version=99 must be rejected.
+    #[test]
+    fn cone_serde_version_rejection() {
+        let invalid = serde_json::json!({
+            "version": 99,
+            "apex": [0.0, 0.0, 0.0],
+            "axis": [0.0, 0.0, 1.0],
+            "half_angle": FRAC_PI_4,
+            "x_axis": [1.0, 0.0, 0.0]
+        });
+        let result: Result<Cone, _> = serde_json::from_value(invalid);
+        assert!(result.is_err(), "version=99 must be rejected");
+    }
+
+    /// Blocker 4: Serialization round-trip must be byte-identical for version=1.
+    #[test]
+    fn cone_serde_round_trip_byte_identical() {
+        let c = std_cone();
+        let json = serde_json::to_string(&c).unwrap();
+        let c2: Cone = serde_json::from_str(&json).unwrap();
+        assert_eq!(c, c2);
+        let json2 = serde_json::to_string(&c2).unwrap();
+        assert_eq!(json, json2, "re-serialization must be byte-identical");
     }
 }

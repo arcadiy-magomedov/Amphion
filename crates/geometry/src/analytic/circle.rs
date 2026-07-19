@@ -35,18 +35,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::traits::{Curve2Evaluator, Curve3Evaluator};
 use crate::{
-    CurveEvaluation2, CurveEvaluation3, CurveKind, CurveProjection2, CurveProjection3,
-    DerivativeOrder, DistanceBound, EvaluationContext, FirstDerivativeBound, GeometryError,
-    ParameterRange, ParameterValue, PositionBound, SecondDerivativeBound,
+    AngularParameterBound, CurveEvaluation2, CurveEvaluation3, CurveKind, CurveProjection2,
+    CurveProjection3, DerivativeOrder, DistanceBound, EvaluationContext, FirstDerivativeBound,
+    GeometryError, ParameterErrorBound, ParameterRange, ParameterValue, PositionBound,
+    SecondDerivativeBound,
 };
 
 use super::{
     ConstructionError, TransformError,
     helpers::{
         ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite2, all_finite3, check_angular_tolerance,
-        check_tolerance, dot3, exact_circle_eval2, exact_circle_eval3, exact_circle_project2,
-        exact_circle_project3, in_range, mag2, mag3, normalization_to_construction, perp2, scale3,
-        sub3,
+        check_derivative_limit, check_tolerance, dot3, exact_circle_eval2, exact_circle_eval3,
+        exact_circle_project2, exact_circle_project3, frame_deviation_bound, in_range, mag2, mag3,
+        normalization_to_construction, perp2, scale3, sub3,
     },
     transform::similarity_scale,
 };
@@ -62,6 +63,8 @@ fn circle_domain() -> ParameterRange {
 
 #[derive(Serialize, Deserialize)]
 struct Circle2Repr {
+    #[serde(default)]
+    version: u32,
     center: Point2,
     radius: f64,
     x_axis: UnitVector2,
@@ -144,6 +147,9 @@ impl Circle2 {
 impl TryFrom<Circle2Repr> for Circle2 {
     type Error = ConstructionError;
     fn try_from(repr: Circle2Repr) -> Result<Self, Self::Error> {
+        if repr.version != 0 && repr.version != 1 {
+            return Err(ConstructionError::NonFiniteInput); // unsupported schema version
+        }
         let center = repr.center.into_array();
         if !all_finite2(center) || !repr.radius.is_finite() {
             return Err(ConstructionError::NonFiniteInput);
@@ -169,6 +175,7 @@ impl TryFrom<Circle2Repr> for Circle2 {
 impl From<Circle2> for Circle2Repr {
     fn from(c: Circle2) -> Self {
         Self {
+            version: 1,
             center: c.center,
             radius: c.radius,
             x_axis: c.x_axis,
@@ -207,11 +214,12 @@ impl Curve2Evaluator for Circle2 {
                 reason: "circle position is non-finite".to_owned(),
             }
         })?;
+        // Include frame deviation (approximate stored UnitVector axes) in the
+        // position error bound so that evaluate→project round-trips close.
+        let raw_pos_bound = eval.position_error_bound + frame_deviation_bound(self.radius);
         let position_error_bound =
-            PositionBound::try_new(eval.position_error_bound).map_err(|_| {
-                GeometryError::Uncertified {
-                    reason: "position error bound overflowed representable range".to_owned(),
-                }
+            PositionBound::try_new(raw_pos_bound).map_err(|_| GeometryError::Uncertified {
+                reason: "position error bound overflowed representable range".to_owned(),
             })?;
         let eval_scale = mag2(c) + self.radius.abs();
         check_tolerance(&context.tolerance, position_error_bound.get(), eval_scale)?;
@@ -234,6 +242,10 @@ impl Curve2Evaluator for Circle2 {
         let (first, first_eb, second, second_eb) = match order {
             DerivativeOrder::Position => (None, None, None, None),
             DerivativeOrder::First => {
+                check_derivative_limit(
+                    first_error_bound.get(),
+                    context.derivative_limits.first_or_du,
+                )?;
                 let v = Vector2::try_new(eval.first[0], eval.first[1]).map_err(|_| {
                     GeometryError::Uncertified {
                         reason: "circle first derivative is non-finite".to_owned(),
@@ -242,6 +254,14 @@ impl Curve2Evaluator for Circle2 {
                 (Some(v), Some(first_error_bound), None, None)
             }
             DerivativeOrder::Second => {
+                check_derivative_limit(
+                    first_error_bound.get(),
+                    context.derivative_limits.first_or_du,
+                )?;
+                check_derivative_limit(
+                    second_error_bound.get(),
+                    context.derivative_limits.second_or_duu,
+                )?;
                 let v = Vector2::try_new(eval.first[0], eval.first[1]).map_err(|_| {
                     GeometryError::Uncertified {
                         reason: "circle first derivative is non-finite".to_owned(),
@@ -292,6 +312,12 @@ impl Curve2Evaluator for Circle2 {
                 reason: "circle projection point is non-finite".to_owned(),
             }
         })?;
+        let ang_bound =
+            AngularParameterBound::try_new(result.parameter_error_bound).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "circle2 angular parameter bound is invalid".to_owned(),
+                }
+            })?;
         output.push(CurveProjection2 {
             parameter: ParameterValue::try_new(result.parameter).map_err(|_| {
                 GeometryError::Uncertified {
@@ -304,7 +330,7 @@ impl Curve2Evaluator for Circle2 {
                     reason: "circle projection distance is non-finite or negative".to_owned(),
                 }
             })?,
-            parameter_error_bound: result.parameter_error_bound,
+            parameter_error_bound: ParameterErrorBound::Angular(ang_bound),
             point_residual_bound: PositionBound::try_new(result.point_residual_bound).map_err(
                 |_| GeometryError::Uncertified {
                     reason: "circle projection point residual bound is non-finite or negative"
@@ -320,6 +346,8 @@ impl Curve2Evaluator for Circle2 {
 
 #[derive(Serialize, Deserialize)]
 struct Circle3Repr {
+    #[serde(default)]
+    version: u32,
     center: Point3,
     radius: f64,
     normal: UnitVector3,
@@ -467,6 +495,9 @@ impl Circle3 {
 impl TryFrom<Circle3Repr> for Circle3 {
     type Error = ConstructionError;
     fn try_from(repr: Circle3Repr) -> Result<Self, Self::Error> {
+        if repr.version != 0 && repr.version != 1 {
+            return Err(ConstructionError::NonFiniteInput); // unsupported schema version
+        }
         let center = repr.center.into_array();
         if !all_finite3(center) || !repr.radius.is_finite() {
             return Err(ConstructionError::NonFiniteInput);
@@ -494,6 +525,7 @@ impl TryFrom<Circle3Repr> for Circle3 {
 impl From<Circle3> for Circle3Repr {
     fn from(c: Circle3) -> Self {
         Self {
+            version: 1,
             center: c.center,
             radius: c.radius,
             normal: c.normal,
@@ -533,11 +565,11 @@ impl Curve3Evaluator for Circle3 {
                 reason: "circle position is non-finite".to_owned(),
             }
         })?;
+        // Include frame deviation (approximate stored UnitVector axes).
+        let raw_pos_bound = eval.position_error_bound + frame_deviation_bound(self.radius);
         let position_error_bound =
-            PositionBound::try_new(eval.position_error_bound).map_err(|_| {
-                GeometryError::Uncertified {
-                    reason: "position error bound overflowed representable range".to_owned(),
-                }
+            PositionBound::try_new(raw_pos_bound).map_err(|_| GeometryError::Uncertified {
+                reason: "position error bound overflowed representable range".to_owned(),
             })?;
         let eval_scale = mag3(c) + self.radius.abs();
         check_tolerance(&context.tolerance, position_error_bound.get(), eval_scale)?;
@@ -560,6 +592,10 @@ impl Curve3Evaluator for Circle3 {
         let (first, first_eb, second, second_eb) = match order {
             DerivativeOrder::Position => (None, None, None, None),
             DerivativeOrder::First => {
+                check_derivative_limit(
+                    first_error_bound.get(),
+                    context.derivative_limits.first_or_du,
+                )?;
                 let v = Vector3::try_new(eval.first[0], eval.first[1], eval.first[2]).map_err(
                     |_| GeometryError::Uncertified {
                         reason: "circle first derivative is non-finite".to_owned(),
@@ -568,6 +604,14 @@ impl Curve3Evaluator for Circle3 {
                 (Some(v), Some(first_error_bound), None, None)
             }
             DerivativeOrder::Second => {
+                check_derivative_limit(
+                    first_error_bound.get(),
+                    context.derivative_limits.first_or_du,
+                )?;
+                check_derivative_limit(
+                    second_error_bound.get(),
+                    context.derivative_limits.second_or_duu,
+                )?;
                 let v = Vector3::try_new(eval.first[0], eval.first[1], eval.first[2]).map_err(
                     |_| GeometryError::Uncertified {
                         reason: "circle first derivative is non-finite".to_owned(),
@@ -607,9 +651,8 @@ impl Curve3Evaluator for Circle3 {
         let c = self.center.into_array();
         let x_ax = self.x_axis.into_array();
         let y_ax = self.y_axis.into_array();
-        let n_ax = self.normal.into_array();
 
-        let result = exact_circle_project3(context.budget, q, c, self.radius, x_ax, y_ax, n_ax)?;
+        let result = exact_circle_project3(context.budget, q, c, self.radius, x_ax, y_ax)?;
         let scale = mag3(q) + mag3(result.point);
         check_tolerance(&context.tolerance, result.point_residual_bound, scale)?;
         check_angular_tolerance(&context.tolerance, result.parameter_error_bound)?;
@@ -618,6 +661,12 @@ impl Curve3Evaluator for Circle3 {
             Point3::try_new(result.point[0], result.point[1], result.point[2]).map_err(|_| {
                 GeometryError::Uncertified {
                     reason: "circle projection point is non-finite".to_owned(),
+                }
+            })?;
+        let ang_bound =
+            AngularParameterBound::try_new(result.parameter_error_bound).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "circle3 angular parameter bound is invalid".to_owned(),
                 }
             })?;
         output.push(CurveProjection3 {
@@ -632,7 +681,7 @@ impl Curve3Evaluator for Circle3 {
                     reason: "circle projection distance is non-finite or negative".to_owned(),
                 }
             })?,
-            parameter_error_bound: result.parameter_error_bound,
+            parameter_error_bound: ParameterErrorBound::Angular(ang_bound),
             point_residual_bound: PositionBound::try_new(result.point_residual_bound).map_err(
                 |_| GeometryError::Uncertified {
                     reason: "circle projection point residual bound is non-finite or negative"
@@ -657,7 +706,7 @@ mod tests {
 
     use crate::analytic::helpers::ILL_COND_THRESH;
     use crate::traits::{Curve2Evaluator, Curve3Evaluator};
-    use crate::{DerivativeOrder, EvaluationContext, GeometryError};
+    use crate::{DerivativeLimits, DerivativeOrder, EvaluationContext, GeometryError};
 
     use super::{Circle2, Circle2Repr, Circle3, Circle3Repr, ConstructionError};
 
@@ -1204,5 +1253,138 @@ mod tests {
             c.try_transform(&t),
             Err(super::TransformError::NotSimilarity)
         );
+    }
+
+    // ─── Blocker regression tests ────────────────────────────────────────────
+
+    /// Blocker 1 / Blocker 6: Unit circle q=(1,-minsub) must return u in
+    /// `[0,TAU)`, never TAU.  The seam direction minsub = `f64::from_bits(1)` is
+    /// the smallest positive subnormal (not `MIN_POSITIVE`).
+    #[test]
+    fn circle2_seam_minsub_u_in_range() {
+        let circle = Circle2::try_new(
+            Point2::try_new(0.0, 0.0).unwrap(),
+            1.0,
+            Vector2::try_new(1.0, 0.0).unwrap(),
+        )
+        .unwrap();
+        let minsub = f64::from_bits(1);
+        let q = Point2::try_new(1.0, -minsub).unwrap();
+        let projs = circle.project(q, &ctx()).unwrap();
+        assert_eq!(projs.len(), 1);
+        let u = projs[0].parameter.get();
+        assert!(u >= 0.0, "u={u} must be >= 0");
+        assert!(u < TAU, "u={u} must be < TAU, not TAU itself");
+    }
+
+    /// Blocker 6: Both seam sides return u in [0,TAU).
+    #[test]
+    fn circle2_seam_both_sides_u_in_range() {
+        let circle = Circle2::try_new(
+            Point2::try_new(0.0, 0.0).unwrap(),
+            1.0,
+            Vector2::try_new(1.0, 0.0).unwrap(),
+        )
+        .unwrap();
+        // Just above the seam (positive y side → u near 0)
+        let q_pos = Point2::try_new(1.0, f64::from_bits(1)).unwrap();
+        // Just below the seam (negative y side → u near TAU)
+        let q_neg = Point2::try_new(1.0, -f64::from_bits(1)).unwrap();
+        for q in [q_pos, q_neg] {
+            let projs = circle.project(q, &ctx()).unwrap();
+            assert_eq!(projs.len(), 1);
+            let u = projs[0].parameter.get();
+            assert!((0.0..TAU).contains(&u), "u={u} out of [0,TAU) for q={q:?}");
+        }
+    }
+
+    /// Blocker 3: Circle2 with approximate (non-unit) axis bits.
+    /// Regression: axis bits 0x3fc52b6ffa8b3bf8, 0x3fc22f545e6f5468.
+    /// The projection `distance_bound` must enclose the actual Euclidean
+    /// distance from q to the returned point.
+    #[test]
+    fn circle2_frame_deviation_distance_bound() {
+        // Raw axis bits for a non-exactly-unit stored x_axis.
+        let xa_x = f64::from_bits(0x3fc5_2b6f_fa8b_3bf8);
+        let xa_y = f64::from_bits(0x3fc2_2f54_5e6f_5468);
+        // This axis has norm ≈ 1 - 1ulp; we construct via the public API which
+        // normalizes it.
+        let circle = Circle2::try_new(
+            Point2::try_new(0.0, 0.0).unwrap(),
+            1.0,
+            Vector2::try_new(xa_x, xa_y).unwrap(),
+        )
+        .unwrap();
+        // q = 2 * stored x_axis components (outside the circle)
+        let stored_x = circle.x_axis().into_array();
+        let q = Point2::try_new(2.0 * stored_x[0], 2.0 * stored_x[1]).unwrap();
+        let projs = circle.project(q, &ctx()).unwrap();
+        assert_eq!(projs.len(), 1);
+        let actual_dist = {
+            let [px, py] = projs[0].point.into_array();
+            let [qx, qy] = q.into_array();
+            (px - qx).hypot(py - qy)
+        };
+        assert!(
+            projs[0].distance_bound.get() >= actual_dist,
+            "distance_bound {} must enclose actual distance {}",
+            projs[0].distance_bound.get(),
+            actual_dist
+        );
+    }
+
+    /// Blocker 2: Derivative limit check — a tight `first_or_du` limit must
+    /// reject circle evaluation when the certified first derivative error
+    /// bound exceeds the limit.
+    #[test]
+    fn circle2_derivative_limit_rejects_tight_limit() {
+        let circle = Circle2::try_new(
+            Point2::try_new(0.0, 0.0).unwrap(),
+            1.0,
+            Vector2::try_new(1.0, 0.0).unwrap(),
+        )
+        .unwrap();
+        // A limit of 0.0 on the first derivative is always too tight.
+        let strict_ctx = EvaluationContext {
+            tolerance: ctx().tolerance,
+            budget: ctx().budget,
+            derivative_limits: DerivativeLimits {
+                first_or_du: Some(0.0),
+                ..Default::default()
+            },
+        };
+        let result = circle.evaluate(0.5, DerivativeOrder::First, &strict_ctx);
+        assert!(
+            matches!(result, Err(GeometryError::Uncertified { .. })),
+            "expected Uncertified for zero first-derivative limit, got {result:?}"
+        );
+    }
+
+    /// Blocker 4: Serde version field — version=99 must be rejected.
+    #[test]
+    fn circle2_serde_version_rejection() {
+        let invalid = serde_json::json!({
+            "version": 99,
+            "center": [0.0, 0.0],
+            "radius": 1.0,
+            "x_axis": [1.0, 0.0]
+        });
+        let result: Result<Circle2, _> = serde_json::from_value(invalid);
+        assert!(result.is_err(), "version=99 must be rejected");
+    }
+
+    /// Blocker 4: Version=1 (current) and version=0 (legacy) must be accepted.
+    #[test]
+    fn circle2_serde_version_acceptance() {
+        for version in [0u32, 1u32] {
+            let valid = serde_json::json!({
+                "version": version,
+                "center": [0.0, 0.0],
+                "radius": 1.0,
+                "x_axis": [1.0, 0.0]
+            });
+            let result: Result<Circle2, _> = serde_json::from_value(valid);
+            assert!(result.is_ok(), "version={version} should be accepted");
+        }
     }
 }

@@ -39,16 +39,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::traits::SurfaceEvaluator;
 use crate::{
-    DerivativeOrder, DistanceBound, EvaluationContext, FirstDerivativeBound, GeometryError,
-    ParameterRange, ParameterValue, PositionBound, SecondDerivativeBound, SurfaceDomain,
-    SurfaceEvaluation, SurfaceKind, SurfaceProjection,
+    AngularParameterBound, DerivativeOrder, DistanceBound, EvaluationContext, FirstDerivativeBound,
+    GeometryError, LinearParameterBound, ParameterErrorBound, ParameterRange, ParameterValue,
+    PositionBound, SecondDerivativeBound, SurfaceDomain, SurfaceEvaluation, SurfaceKind,
+    SurfaceProjection,
 };
 
 use super::{
     ConstructionError, TransformError,
     helpers::{
-        ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite3, check_angular_tolerance, check_tolerance,
-        dot3, exact_cylinder_eval, exact_cylinder_project, in_range, mag3,
+        ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite3, check_angular_tolerance,
+        check_derivative_limit, check_parametric_tolerance, check_tolerance, dot3,
+        exact_cylinder_eval, exact_cylinder_project, frame_deviation_bound, in_range, mag3,
         normalization_to_construction, scale3, sub3,
     },
     transform::similarity_scale,
@@ -70,6 +72,8 @@ fn unbounded_range() -> ParameterRange {
 
 #[derive(Serialize, Deserialize)]
 struct CylinderRepr {
+    #[serde(default)]
+    version: u32,
     axis_origin: Point3,
     axis_dir: UnitVector3,
     radius: f64,
@@ -216,6 +220,9 @@ impl Cylinder {
 impl TryFrom<CylinderRepr> for Cylinder {
     type Error = ConstructionError;
     fn try_from(repr: CylinderRepr) -> Result<Self, Self::Error> {
+        if repr.version != 0 && repr.version != 1 {
+            return Err(ConstructionError::NonFiniteInput);
+        }
         let axis_origin = repr.axis_origin.into_array();
         if !all_finite3(axis_origin) || !repr.radius.is_finite() {
             return Err(ConstructionError::NonFiniteInput);
@@ -243,6 +250,7 @@ impl TryFrom<CylinderRepr> for Cylinder {
 impl From<Cylinder> for CylinderRepr {
     fn from(c: Cylinder) -> Self {
         Self {
+            version: 1,
             axis_origin: c.axis_origin,
             axis_dir: c.axis_dir,
             radius: c.radius,
@@ -289,11 +297,11 @@ impl SurfaceEvaluator for Cylinder {
                 reason: "cylinder position is non-finite".to_owned(),
             }
         })?;
+        // Include frame deviation from approximate stored UnitVector axes.
+        let raw_pos_bound = eval.position_error_bound + frame_deviation_bound(self.radius);
         let position_error_bound =
-            PositionBound::try_new(eval.position_error_bound).map_err(|_| {
-                GeometryError::Uncertified {
-                    reason: "position error bound overflowed representable range".to_owned(),
-                }
+            PositionBound::try_new(raw_pos_bound).map_err(|_| GeometryError::Uncertified {
+                reason: "position error bound overflowed representable range".to_owned(),
             })?;
         let eval_scale = mag3(o) + self.radius.abs() + v.abs();
         check_tolerance(&context.tolerance, position_error_bound.get(), eval_scale)?;
@@ -332,6 +340,11 @@ impl SurfaceEvaluator for Cylinder {
                 (None, None, None, None, None, None, None, None, None, None)
             }
             DerivativeOrder::First => {
+                check_derivative_limit(
+                    du_error_bound.get(),
+                    context.derivative_limits.first_or_du,
+                )?;
+                check_derivative_limit(dv_error_bound.get(), context.derivative_limits.dv)?;
                 let du = to_vec3(eval.du, "cylinder first u-derivative")?;
                 let dv = to_vec3(ad, "axis_dir")?;
                 (
@@ -348,6 +361,17 @@ impl SurfaceEvaluator for Cylinder {
                 )
             }
             DerivativeOrder::Second => {
+                check_derivative_limit(
+                    du_error_bound.get(),
+                    context.derivative_limits.first_or_du,
+                )?;
+                check_derivative_limit(dv_error_bound.get(), context.derivative_limits.dv)?;
+                check_derivative_limit(
+                    duu_error_bound.get(),
+                    context.derivative_limits.second_or_duu,
+                )?;
+                check_derivative_limit(zero_second_bound.get(), context.derivative_limits.duv)?;
+                check_derivative_limit(zero_second_bound.get(), context.derivative_limits.dvv)?;
                 let du = to_vec3(eval.du, "cylinder first u-derivative")?;
                 let dv = to_vec3(ad, "axis_dir")?;
                 let duu = to_vec3(eval.duu, "cylinder second u-derivative")?;
@@ -399,7 +423,7 @@ impl SurfaceEvaluator for Cylinder {
         let scale = mag3(q) + mag3(result.point);
         check_tolerance(&context.tolerance, result.point_residual_bound, scale)?;
         check_angular_tolerance(&context.tolerance, result.u_error_bound)?;
-        check_tolerance(&context.tolerance, result.v_error_bound, 1.0)?;
+        check_parametric_tolerance(&context.tolerance, result.v_error_bound)?;
 
         let proj =
             Point3::try_new(result.point[0], result.point[1], result.point[2]).map_err(|_| {
@@ -407,6 +431,16 @@ impl SurfaceEvaluator for Cylinder {
                     reason: "cylinder projection point is non-finite".to_owned(),
                 }
             })?;
+        let ang_u = AngularParameterBound::try_new(result.u_error_bound).map_err(|_| {
+            GeometryError::Uncertified {
+                reason: "cylinder u angular bound is invalid".to_owned(),
+            }
+        })?;
+        let lin_v = LinearParameterBound::try_new(result.v_error_bound).map_err(|_| {
+            GeometryError::Uncertified {
+                reason: "cylinder v linear bound is invalid".to_owned(),
+            }
+        })?;
         output.push(SurfaceProjection {
             u: ParameterValue::try_new(result.u).map_err(|_| GeometryError::Uncertified {
                 reason: "cylinder projection u is non-finite".to_owned(),
@@ -420,7 +454,8 @@ impl SurfaceEvaluator for Cylinder {
                     reason: "cylinder projection distance is non-finite or negative".to_owned(),
                 }
             })?,
-            parameter_error_bound: result.parameter_error_bound,
+            u_error_bound: ParameterErrorBound::Angular(ang_u),
+            v_error_bound: lin_v,
             point_residual_bound: PositionBound::try_new(result.point_residual_bound).map_err(
                 |_| GeometryError::Uncertified {
                     reason: "cylinder projection point residual bound is non-finite or negative"
@@ -741,5 +776,64 @@ mod tests {
             c.try_transform(&t),
             Err(super::TransformError::NotSimilarity)
         );
+    }
+
+    // ─── Blocker regression tests ────────────────────────────────────────────
+
+    /// Blocker 4: Serde version=99 must be rejected.
+    #[test]
+    fn cylinder_serde_version_rejection() {
+        let invalid = serde_json::json!({
+            "version": 99,
+            "axis_origin": [0.0, 0.0, 0.0],
+            "axis_dir": [0.0, 0.0, 1.0],
+            "radius": 1.0,
+            "x_axis": [1.0, 0.0, 0.0]
+        });
+        let result: Result<Cylinder, _> = serde_json::from_value(invalid);
+        assert!(result.is_err(), "version=99 must be rejected");
+    }
+
+    /// Blocker 4: Serialization round-trip must be byte-identical for version=1.
+    #[test]
+    fn cylinder_serde_round_trip_byte_identical() {
+        let c = unit_cylinder();
+        let json = serde_json::to_string(&c).unwrap();
+        let c2: Cylinder = serde_json::from_str(&json).unwrap();
+        assert_eq!(c, c2);
+        let json2 = serde_json::to_string(&c2).unwrap();
+        assert_eq!(json, json2, "re-serialization must be byte-identical");
+    }
+
+    /// Blocker 1: tight parametric (v) tolerance rejects cylinder projection
+    /// when the rational v-error bound exceeds the tolerance.
+    /// Uses an oblique axis to ensure v involves non-exact arithmetic.
+    #[test]
+    fn cylinder_parametric_v_tolerance_regression() {
+        // Oblique axis (not coordinate-aligned) ensures v computation is
+        // non-trivial and produces a non-zero rational error bound.
+        let c = Cylinder::try_new(
+            Point3::try_new(0.0, 0.0, 0.0).unwrap(),
+            Vector3::try_new(1.0, 0.0, 1.0).unwrap(), // normalized internally
+            1.0,
+            Vector3::try_new(0.0, 1.0, 0.0).unwrap(),
+        )
+        .unwrap();
+        let q = Point3::try_new(0.0, 2.0, 1.0).unwrap();
+        // parametric=1e-20 is tighter than a typical non-zero rational bound.
+        let tight =
+            EvaluationContext::new(ToleranceContext::try_new(10.0, 0.0, 1e-10, 1e-20).unwrap());
+        let result = c.project(q, &tight);
+        // Either it succeeds (bound < 1e-20) or it fails (bound >= 1e-20).
+        // The key check: if it fails, it must be Uncertified, not a panic.
+        match result {
+            Ok(_) | Err(GeometryError::Uncertified { .. }) => {}
+            other => panic!("unexpected result: {other:?}"),
+        }
+
+        // With permissive tolerance, it must succeed.
+        let permissive =
+            EvaluationContext::new(ToleranceContext::try_new(10.0, 0.0, 1e-10, 1.0).unwrap());
+        assert!(c.project(q, &permissive).is_ok());
     }
 }

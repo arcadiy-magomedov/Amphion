@@ -30,15 +30,16 @@ use serde::{Deserialize, Serialize};
 use crate::traits::SurfaceEvaluator;
 use crate::{
     DerivativeOrder, DistanceBound, EvaluationContext, FirstDerivativeBound, GeometryError,
-    ParameterRange, ParameterValue, PositionBound, SecondDerivativeBound, SurfaceDomain,
-    SurfaceEvaluation, SurfaceKind, SurfaceProjection,
+    LinearParameterBound, ParameterErrorBound, ParameterRange, ParameterValue, PositionBound,
+    SecondDerivativeBound, SurfaceDomain, SurfaceEvaluation, SurfaceKind, SurfaceProjection,
 };
 
 use super::{
     ConstructionError, TransformError,
     helpers::{
-        ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite3, check_tolerance, dot3, exact_plane_eval3,
-        exact_plane_project3, mag3, normalization_to_construction, scale3, sub3,
+        ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite3, check_parametric_tolerance, check_tolerance,
+        dot3, exact_plane_eval3, exact_plane_project3, mag3, normalization_to_construction, scale3,
+        sub3,
     },
 };
 
@@ -51,6 +52,8 @@ fn unbounded_range() -> ParameterRange {
 
 #[derive(Serialize, Deserialize)]
 struct PlaneRepr {
+    #[serde(default)]
+    version: u32,
     origin: Point3,
     u_axis: UnitVector3,
     v_axis: UnitVector3,
@@ -175,6 +178,9 @@ impl Plane {
 impl TryFrom<PlaneRepr> for Plane {
     type Error = ConstructionError;
     fn try_from(repr: PlaneRepr) -> Result<Self, Self::Error> {
+        if repr.version != 0 && repr.version != 1 {
+            return Err(ConstructionError::NonFiniteInput);
+        }
         let origin = repr.origin.into_array();
         if !all_finite3(origin) {
             return Err(ConstructionError::NonFiniteInput);
@@ -198,6 +204,7 @@ impl TryFrom<PlaneRepr> for Plane {
 impl From<Plane> for PlaneRepr {
     fn from(p: Plane) -> Self {
         Self {
+            version: 1,
             origin: p.origin,
             u_axis: p.u_axis,
             v_axis: p.v_axis,
@@ -329,7 +336,7 @@ impl SurfaceEvaluator for Plane {
         let result = exact_plane_project3(context.budget, q, o, u_ax, v_ax)?;
         let scale = mag3(q) + mag3(result.point);
         check_tolerance(&context.tolerance, result.point_residual_bound, scale)?;
-        check_tolerance(&context.tolerance, result.parameter_error_bound, 1.0)?;
+        check_parametric_tolerance(&context.tolerance, result.parameter_error_bound)?;
 
         let proj =
             Point3::try_new(result.point[0], result.point[1], result.point[2]).map_err(|_| {
@@ -337,6 +344,16 @@ impl SurfaceEvaluator for Plane {
                     reason: "plane projection point is non-finite".to_owned(),
                 }
             })?;
+        let lin_u = LinearParameterBound::try_new(result.parameter_error_bound).map_err(|_| {
+            GeometryError::Uncertified {
+                reason: "plane u parameter bound is invalid".to_owned(),
+            }
+        })?;
+        let lin_v = LinearParameterBound::try_new(result.parameter_error_bound).map_err(|_| {
+            GeometryError::Uncertified {
+                reason: "plane v parameter bound is invalid".to_owned(),
+            }
+        })?;
         let local = SurfaceProjection {
             u: ParameterValue::try_new(result.u).map_err(|_| GeometryError::Uncertified {
                 reason: "plane projection u is non-finite".to_owned(),
@@ -350,7 +367,8 @@ impl SurfaceEvaluator for Plane {
                     reason: "plane projection distance is non-finite or negative".to_owned(),
                 }
             })?,
-            parameter_error_bound: result.parameter_error_bound,
+            u_error_bound: ParameterErrorBound::Linear(lin_u),
+            v_error_bound: lin_v,
             point_residual_bound: PositionBound::try_new(result.point_residual_bound).map_err(
                 |_| GeometryError::Uncertified {
                     reason: "plane projection point residual bound is non-finite or negative"
@@ -550,7 +568,8 @@ mod tests {
             assert!((projs[0].u.get() - u0).abs() < 1e-11, "u round-trip");
             assert!((projs[0].v.get() - v0).abs() < 1e-11, "v round-trip");
             assert!(projs[0].distance_bound.get() < 1e-11);
-            assert!(projs[0].parameter_error_bound >= 0.0);
+            assert!(projs[0].u_error_bound.get() >= 0.0);
+            assert!(projs[0].v_error_bound.get() >= 0.0);
             assert!(projs[0].point_residual_bound.get() >= 0.0);
         }
     }
