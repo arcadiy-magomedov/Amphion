@@ -1,29 +1,34 @@
 //! Thread-safe evaluator interfaces.
 //!
-//! # CONTRACTS.md change needed
+//! # Certified rational-arithmetic backend
 //!
-//! This module's `evaluate()` signature was extended to take an explicit
-//! `tolerance: &ToleranceContext` parameter, and `CurveEvaluation2`,
-//! `CurveEvaluation3`, and `SurfaceEvaluation` gained certified error-bound
-//! fields (`position_error_bound: DistanceBound`,
-//! `first_error_bound`/`first_u_error_bound`/`first_v_error_bound: Option<DistanceBound>`,
-//! `second_error_bound`/`second_uu_error_bound`/`second_uv_error_bound`/`second_vv_error_bound: Option<DistanceBound>`).
+//! `evaluate()`, `project()`, and `project_into()` accept an explicit
+//! [`EvaluationContext`] (tolerance plus a [`crate::CertificationBudget`])
+//! rather than a bare `ToleranceContext`. `CurveEvaluation2`,
+//! `CurveEvaluation3`, and `SurfaceEvaluation` carry certified error-bound
+//! fields (`position_error_bound: PositionBound`,
+//! `first_error_bound`/`first_u_error_bound`/`first_v_error_bound: Option<FirstDerivativeBound>`,
+//! `second_error_bound`/`second_uu_error_bound`/`second_uv_error_bound`/`second_vv_error_bound: Option<SecondDerivativeBound>`).
 //! Evaluators must return [`GeometryError::Uncertified`] when the
 //! implementation cannot bound the evaluation error within the supplied
-//! tolerance. Trig-dependent evaluators (`Circle2`, `Circle3`, `Cylinder`,
-//! `Cone`) return `Uncertified` from both `evaluate()` and `project_into()`
-//! until a formally-proved, WASM-compatible transcendental implementation is
-//! integrated (no such pure-Rust library currently exists; see the
-//! `analytic::helpers` module docs for the survey of candidates). This
-//! doc comment records the exact CONTRACTS.md wording change required; the
-//! contracts document itself is out of scope for this crate.
+//! tolerance or certification budget.
+//!
+//! Every geometry family — including the trig-dependent `Circle2`,
+//! `Circle3`, `Cylinder`, and `Cone` — now returns a certified numeric
+//! result rather than an unconditional `Uncertified`. Transcendental
+//! quantities (angles) are computed via the certified rational-interval
+//! backend in [`crate::analytic::trig`], which encloses `sin`, `cos`, and
+//! `atan2` in exact `BigRational` intervals rather than relying on any
+//! `f64` trigonometric implementation. See that module's documentation for
+//! the algorithm references and the survey of rejected transcendental
+//! backends.
 
-use amphion_foundation::{Point2, Point3, ToleranceContext};
+use amphion_foundation::{Point2, Point3};
 
 use crate::{
     CurveEvaluation2, CurveEvaluation3, CurveKind, CurveProjection2, CurveProjection3,
-    DerivativeOrder, GeometryError, ParameterRange, SurfaceDomain, SurfaceEvaluation, SurfaceKind,
-    SurfaceProjection,
+    DerivativeOrder, EvaluationContext, GeometryError, ParameterRange, SurfaceDomain,
+    SurfaceEvaluation, SurfaceKind, SurfaceProjection,
 };
 
 /// A canonical parameter-space curve evaluator.
@@ -44,7 +49,7 @@ pub trait Curve2Evaluator: Send + Sync + 'static {
         &self,
         parameter: f64,
         order: DerivativeOrder,
-        tolerance: &ToleranceContext,
+        context: &EvaluationContext,
     ) -> Result<CurveEvaluation2, GeometryError>;
 
     /// Finds every certified projection inside the declared domain.
@@ -56,10 +61,10 @@ pub trait Curve2Evaluator: Send + Sync + 'static {
     fn project(
         &self,
         point: Point2,
-        tolerance: &ToleranceContext,
+        context: &EvaluationContext,
     ) -> Result<Vec<CurveProjection2>, GeometryError> {
         let mut output = Vec::new();
-        self.project_into(point, tolerance, &mut output)?;
+        self.project_into(point, context, &mut output)?;
         Ok(output)
     }
 
@@ -75,7 +80,7 @@ pub trait Curve2Evaluator: Send + Sync + 'static {
     fn project_into(
         &self,
         point: Point2,
-        tolerance: &ToleranceContext,
+        context: &EvaluationContext,
         output: &mut Vec<CurveProjection2>,
     ) -> Result<(), GeometryError>;
 }
@@ -98,7 +103,7 @@ pub trait Curve3Evaluator: Send + Sync + 'static {
         &self,
         parameter: f64,
         order: DerivativeOrder,
-        tolerance: &ToleranceContext,
+        context: &EvaluationContext,
     ) -> Result<CurveEvaluation3, GeometryError>;
 
     /// Finds every certified projection inside the declared domain.
@@ -110,10 +115,10 @@ pub trait Curve3Evaluator: Send + Sync + 'static {
     fn project(
         &self,
         point: Point3,
-        tolerance: &ToleranceContext,
+        context: &EvaluationContext,
     ) -> Result<Vec<CurveProjection3>, GeometryError> {
         let mut output = Vec::new();
-        self.project_into(point, tolerance, &mut output)?;
+        self.project_into(point, context, &mut output)?;
         Ok(output)
     }
 
@@ -129,7 +134,7 @@ pub trait Curve3Evaluator: Send + Sync + 'static {
     fn project_into(
         &self,
         point: Point3,
-        tolerance: &ToleranceContext,
+        context: &EvaluationContext,
         output: &mut Vec<CurveProjection3>,
     ) -> Result<(), GeometryError>;
 }
@@ -153,7 +158,7 @@ pub trait SurfaceEvaluator: Send + Sync + 'static {
         u: f64,
         v: f64,
         order: DerivativeOrder,
-        tolerance: &ToleranceContext,
+        context: &EvaluationContext,
     ) -> Result<SurfaceEvaluation, GeometryError>;
 
     /// Finds every certified projection inside the declared domain.
@@ -165,10 +170,10 @@ pub trait SurfaceEvaluator: Send + Sync + 'static {
     fn project(
         &self,
         point: Point3,
-        tolerance: &ToleranceContext,
+        context: &EvaluationContext,
     ) -> Result<Vec<SurfaceProjection>, GeometryError> {
         let mut output = Vec::new();
-        self.project_into(point, tolerance, &mut output)?;
+        self.project_into(point, context, &mut output)?;
         Ok(output)
     }
 
@@ -184,7 +189,7 @@ pub trait SurfaceEvaluator: Send + Sync + 'static {
     fn project_into(
         &self,
         point: Point3,
-        tolerance: &ToleranceContext,
+        context: &EvaluationContext,
         output: &mut Vec<SurfaceProjection>,
     ) -> Result<(), GeometryError>;
 }

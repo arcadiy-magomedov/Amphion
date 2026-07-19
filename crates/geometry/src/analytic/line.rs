@@ -11,8 +11,10 @@
 //! - `p′(t) = direction`
 //! - `p″(t) = 0`
 //!
-//! Projection: `t = (q − origin) · direction`.  The projected distance bound
-//! equals the perpendicular distance from `q` to the line.
+//! Projection: `t = ((q − origin)·direction) / (direction·direction)`,
+//! computed via exact rational arithmetic (see the private `helpers`
+//! module). The projected distance bound equals a certified upper bound on
+//! the true perpendicular distance from `q` to the line.
 
 #![allow(
     clippy::many_single_char_names,
@@ -20,23 +22,22 @@
     clippy::similar_names
 )]
 
-use amphion_foundation::{
-    Point2, Point3, ToleranceContext, Transform3, UnitVector2, UnitVector3, Vector2, Vector3,
-};
+use amphion_foundation::{Point2, Point3, Transform3, UnitVector2, UnitVector3, Vector2, Vector3};
 use serde::{Deserialize, Serialize};
 
 use crate::traits::{Curve2Evaluator, Curve3Evaluator};
 use crate::{
     CurveEvaluation2, CurveEvaluation3, CurveKind, CurveProjection2, CurveProjection3,
-    DerivativeOrder, DistanceBound, GeometryError, ParameterRange, ParameterValue,
+    DerivativeOrder, DistanceBound, EvaluationContext, FirstDerivativeBound, GeometryError,
+    ParameterRange, ParameterValue, PositionBound, SecondDerivativeBound,
 };
 
 use super::{
     ConstructionError, TransformError,
     helpers::{
-        add2, add3, all_finite2, all_finite3, arithmetic_eval_bound, arithmetic_proj_bound2,
-        arithmetic_proj_bound3, dot2, dot3, mag2, mag3, normalization_to_construction, scale2,
-        scale3, sub2, sub3,
+        all_finite2, all_finite3, check_tolerance, exact_affine_eval2, exact_affine_eval3,
+        exact_line_project2, exact_line_project3, mag2, mag3, normalization_to_construction,
+        scale2, scale3,
     },
 };
 
@@ -141,44 +142,39 @@ impl Curve2Evaluator for Line2 {
         &self,
         parameter: f64,
         order: DerivativeOrder,
-        tolerance: &ToleranceContext,
+        context: &EvaluationContext,
     ) -> Result<CurveEvaluation2, GeometryError> {
         if !parameter.is_finite() {
             return Err(GeometryError::NonFiniteParameter);
         }
-        // Infinite domain: no bound check needed.
         let o = self.origin.into_array();
         let d = self.direction.into_array();
-        let scaled_d = scale2(d, parameter);
-        let pos_arr = add2(o, scaled_d);
-        let pos =
-            Point2::try_new(pos_arr[0], pos_arr[1]).map_err(|_| GeometryError::Uncertified {
+
+        let eval = exact_affine_eval2(context.budget, o, d, parameter)?;
+        let pos = Point2::try_new(eval.point[0], eval.point[1]).map_err(|_| {
+            GeometryError::Uncertified {
                 reason: "line position is non-finite".to_owned(),
+            }
+        })?;
+        let position_error_bound =
+            PositionBound::try_new(eval.position_error_bound).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "position error bound overflowed representable range".to_owned(),
+                }
             })?;
+        let eval_scale = mag2(o) + mag2(scale2(d, parameter));
+        check_tolerance(&context.tolerance, position_error_bound.get(), eval_scale)?;
 
-        // Line evaluation is arithmetic-only (no trig); the Higham bound
-        // applies. `eval_scale` bounds every intermediate magnitude the
-        // evaluation arithmetic can plausibly produce.
-        let eval_scale = mag2(o) + mag2(scaled_d);
-        let position_error_bound = arithmetic_eval_bound(eval_scale)?;
-        let eff_tol =
-            tolerance
-                .effective_length(eval_scale)
-                .map_err(|_| GeometryError::Uncertified {
-                    reason: "world scale is invalid for tolerance computation".to_owned(),
-                })?;
-        if position_error_bound.get() > eff_tol {
-            return Err(GeometryError::Uncertified {
-                reason: "position error bound exceeds requested tolerance at this scale".to_owned(),
-            });
-        }
-
-        // The direction is a stored unit vector: its own arithmetic error
-        // is bounded by the same certified constant applied to unit scale.
-        let direction_error_bound = arithmetic_eval_bound(1.0)?;
+        // The first derivative is exactly the stored direction (no
+        // arithmetic beyond returning the stored vector) and the second
+        // derivative is exactly zero: both are certified with zero error.
+        let direction_error_bound =
+            FirstDerivativeBound::try_new(0.0).map_err(|_| GeometryError::Uncertified {
+                reason: "zero derivative bound construction failed unexpectedly".to_owned(),
+            })?;
         let zero_error_bound =
-            DistanceBound::try_new(0.0).map_err(|_| GeometryError::Uncertified {
-                reason: "zero distance bound construction failed unexpectedly".to_owned(),
+            SecondDerivativeBound::try_new(0.0).map_err(|_| GeometryError::Uncertified {
+                reason: "zero derivative bound construction failed unexpectedly".to_owned(),
             })?;
 
         let (first, first_error_bound, second, second_error_bound) = match order {
@@ -217,36 +213,42 @@ impl Curve2Evaluator for Line2 {
     fn project_into(
         &self,
         point: Point2,
-        tolerance: &ToleranceContext,
+        context: &EvaluationContext,
         output: &mut Vec<CurveProjection2>,
     ) -> Result<(), GeometryError> {
         output.clear();
         let q = point.into_array();
         let o = self.origin.into_array();
         let d = self.direction.into_array();
-        let diff = sub2(q, o);
-        let t = dot2(diff, d);
-        if !t.is_finite() {
-            return Err(GeometryError::Uncertified {
-                reason: "line projection parameter is non-finite".to_owned(),
-            });
-        }
-        let proj_arr = add2(o, scale2(d, t));
-        let proj =
-            Point2::try_new(proj_arr[0], proj_arr[1]).map_err(|_| GeometryError::Uncertified {
+
+        let result = exact_line_project2(context.budget, q, o, d)?;
+        let scale = mag2(q) + mag2(result.point);
+        check_tolerance(&context.tolerance, result.point_residual_bound, scale)?;
+
+        let proj = Point2::try_new(result.point[0], result.point[1]).map_err(|_| {
+            GeometryError::Uncertified {
                 reason: "line projection point is non-finite".to_owned(),
-            })?;
-        let dist = arithmetic_proj_bound2(q, proj_arr, tolerance)?;
+            }
+        })?;
         output.push(CurveProjection2 {
-            parameter: ParameterValue::try_new(t).map_err(|_| GeometryError::Uncertified {
-                reason: "line projection parameter is non-finite".to_owned(),
+            parameter: ParameterValue::try_new(result.parameter).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "line projection parameter is non-finite".to_owned(),
+                }
             })?,
             point: proj,
-            distance_bound: DistanceBound::try_new(dist).map_err(|_| {
+            distance_bound: DistanceBound::try_new(result.distance_bound).map_err(|_| {
                 GeometryError::Uncertified {
                     reason: "line projection distance is non-finite or negative".to_owned(),
                 }
             })?,
+            parameter_error_bound: result.parameter_error_bound,
+            point_residual_bound: PositionBound::try_new(result.point_residual_bound).map_err(
+                |_| GeometryError::Uncertified {
+                    reason: "line projection point residual bound is non-finite or negative"
+                        .to_owned(),
+                },
+            )?,
         });
         Ok(())
     }
@@ -366,39 +368,36 @@ impl Curve3Evaluator for Line3 {
         &self,
         parameter: f64,
         order: DerivativeOrder,
-        tolerance: &ToleranceContext,
+        context: &EvaluationContext,
     ) -> Result<CurveEvaluation3, GeometryError> {
         if !parameter.is_finite() {
             return Err(GeometryError::NonFiniteParameter);
         }
         let o = self.origin.into_array();
         let d = self.direction.into_array();
-        let scaled_d = scale3(d, parameter);
-        let pos_arr = add3(o, scaled_d);
-        let pos = Point3::try_new(pos_arr[0], pos_arr[1], pos_arr[2]).map_err(|_| {
+
+        let eval = exact_affine_eval3(context.budget, o, d, parameter)?;
+        let pos = Point3::try_new(eval.point[0], eval.point[1], eval.point[2]).map_err(|_| {
             GeometryError::Uncertified {
                 reason: "line position is non-finite".to_owned(),
             }
         })?;
+        let position_error_bound =
+            PositionBound::try_new(eval.position_error_bound).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "position error bound overflowed representable range".to_owned(),
+                }
+            })?;
+        let eval_scale = mag3(o) + mag3(scale3(d, parameter));
+        check_tolerance(&context.tolerance, position_error_bound.get(), eval_scale)?;
 
-        let eval_scale = mag3(o) + mag3(scaled_d);
-        let position_error_bound = arithmetic_eval_bound(eval_scale)?;
-        let eff_tol =
-            tolerance
-                .effective_length(eval_scale)
-                .map_err(|_| GeometryError::Uncertified {
-                    reason: "world scale is invalid for tolerance computation".to_owned(),
-                })?;
-        if position_error_bound.get() > eff_tol {
-            return Err(GeometryError::Uncertified {
-                reason: "position error bound exceeds requested tolerance at this scale".to_owned(),
-            });
-        }
-
-        let direction_error_bound = arithmetic_eval_bound(1.0)?;
+        let direction_error_bound =
+            FirstDerivativeBound::try_new(0.0).map_err(|_| GeometryError::Uncertified {
+                reason: "zero derivative bound construction failed unexpectedly".to_owned(),
+            })?;
         let zero_error_bound =
-            DistanceBound::try_new(0.0).map_err(|_| GeometryError::Uncertified {
-                reason: "zero distance bound construction failed unexpectedly".to_owned(),
+            SecondDerivativeBound::try_new(0.0).map_err(|_| GeometryError::Uncertified {
+                reason: "zero derivative bound construction failed unexpectedly".to_owned(),
             })?;
 
         let (first, first_error_bound, second, second_error_bound) = match order {
@@ -440,37 +439,43 @@ impl Curve3Evaluator for Line3 {
     fn project_into(
         &self,
         point: Point3,
-        tolerance: &ToleranceContext,
+        context: &EvaluationContext,
         output: &mut Vec<CurveProjection3>,
     ) -> Result<(), GeometryError> {
         output.clear();
         let q = point.into_array();
         let o = self.origin.into_array();
         let d = self.direction.into_array();
-        let diff = sub3(q, o);
-        let t = dot3(diff, d);
-        if !t.is_finite() {
-            return Err(GeometryError::Uncertified {
-                reason: "line projection parameter is non-finite".to_owned(),
-            });
-        }
-        let proj_arr = add3(o, scale3(d, t));
-        let proj = Point3::try_new(proj_arr[0], proj_arr[1], proj_arr[2]).map_err(|_| {
-            GeometryError::Uncertified {
-                reason: "line projection point is non-finite".to_owned(),
-            }
-        })?;
-        let dist = arithmetic_proj_bound3(q, proj_arr, tolerance)?;
+
+        let result = exact_line_project3(context.budget, q, o, d)?;
+        let scale = mag3(q) + mag3(result.point);
+        check_tolerance(&context.tolerance, result.point_residual_bound, scale)?;
+
+        let proj =
+            Point3::try_new(result.point[0], result.point[1], result.point[2]).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "line projection point is non-finite".to_owned(),
+                }
+            })?;
         output.push(CurveProjection3 {
-            parameter: ParameterValue::try_new(t).map_err(|_| GeometryError::Uncertified {
-                reason: "line projection parameter is non-finite".to_owned(),
+            parameter: ParameterValue::try_new(result.parameter).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "line projection parameter is non-finite".to_owned(),
+                }
             })?,
             point: proj,
-            distance_bound: DistanceBound::try_new(dist).map_err(|_| {
+            distance_bound: DistanceBound::try_new(result.distance_bound).map_err(|_| {
                 GeometryError::Uncertified {
                     reason: "line projection distance is non-finite or negative".to_owned(),
                 }
             })?,
+            parameter_error_bound: result.parameter_error_bound,
+            point_residual_bound: PositionBound::try_new(result.point_residual_bound).map_err(
+                |_| GeometryError::Uncertified {
+                    reason: "line projection point residual bound is non-finite or negative"
+                        .to_owned(),
+                },
+            )?,
         });
         Ok(())
     }
@@ -483,15 +488,21 @@ mod tests {
     use std::f64::consts::SQRT_2;
 
     use amphion_foundation::{Point2, Point3, ToleranceContext, Vector2, Vector3};
+    use num_bigint::BigInt;
+    use num_rational::BigRational;
     use serde_json::json;
 
     use crate::traits::{Curve2Evaluator, Curve3Evaluator};
-    use crate::{DerivativeOrder, GeometryError};
+    use crate::{DerivativeOrder, EvaluationContext, GeometryError};
 
     use super::{ConstructionError, Line2, Line2Repr, Line3, Line3Repr};
 
     fn tol() -> ToleranceContext {
         ToleranceContext::try_new(1e-9, 1e-8, 1e-10, 1e-12).unwrap()
+    }
+
+    fn ctx() -> EvaluationContext {
+        EvaluationContext::new(tol())
     }
 
     fn dist2(a: Point2, b: Point2) -> f64 {
@@ -571,7 +582,7 @@ mod tests {
         )
         .unwrap();
         let ev = line
-            .evaluate(3.0, DerivativeOrder::Position, &tol())
+            .evaluate(3.0, DerivativeOrder::Position, &ctx())
             .unwrap();
         assert!((ev.position.x() - 4.0).abs() < 1e-14);
         assert!((ev.position.y() - 2.0).abs() < 1e-14);
@@ -586,7 +597,7 @@ mod tests {
             Vector2::try_new(1.0, 0.0).unwrap(),
         )
         .unwrap();
-        let ev = line.evaluate(5.0, DerivativeOrder::Second, &tol()).unwrap();
+        let ev = line.evaluate(5.0, DerivativeOrder::Second, &ctx()).unwrap();
         let d1 = ev.first.unwrap().into_array();
         let d2 = ev.second.unwrap().into_array();
         assert!(
@@ -613,12 +624,12 @@ mod tests {
         let h = 1e-7_f64;
         let t0 = 2.0_f64;
         let p_plus = line
-            .evaluate(t0 + h, DerivativeOrder::Position, &tol())
+            .evaluate(t0 + h, DerivativeOrder::Position, &ctx())
             .unwrap()
             .position
             .into_array();
         let p_minus = line
-            .evaluate(t0 - h, DerivativeOrder::Position, &tol())
+            .evaluate(t0 - h, DerivativeOrder::Position, &ctx())
             .unwrap()
             .position
             .into_array();
@@ -627,7 +638,7 @@ mod tests {
             (p_plus[1] - p_minus[1]) / (2.0 * h),
         ];
         let analytic = line
-            .evaluate(t0, DerivativeOrder::First, &tol())
+            .evaluate(t0, DerivativeOrder::First, &ctx())
             .unwrap()
             .first
             .unwrap()
@@ -655,13 +666,15 @@ mod tests {
         .unwrap();
         let t0 = 7.5_f64;
         let point = line
-            .evaluate(t0, DerivativeOrder::Position, &tol())
+            .evaluate(t0, DerivativeOrder::Position, &ctx())
             .unwrap()
             .position;
-        let projections = line.project(point, &tol()).unwrap();
+        let projections = line.project(point, &ctx()).unwrap();
         assert_eq!(projections.len(), 1);
         assert!((projections[0].parameter.get() - t0).abs() < 1e-12);
         assert!(projections[0].distance_bound.get() < 1e-12);
+        assert!(projections[0].parameter_error_bound >= 0.0);
+        assert!(projections[0].point_residual_bound.get() >= 0.0);
     }
 
     #[test]
@@ -672,7 +685,7 @@ mod tests {
         )
         .unwrap();
         let q = Point2::try_new(3.0, 4.0).unwrap();
-        let projections = line.project(q, &tol()).unwrap();
+        let projections = line.project(q, &ctx()).unwrap();
         assert_eq!(projections.len(), 1);
         let proj = &projections[0];
         // foot should be at (3, 0)
@@ -689,7 +702,7 @@ mod tests {
         )
         .unwrap();
         for query in [
-            line.evaluate(3.0, DerivativeOrder::Position, &tol())
+            line.evaluate(3.0, DerivativeOrder::Position, &ctx())
                 .unwrap()
                 .position,
             Point2::try_new(3.0, 4.0).unwrap(),
@@ -697,11 +710,125 @@ mod tests {
             Point2::try_new(1.0e-12, -2.0e-12).unwrap(),
             Point2::try_new(10.0, 10.0 + 1.0e-12).unwrap(),
         ] {
-            let projection = line.project(query, &tol()).unwrap().remove(0);
+            let projection = line.project(query, &ctx()).unwrap().remove(0);
             let actual = dist2(query, projection.point);
             assert!(actual <= projection.distance_bound.get(), "{query:?}");
             assert!(projection.distance_bound.get() >= 0.0);
         }
+    }
+
+    /// Regression test for the "minsub" floating-point cancellation failure
+    /// mode: `Line2::try_new((0,0), (1,-1))`, projecting `(m,m)` with
+    /// `m = 2^-52`. The true squared distance is exactly `2m²` (a power of
+    /// two, exactly representable), so the true distance is the irrational
+    /// `m√2`. A constant-factor (Higham) floating-point error bound computed
+    /// from the already-tiny `scale ≈ m√2` can be swamped by rounding in its
+    /// own computation; the exact-rational bound derived from `sq_dist_exact
+    /// = 2m²` is always ≥ the true value by construction (`sqrt_up`).
+    #[test]
+    fn line2_exact_distance_minsub_regression() {
+        let m = 2.0_f64.powi(-52);
+        let line = Line2::try_new(
+            Point2::try_new(0.0, 0.0).unwrap(),
+            Vector2::try_new(1.0, -1.0).unwrap(),
+        )
+        .unwrap();
+        let q = Point2::try_new(m, m).unwrap();
+        let proj = line.project(q, &ctx()).unwrap().remove(0);
+
+        // sq_dist_exact = 2m^2 is an exact power of two.
+        let sq_dist_exact = 2.0 * m * m;
+        // `sq_dist_exact * 2^200 = 2^97` is an exact power of two well within
+        // `i128` range for `m = 2^-52`, so this scaling cast is exact, not a
+        // truncating approximation.
+        #[allow(clippy::cast_possible_truncation)]
+        let sq_dist_numer = (sq_dist_exact * 2.0_f64.powi(200)) as i128;
+        let sq_rat = BigRational::new(BigInt::from(sq_dist_numer), BigInt::from(2i128).pow(200));
+        let lower = crate::analytic::exact::sqrt_down(&sq_rat).unwrap();
+        let upper = crate::analytic::exact::sqrt_up(&sq_rat).unwrap();
+
+        assert!(
+            proj.distance_bound.get() >= lower,
+            "certified bound {} must be >= certified lower bound {lower}",
+            proj.distance_bound.get()
+        );
+        // The certified bound must also be reasonably tight (within a small
+        // factor of the certified upper bound derived independently).
+        assert!(
+            proj.distance_bound.get() <= upper * 1.000_000_1,
+            "certified bound {} should be close to the true value {upper}",
+            proj.distance_bound.get()
+        );
+    }
+
+    /// Regression test for the floating-point cancellation failure mode:
+    /// `Line2::try_new((284.0065004673188, 426.00975070097496), (2,3))`,
+    /// projecting `(0, 2^-43)`. Naive `f64` computation of the projected
+    /// point suffers catastrophic cancellation (`origin ≈ 284` cancels
+    /// against `t·direction ≈ -284`, leaving a residual on the order of
+    /// `1e-12` computed from operands that have already lost precision at
+    /// the `~284` scale, i.e. an absolute error of `~eps·284 ≈ 6e-14` — over
+    /// 3% of the final `~1.86e-12` residual). The exact-rational
+    /// computation performs the cancellation in exact arithmetic, so it
+    /// never loses that precision.
+    #[test]
+    fn line2_exact_distance_cancellation_regression() {
+        let line = Line2::try_new(
+            Point2::try_new(284.006_500_467_318_8, 426.009_750_700_974_96).unwrap(),
+            Vector2::try_new(2.0, 3.0).unwrap(),
+        )
+        .unwrap();
+        let q = Point2::try_new(0.0, 2.0_f64.powi(-43)).unwrap();
+        let proj = line.project(q, &ctx()).unwrap().remove(0);
+
+        // Independent oracle: recompute the exact squared distance directly
+        // via BigRational, mirroring (but not calling into) the production
+        // helper, using the same stored (already-normalized) direction.
+        let o = line.origin().into_array();
+        let d = line.direction().into_array();
+        let qa = q.into_array();
+        let o_r = [
+            crate::analytic::exact::f64_to_rat(o[0]),
+            crate::analytic::exact::f64_to_rat(o[1]),
+        ];
+        let d_r = [
+            crate::analytic::exact::f64_to_rat(d[0]),
+            crate::analytic::exact::f64_to_rat(d[1]),
+        ];
+        let q_r = [
+            crate::analytic::exact::f64_to_rat(qa[0]),
+            crate::analytic::exact::f64_to_rat(qa[1]),
+        ];
+        let diff_r = [&q_r[0] - &o_r[0], &q_r[1] - &o_r[1]];
+        let dot_dd = &d_r[0] * &d_r[0] + &d_r[1] * &d_r[1];
+        let dot_diff_d = &diff_r[0] * &d_r[0] + &diff_r[1] * &d_r[1];
+        let t_exact = &dot_diff_d / &dot_dd;
+        let proj_r = [&o_r[0] + &t_exact * &d_r[0], &o_r[1] + &t_exact * &d_r[1]];
+        let res_r = [&q_r[0] - &proj_r[0], &q_r[1] - &proj_r[1]];
+        let sq_dist_exact = &res_r[0] * &res_r[0] + &res_r[1] * &res_r[1];
+
+        let lower = crate::analytic::exact::sqrt_down(&sq_dist_exact).unwrap();
+        let upper = crate::analytic::exact::sqrt_up(&sq_dist_exact).unwrap();
+
+        assert!(
+            proj.distance_bound.get() >= lower,
+            "certified bound {} must be >= certified true lower bound {lower}",
+            proj.distance_bound.get()
+        );
+        assert!(
+            proj.distance_bound.get() <= upper * 1.000_000_1,
+            "certified bound {} should be close to the true value {upper}",
+            proj.distance_bound.get()
+        );
+        // The true distance is close to 1.8603e-12; the naive
+        // catastrophically-cancelled floating-point residual (≈1.8446e-12)
+        // must not be mistaken for a valid certified bound.
+        assert!(
+            proj.distance_bound.get() > 1.85e-12,
+            "certified bound {} must reflect the true ~1.8603e-12 distance, not the \
+             cancellation-corrupted ~1.8446e-12 naive residual",
+            proj.distance_bound.get()
+        );
     }
 
     #[test]
@@ -712,11 +839,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            line.evaluate(f64::NAN, DerivativeOrder::Position, &tol()),
+            line.evaluate(f64::NAN, DerivativeOrder::Position, &ctx()),
             Err(GeometryError::NonFiniteParameter)
         );
         assert_eq!(
-            line.evaluate(f64::INFINITY, DerivativeOrder::Position, &tol()),
+            line.evaluate(f64::INFINITY, DerivativeOrder::Position, &ctx()),
             Err(GeometryError::NonFiniteParameter)
         );
     }
@@ -800,7 +927,7 @@ mod tests {
             Vector3::try_new(SQRT_2 / 2.0, SQRT_2 / 2.0, 0.0).unwrap(),
         )
         .unwrap();
-        let ev = line.evaluate(0.0, DerivativeOrder::Second, &tol()).unwrap();
+        let ev = line.evaluate(0.0, DerivativeOrder::Second, &ctx()).unwrap();
         assert!((ev.position.x() - 1.0).abs() < 1e-14);
         assert!((ev.position.y() - 2.0).abs() < 1e-14);
         assert!((ev.position.z() - 3.0).abs() < 1e-14);
@@ -824,18 +951,18 @@ mod tests {
         let h = 1e-7_f64;
         let t0 = -1.5_f64;
         let p_plus = line
-            .evaluate(t0 + h, DerivativeOrder::Position, &tol())
+            .evaluate(t0 + h, DerivativeOrder::Position, &ctx())
             .unwrap()
             .position
             .into_array();
         let p_minus = line
-            .evaluate(t0 - h, DerivativeOrder::Position, &tol())
+            .evaluate(t0 - h, DerivativeOrder::Position, &ctx())
             .unwrap()
             .position
             .into_array();
         let fd: [f64; 3] = std::array::from_fn(|i| (p_plus[i] - p_minus[i]) / (2.0 * h));
         let analytic = line
-            .evaluate(t0, DerivativeOrder::First, &tol())
+            .evaluate(t0, DerivativeOrder::First, &ctx())
             .unwrap()
             .first
             .unwrap()
@@ -859,10 +986,10 @@ mod tests {
         .unwrap();
         for t0 in [-10.0, 0.0, 5.0, 100.0] {
             let pt = line
-                .evaluate(t0, DerivativeOrder::Position, &tol())
+                .evaluate(t0, DerivativeOrder::Position, &ctx())
                 .unwrap()
                 .position;
-            let projs = line.project(pt, &tol()).unwrap();
+            let projs = line.project(pt, &ctx()).unwrap();
             assert_eq!(projs.len(), 1);
             assert!(
                 (projs[0].parameter.get() - t0).abs() < 1e-10,
@@ -892,7 +1019,7 @@ mod tests {
         )
         .unwrap();
         for query in [
-            line.evaluate(-4.0, DerivativeOrder::Position, &tol())
+            line.evaluate(-4.0, DerivativeOrder::Position, &ctx())
                 .unwrap()
                 .position,
             Point3::try_new(3.0, 4.0, 5.0).unwrap(),
@@ -900,7 +1027,7 @@ mod tests {
             Point3::try_new(1.0e-12, -2.0e-12, 3.0e-12).unwrap(),
             Point3::try_new(10.0, 10.0 + 1.0e-12, 10.0 - 1.0e-12).unwrap(),
         ] {
-            let projection = line.project(query, &tol()).unwrap().remove(0);
+            let projection = line.project(query, &ctx()).unwrap().remove(0);
             let actual = dist3(query, projection.point);
             assert!(actual <= projection.distance_bound.get(), "{query:?}");
             assert!(projection.distance_bound.get() >= 0.0);

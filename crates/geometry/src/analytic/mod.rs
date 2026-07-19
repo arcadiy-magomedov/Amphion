@@ -25,8 +25,10 @@
 //! foundation has no 2-D transform type.
 
 mod error;
+pub(crate) mod exact;
 mod helpers;
 mod transform;
+pub(crate) mod trig;
 
 pub mod circle;
 pub mod cone;

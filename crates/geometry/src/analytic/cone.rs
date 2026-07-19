@@ -19,13 +19,22 @@
 //! [`GeometryError::Singular`] (this is a geometric fact, independent of
 //! trig certification).
 //!
-//! [`evaluate`](crate::traits::SurfaceEvaluator::evaluate) and
-//! [`project_into`](crate::traits::SurfaceEvaluator::project_into) require
-//! `sin`, `cos`, and `tan`. No pure-Rust, WASM-compatible, formally-proved
-//! correctly-rounded implementation of these functions currently exists (see
-//! the `analytic::helpers` module docs for the survey of candidates), so
-//! both methods return [`GeometryError::Uncertified`] once the
-//! domain/finiteness/singularity checks have passed.
+//! Derivatives:
+//! ```text
+//! ∂p/∂u    =  v·tan(α)·(−sin u·x_axis + cos u·y_axis)
+//! ∂p/∂v    =  axis + tan(α)·(cos u·x_axis + sin u·y_axis)
+//! ∂²p/∂u²  =  −v·tan(α)·(cos u·x_axis + sin u·y_axis)
+//! ∂²p/∂u∂v =  tan(α)·(−sin u·x_axis + cos u·y_axis)
+//! ∂²p/∂v²  =  0
+//! ```
+//!
+//! Projection: the correct nappe (sign of the reported `v`) is always
+//! `s = sign(h)` where `h = (q − apex)·axis`, proven by comparing the
+//! foot-of-perpendicular arclength parameter on both candidate rays in the
+//! meridian half-plane containing the query point; no clamping or
+//! two-candidate distance comparison is required.  Returns
+//! [`GeometryError::Singular`] when the query lies exactly on the cone's
+//! axis (no unique nearest point or azimuthal angle).
 
 #![allow(
     clippy::many_single_char_names,
@@ -35,20 +44,21 @@
 
 use std::f64::consts::TAU;
 
-use amphion_foundation::{Point3, ToleranceContext, Transform3, UnitVector3, Vector3};
+use amphion_foundation::{Point3, Transform3, UnitVector3, Vector3};
 use serde::{Deserialize, Serialize};
 
 use crate::traits::SurfaceEvaluator;
 use crate::{
-    DerivativeOrder, GeometryError, ParameterRange, SurfaceDomain, SurfaceEvaluation, SurfaceKind,
-    SurfaceProjection,
+    DerivativeOrder, DistanceBound, EvaluationContext, FirstDerivativeBound, GeometryError,
+    ParameterRange, ParameterValue, PositionBound, SecondDerivativeBound, SurfaceDomain,
+    SurfaceEvaluation, SurfaceKind, SurfaceProjection,
 };
 
 use super::{
     ConstructionError, TransformError,
     helpers::{
-        ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite3, dot3, in_range, mag3,
-        normalization_to_construction, scale3, sub3,
+        ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite3, check_tolerance, dot3, exact_cone_eval,
+        exact_cone_project, in_range, mag3, normalization_to_construction, scale3, sub3,
     },
     transform::similarity_scale,
 };
@@ -264,12 +274,17 @@ impl SurfaceEvaluator for Cone {
         SurfaceDomain::new(angular_range(), unbounded_range())
     }
 
+    // Long due to certifying position plus first/second derivative bounds
+    // (each independently wrapped in its own `GeometryError`-mapped
+    // constructor) across every `DerivativeOrder`, not accidental
+    // complexity.
+    #[allow(clippy::too_many_lines)]
     fn evaluate(
         &self,
         u: f64,
         v: f64,
         order: DerivativeOrder,
-        _tolerance: &ToleranceContext,
+        context: &EvaluationContext,
     ) -> Result<SurfaceEvaluation, GeometryError> {
         if !u.is_finite() || !v.is_finite() {
             return Err(GeometryError::NonFiniteParameter);
@@ -280,43 +295,169 @@ impl SurfaceEvaluator for Cone {
         // Apex singularity: ∂p/∂u = 0 at v = 0. This is a genuine geometric
         // singularity independent of trig certification (it holds regardless
         // of how accurately sin/cos/tan are computed), so it is checked
-        // before falling through to the Uncertified result below.
+        // before calling the certified evaluator below.
         if v == 0.0 && order != DerivativeOrder::Position {
             return Err(GeometryError::Singular);
         }
-        // p(u, v) = apex + v·axis + v·tan(α)·(cos(u)·x_axis + sin(u)·y_axis)
-        // requires `cos`, `sin`, and `tan`. No pure-Rust, WASM-compatible,
-        // formally-proved correctly-rounded implementation of these
-        // functions currently exists (see the `analytic::helpers` module
-        // docs for the survey of candidates), so no certified error bound
-        // can be produced.
-        Err(GeometryError::Uncertified {
-            reason: "cone evaluation requires certified sin/cos/tan; no formally-proved \
-                     WASM-compatible implementation is available. libm (MIT, WASM) gives \
-                     ~1-2 ULP empirically but is not formally proved. core-math (MIT, 0.5 ULP) \
-                     requires C FFI incompatible with WASM. IEEE 754-2019 §9.2 recommends but \
-                     does not require correctly-rounded transcendentals."
-                .to_owned(),
+
+        let ap = self.apex.into_array();
+        let ax = self.axis.into_array();
+        let xa = self.x_axis.into_array();
+        let ya = self.y_axis.into_array();
+
+        let eval = exact_cone_eval(context.budget, ap, ax, self.half_angle, xa, ya, u, v)?;
+        let pos = Point3::try_new(eval.point[0], eval.point[1], eval.point[2]).map_err(|_| {
+            GeometryError::Uncertified {
+                reason: "cone position is non-finite".to_owned(),
+            }
+        })?;
+        let position_error_bound =
+            PositionBound::try_new(eval.position_error_bound).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "position error bound overflowed representable range".to_owned(),
+                }
+            })?;
+        let eval_scale = mag3(ap) + v.abs() * (1.0 + self.half_angle.tan().abs());
+        check_tolerance(&context.tolerance, position_error_bound.get(), eval_scale)?;
+
+        let du_error_bound = FirstDerivativeBound::try_new(eval.du_error_bound).map_err(|_| {
+            GeometryError::Uncertified {
+                reason: "first derivative error bound overflowed representable range".to_owned(),
+            }
+        })?;
+        let dv_error_bound = FirstDerivativeBound::try_new(eval.dv_error_bound).map_err(|_| {
+            GeometryError::Uncertified {
+                reason: "first derivative error bound overflowed representable range".to_owned(),
+            }
+        })?;
+        let duu_error_bound =
+            SecondDerivativeBound::try_new(eval.duu_error_bound).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "second derivative error bound overflowed representable range"
+                        .to_owned(),
+                }
+            })?;
+        let duv_error_bound =
+            SecondDerivativeBound::try_new(eval.duv_error_bound).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "second derivative error bound overflowed representable range"
+                        .to_owned(),
+                }
+            })?;
+        // ∂²p/∂v² = 0 exactly (the parameterization is affine in v along a
+        // fixed ray direction).
+        let zero_second_bound =
+            SecondDerivativeBound::try_new(0.0).map_err(|_| GeometryError::Uncertified {
+                reason: "zero derivative bound construction failed unexpectedly".to_owned(),
+            })?;
+
+        let to_vec3 = |arr: [f64; 3], what: &'static str| {
+            Vector3::try_new(arr[0], arr[1], arr[2]).map_err(|_| GeometryError::Uncertified {
+                reason: format!("{what} non-finite"),
+            })
+        };
+
+        let (du, dv, duu, duv, dvv, first_u_eb, first_v_eb, duu_eb, duv_eb, dvv_eb) = match order {
+            DerivativeOrder::Position => {
+                (None, None, None, None, None, None, None, None, None, None)
+            }
+            DerivativeOrder::First => {
+                let du = to_vec3(eval.du, "cone first u-derivative")?;
+                let dv = to_vec3(eval.dv, "cone first v-derivative")?;
+                (
+                    Some(du),
+                    Some(dv),
+                    None,
+                    None,
+                    None,
+                    Some(du_error_bound),
+                    Some(dv_error_bound),
+                    None,
+                    None,
+                    None,
+                )
+            }
+            DerivativeOrder::Second => {
+                let du = to_vec3(eval.du, "cone first u-derivative")?;
+                let dv = to_vec3(eval.dv, "cone first v-derivative")?;
+                let duu = to_vec3(eval.duu, "cone second u-derivative")?;
+                let duv = to_vec3(eval.duv, "cone mixed second derivative")?;
+                let zero = to_vec3([0.0, 0.0, 0.0], "zero vector")?;
+                (
+                    Some(du),
+                    Some(dv),
+                    Some(duu),
+                    Some(duv),
+                    Some(zero),
+                    Some(du_error_bound),
+                    Some(dv_error_bound),
+                    Some(duu_error_bound),
+                    Some(duv_error_bound),
+                    Some(zero_second_bound),
+                )
+            }
+        };
+        Ok(SurfaceEvaluation {
+            position: pos,
+            du,
+            dv,
+            duu,
+            duv,
+            dvv,
+            position_error_bound,
+            first_u_error_bound: first_u_eb,
+            first_v_error_bound: first_v_eb,
+            second_uu_error_bound: duu_eb,
+            second_uv_error_bound: duv_eb,
+            second_vv_error_bound: dvv_eb,
         })
     }
 
     fn project_into(
         &self,
-        _point: Point3,
-        _tolerance: &ToleranceContext,
+        point: Point3,
+        context: &EvaluationContext,
         output: &mut Vec<SurfaceProjection>,
     ) -> Result<(), GeometryError> {
         output.clear();
-        // u = atan2(...) is an uncertified std transcendental; the nappe
-        // disambiguation and sin(u)/cos(u)/tan(α) reconstruction of the
-        // projected point are also uncertified. See the `analytic::helpers`
-        // module docs.
-        Err(GeometryError::Uncertified {
-            reason: "cone projection requires certified atan2/sin/cos/tan; pending certified \
-                     trig integration. See: libm crate (empirical accuracy only), core-math \
-                     (0.5 ULP, not WASM-compatible)."
-                .to_owned(),
-        })
+        let q = point.into_array();
+        let ap = self.apex.into_array();
+        let ax = self.axis.into_array();
+        let xa = self.x_axis.into_array();
+        let ya = self.y_axis.into_array();
+
+        let result = exact_cone_project(context.budget, q, ap, ax, self.half_angle, xa, ya)?;
+        let scale = mag3(q) + mag3(result.point);
+        check_tolerance(&context.tolerance, result.point_residual_bound, scale)?;
+
+        let proj =
+            Point3::try_new(result.point[0], result.point[1], result.point[2]).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "cone projection point is non-finite".to_owned(),
+                }
+            })?;
+        output.push(SurfaceProjection {
+            u: ParameterValue::try_new(result.u).map_err(|_| GeometryError::Uncertified {
+                reason: "cone projection u is non-finite".to_owned(),
+            })?,
+            v: ParameterValue::try_new(result.v).map_err(|_| GeometryError::Uncertified {
+                reason: "cone projection v is non-finite".to_owned(),
+            })?,
+            point: proj,
+            distance_bound: DistanceBound::try_new(result.distance_bound).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "cone projection distance is non-finite or negative".to_owned(),
+                }
+            })?,
+            parameter_error_bound: result.parameter_error_bound,
+            point_residual_bound: PositionBound::try_new(result.point_residual_bound).map_err(
+                |_| GeometryError::Uncertified {
+                    reason: "cone projection point residual bound is non-finite or negative"
+                        .to_owned(),
+                },
+            )?,
+        });
+        Ok(())
     }
 }
 
@@ -331,7 +472,7 @@ mod tests {
 
     use crate::analytic::helpers::ILL_COND_THRESH;
     use crate::traits::SurfaceEvaluator;
-    use crate::{DerivativeOrder, GeometryError};
+    use crate::{DerivativeOrder, EvaluationContext, GeometryError};
 
     use super::{Cone, ConeRepr, ConstructionError};
 
@@ -339,13 +480,14 @@ mod tests {
         ToleranceContext::try_new(1e-9, 1e-8, 1e-10, 1e-12).unwrap()
     }
 
-    fn assert_uncertified(err: &GeometryError) {
-        match err {
-            GeometryError::Uncertified { reason } => {
-                assert!(!reason.is_empty(), "reason string must not be empty");
-            }
-            other => panic!("expected Uncertified, got {other:?}"),
-        }
+    fn ctx() -> EvaluationContext {
+        EvaluationContext::new(tol())
+    }
+
+    fn dist3(a: Point3, b: Point3) -> f64 {
+        let [ax, ay, az] = a.into_array();
+        let [bx, by, bz] = b.into_array();
+        ((ax - bx).powi(2) + (ay - by).powi(2) + (az - bz).powi(2)).sqrt()
     }
 
     fn std_cone() -> Cone {
@@ -428,43 +570,71 @@ mod tests {
     fn cone_evaluate_apex_derivative_singular() {
         // The apex ∂p/∂u = 0 singularity is a geometric fact independent of
         // trig certification, so it is still reported (and takes priority
-        // over Uncertified).
+        // over any certified computation).
         let c = std_cone();
         assert_eq!(
-            c.evaluate(0.0, 0.0, DerivativeOrder::First, &tol()),
+            c.evaluate(0.0, 0.0, DerivativeOrder::First, &ctx()),
             Err(GeometryError::Singular)
         );
         assert_eq!(
-            c.evaluate(0.0, 0.0, DerivativeOrder::Second, &tol()),
+            c.evaluate(0.0, 0.0, DerivativeOrder::Second, &ctx()),
             Err(GeometryError::Singular)
         );
     }
 
     #[test]
-    fn cone_evaluate_returns_uncertified_pending_trig() {
-        // No pure-Rust, WASM-compatible, formally-proved correctly-rounded
-        // sin/cos/tan implementation exists; evaluate() must be honest
-        // about this rather than assert an unproven bound.
+    fn cone_evaluate_matches_known_values() {
+        // std_cone: apex=(0,0,0), axis=(0,0,1), half_angle=π/4
+        // (tan(π/4)=1), x_axis=(1,0,0), y_axis=(0,1,0). At (u,v)=(0,0):
+        // p=apex=(0,0,0). At (u,v)=(0,5): p=(5,0,5), du=(0,5,0),
+        // dv=(1,0,1), duu=(-5,0,0), duv=(0,1,0), dvv=(0,0,0).
         let c = std_cone();
-        let err = c
-            .evaluate(0.0, 1.0, DerivativeOrder::Position, &tol())
-            .unwrap_err();
-        assert_uncertified(&err);
-        let err = c
-            .evaluate(0.0, 1.0, DerivativeOrder::Second, &tol())
-            .unwrap_err();
-        assert_uncertified(&err);
+        let eval = c
+            .evaluate(0.0, 0.0, DerivativeOrder::Position, &ctx())
+            .unwrap();
+        let [px, py, pz] = eval.position.into_array();
+        assert!(px.abs() < 1e-9 && py.abs() < 1e-9 && pz.abs() < 1e-9);
+
+        let eval = c
+            .evaluate(0.0, 5.0, DerivativeOrder::Second, &ctx())
+            .unwrap();
+        let [px, py, pz] = eval.position.into_array();
+        assert!((px - 5.0).abs() < 1e-9, "px={px}");
+        assert!(py.abs() < 1e-9, "py={py}");
+        assert!((pz - 5.0).abs() < 1e-9, "pz={pz}");
+
+        let [dux, duy, duz] = eval.du.unwrap().into_array();
+        assert!(dux.abs() < 1e-9, "dux={dux}");
+        assert!((duy - 5.0).abs() < 1e-9, "duy={duy}");
+        assert!(duz.abs() < 1e-9, "duz={duz}");
+
+        let [dvx, dvy, dvz] = eval.dv.unwrap().into_array();
+        assert!((dvx - 1.0).abs() < 1e-9, "dvx={dvx}");
+        assert!(dvy.abs() < 1e-9, "dvy={dvy}");
+        assert!((dvz - 1.0).abs() < 1e-9, "dvz={dvz}");
+
+        let [duux, duuy, duuz] = eval.duu.unwrap().into_array();
+        assert!((duux - (-5.0)).abs() < 1e-9, "duux={duux}");
+        assert!(duuy.abs() < 1e-9 && duuz.abs() < 1e-9);
+
+        let [duvx, duvy, duvz] = eval.duv.unwrap().into_array();
+        assert!(duvx.abs() < 1e-9, "duvx={duvx}");
+        assert!((duvy - 1.0).abs() < 1e-9, "duvy={duvy}");
+        assert!(duvz.abs() < 1e-9, "duvz={duvz}");
+
+        let [dvvx, dvvy, dvvz] = eval.dvv.unwrap().into_array();
+        assert!(dvvx.abs() < 1e-9 && dvvy.abs() < 1e-9 && dvvz.abs() < 1e-9);
     }
 
     #[test]
     fn cone_evaluate_rejects_out_of_domain() {
         let c = std_cone();
         assert_eq!(
-            c.evaluate(-0.001, 1.0, DerivativeOrder::Position, &tol()),
+            c.evaluate(-0.001, 1.0, DerivativeOrder::Position, &ctx()),
             Err(GeometryError::OutsideDomain)
         );
         assert_eq!(
-            c.evaluate(TAU, 1.0, DerivativeOrder::Position, &tol()),
+            c.evaluate(TAU, 1.0, DerivativeOrder::Position, &ctx()),
             Err(GeometryError::OutsideDomain)
         );
     }
@@ -473,33 +643,48 @@ mod tests {
     fn cone_evaluate_rejects_non_finite() {
         let c = std_cone();
         assert_eq!(
-            c.evaluate(f64::NAN, 1.0, DerivativeOrder::Position, &tol()),
+            c.evaluate(f64::NAN, 1.0, DerivativeOrder::Position, &ctx()),
             Err(GeometryError::NonFiniteParameter)
         );
         assert_eq!(
-            c.evaluate(0.0, f64::INFINITY, DerivativeOrder::Position, &tol()),
+            c.evaluate(0.0, f64::INFINITY, DerivativeOrder::Position, &ctx()),
             Err(GeometryError::NonFiniteParameter)
         );
     }
 
     #[test]
-    fn cone_project_returns_uncertified_pending_trig() {
-        // u = atan2(...), nappe disambiguation, and sin/cos/tan
-        // reconstruction are all uncertified std transcendentals;
-        // project_into must report Uncertified rather than a bound it
-        // cannot support.
+    fn cone_project_matches_known_values() {
+        // std_cone: apex=(0,0,0), axis=(0,0,1), half_angle=π/4 (tan=1),
+        // x_axis=(1,0,0), y_axis=(0,1,0). q=(2,0,1): h=1, in-plane offset
+        // (2,0) ⇒ radial=2. t* = cos(π/4) + 2·sin(π/4) = 3√2/2,
+        // v = t*·cos(π/4) = 1.5, rho = t*·sin(π/4) = 1.5 ⇒ nearest
+        // point=(1.5,0,1.5), sq_dist = h² + radial² − t*² = 1+4−4.5 = 0.5.
         let c = std_cone();
-        let q = Point3::try_new(2.0, 0.0, 3.0).unwrap();
-        let err = c.project(q, &tol()).unwrap_err();
-        assert_uncertified(&err);
+        let q = Point3::try_new(2.0, 0.0, 1.0).unwrap();
+        let projs = c.project(q, &ctx()).unwrap();
+        assert_eq!(projs.len(), 1);
+        let p = &projs[0];
+        let [px, py, pz] = p.point.into_array();
+        assert!((px - 1.5).abs() < 1e-9, "px={px}");
+        assert!(py.abs() < 1e-9, "py={py}");
+        assert!((pz - 1.5).abs() < 1e-9, "pz={pz}");
+        let expected_dist = 0.5_f64.sqrt();
+        assert!((p.distance_bound.get() - expected_dist).abs() < 1e-9);
+        assert!(p.u.get().abs() < 1e-9, "u={}", p.u.get());
+        assert!((p.v.get() - 1.5).abs() < 1e-9, "v={}", p.v.get());
+        let actual = dist3(q, p.point);
+        assert!(actual <= p.distance_bound.get());
     }
 
     #[test]
     fn cone_project_into_clears_output_on_error() {
+        // Querying exactly on the cone axis is singular: the in-plane
+        // offset is zero, so there is no unique nearest point / azimuthal
+        // angle.
         let c = std_cone();
         let mut output = vec![];
-        let err = c.project_into(Point3::try_new(1.0, 0.0, 1.0).unwrap(), &tol(), &mut output);
-        assert_uncertified(&err.unwrap_err());
+        let err = c.project_into(Point3::try_new(0.0, 0.0, 5.0).unwrap(), &ctx(), &mut output);
+        assert_eq!(err.unwrap_err(), GeometryError::Singular);
         assert!(output.is_empty());
     }
 

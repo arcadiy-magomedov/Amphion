@@ -22,8 +22,10 @@ pub use analytic::{Circle2, Circle3, Cone, ConstructionError, Cylinder, Line2, L
 pub use domain::{ParameterInterval, ParameterRange, ParameterRangeError, SurfaceDomain};
 pub use error::GeometryError;
 pub use evaluation::{
-    CurveEvaluation2, CurveEvaluation3, CurveProjection2, CurveProjection3, DerivativeOrder,
-    DistanceBound, ParameterValue, ProjectionValueError, SurfaceEvaluation, SurfaceProjection,
+    CertificationBudget, CurveEvaluation2, CurveEvaluation3, CurveProjection2, CurveProjection3,
+    DerivativeOrder, DistanceBound, EvaluationContext, FirstDerivativeBound, ParameterValue,
+    PositionBound, ProjectionValueError, SecondDerivativeBound, SurfaceEvaluation,
+    SurfaceProjection,
 };
 pub use id::{Curve2Id, Curve3Id, GeometryHandle, SurfaceId};
 pub use kind::{CurveKind, SurfaceKind};

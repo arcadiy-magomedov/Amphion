@@ -24,20 +24,21 @@
     clippy::similar_names
 )]
 
-use amphion_foundation::{Point3, ToleranceContext, Transform3, UnitVector3, Vector3};
+use amphion_foundation::{Point3, Transform3, UnitVector3, Vector3};
 use serde::{Deserialize, Serialize};
 
 use crate::traits::SurfaceEvaluator;
 use crate::{
-    DerivativeOrder, DistanceBound, GeometryError, ParameterRange, ParameterValue, SurfaceDomain,
+    DerivativeOrder, DistanceBound, EvaluationContext, FirstDerivativeBound, GeometryError,
+    ParameterRange, ParameterValue, PositionBound, SecondDerivativeBound, SurfaceDomain,
     SurfaceEvaluation, SurfaceKind, SurfaceProjection,
 };
 
 use super::{
     ConstructionError, TransformError,
     helpers::{
-        ILL_COND_THRESH, UNIT_VECTOR_TOL, add3, all_finite3, arithmetic_eval_bound,
-        arithmetic_proj_bound3, dot3, mag3, normalization_to_construction, scale3, sub3,
+        ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite3, check_tolerance, dot3, exact_plane_eval3,
+        exact_plane_project3, mag3, normalization_to_construction, scale3, sub3,
     },
 };
 
@@ -220,7 +221,7 @@ impl SurfaceEvaluator for Plane {
         u: f64,
         v: f64,
         order: DerivativeOrder,
-        tolerance: &ToleranceContext,
+        context: &EvaluationContext,
     ) -> Result<SurfaceEvaluation, GeometryError> {
         if !u.is_finite() || !v.is_finite() {
             return Err(GeometryError::NonFiniteParameter);
@@ -228,40 +229,37 @@ impl SurfaceEvaluator for Plane {
         let o = self.origin.into_array();
         let u_ax = self.u_axis.into_array();
         let v_ax = self.v_axis.into_array();
-        let u_term = scale3(u_ax, u);
-        let v_term = scale3(v_ax, v);
-        let pos_arr = add3(o, add3(u_term, v_term));
-        let pos = Point3::try_new(pos_arr[0], pos_arr[1], pos_arr[2]).map_err(|_| {
+
+        let eval = exact_plane_eval3(context.budget, o, u_ax, v_ax, u, v)?;
+        let pos = Point3::try_new(eval.point[0], eval.point[1], eval.point[2]).map_err(|_| {
             GeometryError::Uncertified {
                 reason: "plane position is non-finite".to_owned(),
             }
         })?;
-
-        // Plane evaluation is arithmetic-only (no trig); the Higham bound
-        // applies.
-        let eval_scale = mag3(o) + mag3(u_term) + mag3(v_term);
-        let position_error_bound = arithmetic_eval_bound(eval_scale)?;
-        let eff_tol =
-            tolerance
-                .effective_length(eval_scale)
-                .map_err(|_| GeometryError::Uncertified {
-                    reason: "world scale is invalid for tolerance computation".to_owned(),
-                })?;
-        if position_error_bound.get() > eff_tol {
-            return Err(GeometryError::Uncertified {
-                reason: "position error bound exceeds requested tolerance at this scale".to_owned(),
-            });
-        }
+        let position_error_bound =
+            PositionBound::try_new(eval.position_error_bound).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "position error bound overflowed representable range".to_owned(),
+                }
+            })?;
+        let eval_scale = mag3(o) + mag3(scale3(u_ax, u)) + mag3(scale3(v_ax, v));
+        check_tolerance(&context.tolerance, position_error_bound.get(), eval_scale)?;
 
         let to_vec3 = |arr: [f64; 3], what: &'static str| {
             Vector3::try_new(arr[0], arr[1], arr[2]).map_err(|_| GeometryError::Uncertified {
                 reason: format!("{what} non-finite"),
             })
         };
-        let axis_error_bound = arithmetic_eval_bound(1.0)?;
+        // Both axes are stored, unarithmeticized unit vectors: the first
+        // partial derivatives are exact (zero error), and every second
+        // partial derivative of a plane is exactly the zero vector.
+        let axis_error_bound =
+            FirstDerivativeBound::try_new(0.0).map_err(|_| GeometryError::Uncertified {
+                reason: "zero derivative bound construction failed unexpectedly".to_owned(),
+            })?;
         let zero_error_bound =
-            DistanceBound::try_new(0.0).map_err(|_| GeometryError::Uncertified {
-                reason: "zero distance bound construction failed unexpectedly".to_owned(),
+            SecondDerivativeBound::try_new(0.0).map_err(|_| GeometryError::Uncertified {
+                reason: "zero derivative bound construction failed unexpectedly".to_owned(),
             })?;
 
         let (du, dv, duu, duv, dvv, first_u_eb, first_v_eb, duu_eb, duv_eb, dvv_eb) = match order {
@@ -321,7 +319,7 @@ impl SurfaceEvaluator for Plane {
     fn project_into(
         &self,
         point: Point3,
-        tolerance: &ToleranceContext,
+        context: &EvaluationContext,
         output: &mut Vec<SurfaceProjection>,
     ) -> Result<(), GeometryError> {
         output.clear();
@@ -329,32 +327,37 @@ impl SurfaceEvaluator for Plane {
         let o = self.origin.into_array();
         let u_ax = self.u_axis.into_array();
         let v_ax = self.v_axis.into_array();
-        let diff = sub3(q, o);
-        let u_val = dot3(diff, u_ax);
-        let v_val = dot3(diff, v_ax);
-        if !u_val.is_finite() || !v_val.is_finite() {
-            return Err(GeometryError::Uncertified {
-                reason: "plane projection parameter is non-finite".to_owned(),
-            });
-        }
-        let proj_arr = add3(o, add3(scale3(u_ax, u_val), scale3(v_ax, v_val)));
-        let proj = Point3::try_new(proj_arr[0], proj_arr[1], proj_arr[2]).map_err(|_| {
-            GeometryError::Uncertified {
-                reason: "plane projection point is non-finite".to_owned(),
-            }
-        })?;
+
+        let result = exact_plane_project3(context.budget, q, o, u_ax, v_ax)?;
+        let scale = mag3(q) + mag3(result.point);
+        check_tolerance(&context.tolerance, result.point_residual_bound, scale)?;
+
+        let proj =
+            Point3::try_new(result.point[0], result.point[1], result.point[2]).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "plane projection point is non-finite".to_owned(),
+                }
+            })?;
         let local = SurfaceProjection {
-            u: ParameterValue::try_new(u_val).map_err(|_| GeometryError::Uncertified {
+            u: ParameterValue::try_new(result.u).map_err(|_| GeometryError::Uncertified {
                 reason: "plane projection u is non-finite".to_owned(),
             })?,
-            v: ParameterValue::try_new(v_val).map_err(|_| GeometryError::Uncertified {
+            v: ParameterValue::try_new(result.v).map_err(|_| GeometryError::Uncertified {
                 reason: "plane projection v is non-finite".to_owned(),
             })?,
             point: proj,
-            distance_bound: DistanceBound::try_new(arithmetic_proj_bound3(q, proj_arr, tolerance)?)
-                .map_err(|_| GeometryError::Uncertified {
+            distance_bound: DistanceBound::try_new(result.distance_bound).map_err(|_| {
+                GeometryError::Uncertified {
                     reason: "plane projection distance is non-finite or negative".to_owned(),
-                })?,
+                }
+            })?,
+            parameter_error_bound: result.parameter_error_bound,
+            point_residual_bound: PositionBound::try_new(result.point_residual_bound).map_err(
+                |_| GeometryError::Uncertified {
+                    reason: "plane projection point residual bound is non-finite or negative"
+                        .to_owned(),
+                },
+            )?,
         };
         output.push(local);
         Ok(())
@@ -369,13 +372,17 @@ mod tests {
     use serde_json::json;
 
     use crate::traits::SurfaceEvaluator;
-    use crate::{DerivativeOrder, GeometryError};
+    use crate::{DerivativeOrder, EvaluationContext, GeometryError};
 
     use super::{ConstructionError, Plane, PlaneRepr};
     use crate::analytic::helpers::ILL_COND_THRESH;
 
     fn tol() -> ToleranceContext {
         ToleranceContext::try_new(1e-9, 1e-8, 1e-10, 1e-12).unwrap()
+    }
+
+    fn ctx() -> EvaluationContext {
+        EvaluationContext::new(tol())
     }
 
     fn dist3(a: Point3, b: Point3) -> f64 {
@@ -460,7 +467,7 @@ mod tests {
     fn plane_evaluate_position() {
         let p = xy_plane();
         let ev = p
-            .evaluate(3.0, 4.0, DerivativeOrder::Position, &tol())
+            .evaluate(3.0, 4.0, DerivativeOrder::Position, &ctx())
             .unwrap();
         assert!((ev.position.x() - 3.0).abs() < 1e-14);
         assert!((ev.position.y() - 4.0).abs() < 1e-14);
@@ -472,7 +479,7 @@ mod tests {
     fn plane_evaluate_derivatives() {
         let p = xy_plane();
         let ev = p
-            .evaluate(1.0, 2.0, DerivativeOrder::Second, &tol())
+            .evaluate(1.0, 2.0, DerivativeOrder::Second, &ctx())
             .unwrap();
         let du = ev.du.unwrap().into_array();
         let dv = ev.dv.unwrap().into_array();
@@ -503,18 +510,18 @@ mod tests {
         let h = 1e-7_f64;
         let (u0, v0) = (1.5, -2.0);
         let p_u_plus = p
-            .evaluate(u0 + h, v0, DerivativeOrder::Position, &tol())
+            .evaluate(u0 + h, v0, DerivativeOrder::Position, &ctx())
             .unwrap()
             .position
             .into_array();
         let p_u_minus = p
-            .evaluate(u0 - h, v0, DerivativeOrder::Position, &tol())
+            .evaluate(u0 - h, v0, DerivativeOrder::Position, &ctx())
             .unwrap()
             .position
             .into_array();
         let fd_u: [f64; 3] = std::array::from_fn(|i| (p_u_plus[i] - p_u_minus[i]) / (2.0 * h));
         let analytic_du = p
-            .evaluate(u0, v0, DerivativeOrder::First, &tol())
+            .evaluate(u0, v0, DerivativeOrder::First, &ctx())
             .unwrap()
             .du
             .unwrap()
@@ -534,14 +541,16 @@ mod tests {
         .unwrap();
         for (u0, v0) in [(0.0, 0.0), (5.0, -3.0), (-100.0, 200.0)] {
             let pt = p
-                .evaluate(u0, v0, DerivativeOrder::Position, &tol())
+                .evaluate(u0, v0, DerivativeOrder::Position, &ctx())
                 .unwrap()
                 .position;
-            let projs = p.project(pt, &tol()).unwrap();
+            let projs = p.project(pt, &ctx()).unwrap();
             assert_eq!(projs.len(), 1);
             assert!((projs[0].u.get() - u0).abs() < 1e-11, "u round-trip");
             assert!((projs[0].v.get() - v0).abs() < 1e-11, "v round-trip");
             assert!(projs[0].distance_bound.get() < 1e-11);
+            assert!(projs[0].parameter_error_bound >= 0.0);
+            assert!(projs[0].point_residual_bound.get() >= 0.0);
         }
     }
 
@@ -550,7 +559,7 @@ mod tests {
         let p = xy_plane();
         // Point 5 units above the XY plane.
         let q = Point3::try_new(3.0, 4.0, 5.0).unwrap();
-        let projs = p.project(q, &tol()).unwrap();
+        let projs = p.project(q, &ctx()).unwrap();
         assert_eq!(projs.len(), 1);
         assert!((projs[0].u.get() - 3.0).abs() < 1e-12);
         assert!((projs[0].v.get() - 4.0).abs() < 1e-12);
@@ -562,7 +571,7 @@ mod tests {
         let plane = xy_plane();
         for query in [
             plane
-                .evaluate(3.0, 4.0, DerivativeOrder::Position, &tol())
+                .evaluate(3.0, 4.0, DerivativeOrder::Position, &ctx())
                 .unwrap()
                 .position,
             Point3::try_new(3.0, 4.0, 5.0).unwrap(),
@@ -570,7 +579,7 @@ mod tests {
             Point3::try_new(1.0e-12, -2.0e-12, 3.0e-12).unwrap(),
             Point3::try_new(10.0, 11.0, 1.0e-12).unwrap(),
         ] {
-            let projection = plane.project(query, &tol()).unwrap().remove(0);
+            let projection = plane.project(query, &ctx()).unwrap().remove(0);
             let actual = dist3(query, projection.point);
             assert!(actual <= projection.distance_bound.get(), "{query:?}");
             assert!(projection.distance_bound.get() >= 0.0);
@@ -581,7 +590,7 @@ mod tests {
     fn plane_evaluate_rejects_non_finite() {
         let p = xy_plane();
         assert_eq!(
-            p.evaluate(f64::NAN, 0.0, DerivativeOrder::Position, &tol()),
+            p.evaluate(f64::NAN, 0.0, DerivativeOrder::Position, &ctx()),
             Err(GeometryError::NonFiniteParameter)
         );
     }

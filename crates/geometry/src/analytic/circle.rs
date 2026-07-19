@@ -30,22 +30,22 @@
 
 use std::f64::consts::TAU;
 
-use amphion_foundation::{
-    Point2, Point3, ToleranceContext, Transform3, UnitVector2, UnitVector3, Vector2, Vector3,
-};
+use amphion_foundation::{Point2, Point3, Transform3, UnitVector2, UnitVector3, Vector2, Vector3};
 use serde::{Deserialize, Serialize};
 
 use crate::traits::{Curve2Evaluator, Curve3Evaluator};
 use crate::{
     CurveEvaluation2, CurveEvaluation3, CurveKind, CurveProjection2, CurveProjection3,
-    DerivativeOrder, GeometryError, ParameterRange,
+    DerivativeOrder, DistanceBound, EvaluationContext, FirstDerivativeBound, GeometryError,
+    ParameterRange, ParameterValue, PositionBound, SecondDerivativeBound,
 };
 
 use super::{
     ConstructionError, TransformError,
     helpers::{
-        ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite2, all_finite3, dot3, in_range, mag3,
-        normalization_to_construction, perp2, scale3, sub3,
+        ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite2, all_finite3, check_tolerance, dot3,
+        exact_circle_eval2, exact_circle_eval3, exact_circle_project2, exact_circle_project3,
+        in_range, mag2, mag3, normalization_to_construction, perp2, scale3, sub3,
     },
     transform::similarity_scale,
 };
@@ -189,8 +189,8 @@ impl Curve2Evaluator for Circle2 {
     fn evaluate(
         &self,
         parameter: f64,
-        _order: DerivativeOrder,
-        _tolerance: &ToleranceContext,
+        order: DerivativeOrder,
+        context: &EvaluationContext,
     ) -> Result<CurveEvaluation2, GeometryError> {
         if !parameter.is_finite() {
             return Err(GeometryError::NonFiniteParameter);
@@ -198,37 +198,121 @@ impl Curve2Evaluator for Circle2 {
         if !in_range(parameter, self.domain()) {
             return Err(GeometryError::OutsideDomain);
         }
-        // p(θ) = center + r·cos(θ)·x_axis + r·sin(θ)·y_axis requires `cos`
-        // and `sin`. No pure-Rust, WASM-compatible, formally-proved
-        // correctly-rounded implementation of these functions currently
-        // exists (see the `analytic::helpers` module docs for the survey of
-        // candidates), so no certified error bound can be produced.
-        Err(GeometryError::Uncertified {
-            reason: "circle evaluation requires certified sin/cos; no formally-proved \
-                     WASM-compatible implementation is available. libm (MIT, WASM) gives \
-                     ~1-2 ULP empirically but is not formally proved. core-math (MIT, 0.5 ULP) \
-                     requires C FFI incompatible with WASM. IEEE 754-2019 §9.2 recommends but \
-                     does not require correctly-rounded transcendentals."
-                .to_owned(),
+        let c = self.center.into_array();
+        let x_ax = self.x_axis.into_array();
+        let y_ax = self.y_axis.into_array();
+
+        let eval = exact_circle_eval2(context.budget, c, self.radius, x_ax, y_ax, parameter)?;
+        let pos = Point2::try_new(eval.point[0], eval.point[1]).map_err(|_| {
+            GeometryError::Uncertified {
+                reason: "circle position is non-finite".to_owned(),
+            }
+        })?;
+        let position_error_bound =
+            PositionBound::try_new(eval.position_error_bound).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "position error bound overflowed representable range".to_owned(),
+                }
+            })?;
+        let eval_scale = mag2(c) + self.radius.abs();
+        check_tolerance(&context.tolerance, position_error_bound.get(), eval_scale)?;
+
+        let first_error_bound =
+            FirstDerivativeBound::try_new(eval.first_error_bound).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "first derivative error bound overflowed representable range"
+                        .to_owned(),
+                }
+            })?;
+        let second_error_bound =
+            SecondDerivativeBound::try_new(eval.second_error_bound).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "second derivative error bound overflowed representable range"
+                        .to_owned(),
+                }
+            })?;
+
+        let (first, first_eb, second, second_eb) = match order {
+            DerivativeOrder::Position => (None, None, None, None),
+            DerivativeOrder::First => {
+                let v = Vector2::try_new(eval.first[0], eval.first[1]).map_err(|_| {
+                    GeometryError::Uncertified {
+                        reason: "circle first derivative is non-finite".to_owned(),
+                    }
+                })?;
+                (Some(v), Some(first_error_bound), None, None)
+            }
+            DerivativeOrder::Second => {
+                let v = Vector2::try_new(eval.first[0], eval.first[1]).map_err(|_| {
+                    GeometryError::Uncertified {
+                        reason: "circle first derivative is non-finite".to_owned(),
+                    }
+                })?;
+                let v2 = Vector2::try_new(eval.second[0], eval.second[1]).map_err(|_| {
+                    GeometryError::Uncertified {
+                        reason: "circle second derivative is non-finite".to_owned(),
+                    }
+                })?;
+                (
+                    Some(v),
+                    Some(first_error_bound),
+                    Some(v2),
+                    Some(second_error_bound),
+                )
+            }
+        };
+        Ok(CurveEvaluation2 {
+            position: pos,
+            first,
+            second,
+            position_error_bound,
+            first_error_bound: first_eb,
+            second_error_bound: second_eb,
         })
     }
 
     fn project_into(
         &self,
-        _point: Point2,
-        _tolerance: &ToleranceContext,
+        point: Point2,
+        context: &EvaluationContext,
         output: &mut Vec<CurveProjection2>,
     ) -> Result<(), GeometryError> {
         output.clear();
-        // θ = atan2(Δ·y_axis, Δ·x_axis) is an uncertified std transcendental;
-        // the sin(θ)/cos(θ) reconstruction of the projected point is also
-        // uncertified. See the `analytic::helpers` module docs.
-        Err(GeometryError::Uncertified {
-            reason: "circle projection requires certified atan2/sin/cos; pending certified \
-                     trig integration. See: libm crate (empirical accuracy only), core-math \
-                     (0.5 ULP, not WASM-compatible)."
-                .to_owned(),
-        })
+        let q = point.into_array();
+        let c = self.center.into_array();
+        let x_ax = self.x_axis.into_array();
+        let y_ax = self.y_axis.into_array();
+
+        let result = exact_circle_project2(context.budget, q, c, self.radius, x_ax, y_ax)?;
+        let scale = mag2(q) + mag2(result.point);
+        check_tolerance(&context.tolerance, result.point_residual_bound, scale)?;
+
+        let proj = Point2::try_new(result.point[0], result.point[1]).map_err(|_| {
+            GeometryError::Uncertified {
+                reason: "circle projection point is non-finite".to_owned(),
+            }
+        })?;
+        output.push(CurveProjection2 {
+            parameter: ParameterValue::try_new(result.parameter).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "circle projection parameter is non-finite".to_owned(),
+                }
+            })?,
+            point: proj,
+            distance_bound: DistanceBound::try_new(result.distance_bound).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "circle projection distance is non-finite or negative".to_owned(),
+                }
+            })?,
+            parameter_error_bound: result.parameter_error_bound,
+            point_residual_bound: PositionBound::try_new(result.point_residual_bound).map_err(
+                |_| GeometryError::Uncertified {
+                    reason: "circle projection point residual bound is non-finite or negative"
+                        .to_owned(),
+                },
+            )?,
+        });
+        Ok(())
     }
 }
 
@@ -432,8 +516,8 @@ impl Curve3Evaluator for Circle3 {
     fn evaluate(
         &self,
         parameter: f64,
-        _order: DerivativeOrder,
-        _tolerance: &ToleranceContext,
+        order: DerivativeOrder,
+        context: &EvaluationContext,
     ) -> Result<CurveEvaluation3, GeometryError> {
         if !parameter.is_finite() {
             return Err(GeometryError::NonFiniteParameter);
@@ -441,37 +525,123 @@ impl Curve3Evaluator for Circle3 {
         if !in_range(parameter, self.domain()) {
             return Err(GeometryError::OutsideDomain);
         }
-        // p(θ) = center + r·cos(θ)·x_axis + r·sin(θ)·y_axis requires `cos`
-        // and `sin`. No pure-Rust, WASM-compatible, formally-proved
-        // correctly-rounded implementation of these functions currently
-        // exists (see the `analytic::helpers` module docs for the survey of
-        // candidates), so no certified error bound can be produced.
-        Err(GeometryError::Uncertified {
-            reason: "circle evaluation requires certified sin/cos; no formally-proved \
-                     WASM-compatible implementation is available. libm (MIT, WASM) gives \
-                     ~1-2 ULP empirically but is not formally proved. core-math (MIT, 0.5 ULP) \
-                     requires C FFI incompatible with WASM. IEEE 754-2019 §9.2 recommends but \
-                     does not require correctly-rounded transcendentals."
-                .to_owned(),
+        let c = self.center.into_array();
+        let x_ax = self.x_axis.into_array();
+        let y_ax = self.y_axis.into_array();
+
+        let eval = exact_circle_eval3(context.budget, c, self.radius, x_ax, y_ax, parameter)?;
+        let pos = Point3::try_new(eval.point[0], eval.point[1], eval.point[2]).map_err(|_| {
+            GeometryError::Uncertified {
+                reason: "circle position is non-finite".to_owned(),
+            }
+        })?;
+        let position_error_bound =
+            PositionBound::try_new(eval.position_error_bound).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "position error bound overflowed representable range".to_owned(),
+                }
+            })?;
+        let eval_scale = mag3(c) + self.radius.abs();
+        check_tolerance(&context.tolerance, position_error_bound.get(), eval_scale)?;
+
+        let first_error_bound =
+            FirstDerivativeBound::try_new(eval.first_error_bound).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "first derivative error bound overflowed representable range"
+                        .to_owned(),
+                }
+            })?;
+        let second_error_bound =
+            SecondDerivativeBound::try_new(eval.second_error_bound).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "second derivative error bound overflowed representable range"
+                        .to_owned(),
+                }
+            })?;
+
+        let (first, first_eb, second, second_eb) = match order {
+            DerivativeOrder::Position => (None, None, None, None),
+            DerivativeOrder::First => {
+                let v = Vector3::try_new(eval.first[0], eval.first[1], eval.first[2]).map_err(
+                    |_| GeometryError::Uncertified {
+                        reason: "circle first derivative is non-finite".to_owned(),
+                    },
+                )?;
+                (Some(v), Some(first_error_bound), None, None)
+            }
+            DerivativeOrder::Second => {
+                let v = Vector3::try_new(eval.first[0], eval.first[1], eval.first[2]).map_err(
+                    |_| GeometryError::Uncertified {
+                        reason: "circle first derivative is non-finite".to_owned(),
+                    },
+                )?;
+                let v2 = Vector3::try_new(eval.second[0], eval.second[1], eval.second[2]).map_err(
+                    |_| GeometryError::Uncertified {
+                        reason: "circle second derivative is non-finite".to_owned(),
+                    },
+                )?;
+                (
+                    Some(v),
+                    Some(first_error_bound),
+                    Some(v2),
+                    Some(second_error_bound),
+                )
+            }
+        };
+        Ok(CurveEvaluation3 {
+            position: pos,
+            first,
+            second,
+            position_error_bound,
+            first_error_bound: first_eb,
+            second_error_bound: second_eb,
         })
     }
 
     fn project_into(
         &self,
-        _point: Point3,
-        _tolerance: &ToleranceContext,
+        point: Point3,
+        context: &EvaluationContext,
         output: &mut Vec<CurveProjection3>,
     ) -> Result<(), GeometryError> {
         output.clear();
-        // θ = atan2(...) is an uncertified std transcendental; the
-        // sin(θ)/cos(θ) reconstruction of the projected point is also
-        // uncertified. See the `analytic::helpers` module docs.
-        Err(GeometryError::Uncertified {
-            reason: "circle projection requires certified atan2/sin/cos; pending certified \
-                     trig integration. See: libm crate (empirical accuracy only), core-math \
-                     (0.5 ULP, not WASM-compatible)."
-                .to_owned(),
-        })
+        let q = point.into_array();
+        let c = self.center.into_array();
+        let x_ax = self.x_axis.into_array();
+        let y_ax = self.y_axis.into_array();
+        let n_ax = self.normal.into_array();
+
+        let result = exact_circle_project3(context.budget, q, c, self.radius, x_ax, y_ax, n_ax)?;
+        let scale = mag3(q) + mag3(result.point);
+        check_tolerance(&context.tolerance, result.point_residual_bound, scale)?;
+
+        let proj =
+            Point3::try_new(result.point[0], result.point[1], result.point[2]).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "circle projection point is non-finite".to_owned(),
+                }
+            })?;
+        output.push(CurveProjection3 {
+            parameter: ParameterValue::try_new(result.parameter).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "circle projection parameter is non-finite".to_owned(),
+                }
+            })?,
+            point: proj,
+            distance_bound: DistanceBound::try_new(result.distance_bound).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "circle projection distance is non-finite or negative".to_owned(),
+                }
+            })?,
+            parameter_error_bound: result.parameter_error_bound,
+            point_residual_bound: PositionBound::try_new(result.point_residual_bound).map_err(
+                |_| GeometryError::Uncertified {
+                    reason: "circle projection point residual bound is non-finite or negative"
+                        .to_owned(),
+                },
+            )?,
+        });
+        Ok(())
     }
 }
 
@@ -486,12 +656,16 @@ mod tests {
 
     use crate::analytic::helpers::ILL_COND_THRESH;
     use crate::traits::{Curve2Evaluator, Curve3Evaluator};
-    use crate::{DerivativeOrder, GeometryError};
+    use crate::{DerivativeOrder, EvaluationContext, GeometryError};
 
     use super::{Circle2, Circle2Repr, Circle3, Circle3Repr, ConstructionError};
 
     fn tol() -> ToleranceContext {
         ToleranceContext::try_new(1e-9, 1e-8, 1e-10, 1e-12).unwrap()
+    }
+
+    fn ctx() -> EvaluationContext {
+        EvaluationContext::new(tol())
     }
 
     fn dist2(a: Point2, b: Point2) -> f64 {
@@ -500,13 +674,10 @@ mod tests {
         (ax - bx).hypot(ay - by)
     }
 
-    fn assert_uncertified(err: &GeometryError) {
-        match err {
-            GeometryError::Uncertified { reason } => {
-                assert!(!reason.is_empty(), "reason string must not be empty");
-            }
-            other => panic!("expected Uncertified, got {other:?}"),
-        }
+    fn dist3(a: Point3, b: Point3) -> f64 {
+        let [ax, ay, az] = a.into_array();
+        let [bx, by, bz] = b.into_array();
+        ((ax - bx).powi(2) + (ay - by).powi(2) + (az - bz).powi(2)).sqrt()
     }
 
     // ── Circle2 ──────────────────────────────────────────────────────────────
@@ -555,24 +726,33 @@ mod tests {
     }
 
     #[test]
-    fn circle2_evaluate_returns_uncertified_pending_trig() {
-        // No pure-Rust, WASM-compatible, formally-proved correctly-rounded
-        // sin/cos implementation exists; evaluate() must be honest about
-        // this rather than assert an unproven bound.
+    fn circle2_evaluate_matches_known_values() {
+        // center=(1,2), radius=3, x_axis=(1,0) ⇒ y_axis=(0,1) (perp2 rotates
+        // +90°). At θ=0: p=(4,2). At θ=π/2: p=(1,5), p′=(-3,0), p″=(0,-3).
         let c = Circle2::try_new(
             Point2::try_new(1.0, 2.0).unwrap(),
             3.0,
             Vector2::try_new(1.0, 0.0).unwrap(),
         )
         .unwrap();
-        let err = c
-            .evaluate(0.0, DerivativeOrder::Position, &tol())
-            .unwrap_err();
-        assert_uncertified(&err);
-        let err = c
-            .evaluate(FRAC_PI_2, DerivativeOrder::Second, &tol())
-            .unwrap_err();
-        assert_uncertified(&err);
+        let eval = c.evaluate(0.0, DerivativeOrder::Position, &ctx()).unwrap();
+        let [px, py] = eval.position.into_array();
+        assert!((px - 4.0).abs() < 1e-9, "px={px}");
+        assert!((py - 2.0).abs() < 1e-9, "py={py}");
+        assert!(eval.position_error_bound.get() < 1e-9);
+
+        let eval = c
+            .evaluate(FRAC_PI_2, DerivativeOrder::Second, &ctx())
+            .unwrap();
+        let [px, py] = eval.position.into_array();
+        assert!((px - 1.0).abs() < 1e-9, "px={px}");
+        assert!((py - 5.0).abs() < 1e-9, "py={py}");
+        let [dx, dy] = eval.first.unwrap().into_array();
+        assert!((dx - (-3.0)).abs() < 1e-9, "dx={dx}");
+        assert!(dy.abs() < 1e-9, "dy={dy}");
+        let [ddx, ddy] = eval.second.unwrap().into_array();
+        assert!(ddx.abs() < 1e-9, "ddx={ddx}");
+        assert!((ddy - (-3.0)).abs() < 1e-9, "ddy={ddy}");
     }
 
     #[test]
@@ -584,11 +764,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            c.evaluate(-0.001, DerivativeOrder::Position, &tol()),
+            c.evaluate(-0.001, DerivativeOrder::Position, &ctx()),
             Err(GeometryError::OutsideDomain)
         );
         assert_eq!(
-            c.evaluate(TAU, DerivativeOrder::Position, &tol()),
+            c.evaluate(TAU, DerivativeOrder::Position, &ctx()),
             Err(GeometryError::OutsideDomain)
         );
     }
@@ -602,16 +782,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            c.evaluate(f64::NAN, DerivativeOrder::Position, &tol()),
+            c.evaluate(f64::NAN, DerivativeOrder::Position, &ctx()),
             Err(GeometryError::NonFiniteParameter)
         );
     }
 
     #[test]
-    fn circle2_project_returns_uncertified_pending_trig() {
-        // θ = atan2(...) and its sin/cos reconstruction are uncertified std
-        // transcendentals; project_into must report Uncertified rather than
-        // a bound it cannot support.
+    fn circle2_project_matches_known_values() {
+        // center=(2,3), radius=4, x_axis=(1,0). q=(10,3) lies on the +x_axis
+        // ray from the center, so the nearest point is center+radius·x_axis
+        // = (6,3), distance = |10-2|-4 = 4, parameter = atan2(0, 8) = 0.
         let c = Circle2::try_new(
             Point2::try_new(2.0, 3.0).unwrap(),
             4.0,
@@ -619,12 +799,22 @@ mod tests {
         )
         .unwrap();
         let q = Point2::try_new(10.0, 3.0).unwrap();
-        let err = c.project(q, &tol()).unwrap_err();
-        assert_uncertified(&err);
+        let projs = c.project(q, &ctx()).unwrap();
+        assert_eq!(projs.len(), 1);
+        let p = &projs[0];
+        let [px, py] = p.point.into_array();
+        assert!((px - 6.0).abs() < 1e-9, "px={px}");
+        assert!((py - 3.0).abs() < 1e-9, "py={py}");
+        assert!((p.distance_bound.get() - 4.0).abs() < 1e-9);
+        assert!(p.parameter.get().abs() < 1e-9);
+        let actual = dist2(q, p.point);
+        assert!(actual <= p.distance_bound.get());
     }
 
     #[test]
     fn circle2_project_into_clears_output_on_error() {
+        // Querying exactly at the center is singular: the in-plane offset is
+        // zero, so there is no unique nearest point / well-defined angle.
         let c = Circle2::try_new(
             Point2::try_new(0.0, 0.0).unwrap(),
             1.0,
@@ -632,8 +822,8 @@ mod tests {
         )
         .unwrap();
         let mut output = vec![];
-        let err = c.project_into(Point2::try_new(0.5, 0.0).unwrap(), &tol(), &mut output);
-        assert_uncertified(&err.unwrap_err());
+        let err = c.project_into(Point2::try_new(0.0, 0.0).unwrap(), &ctx(), &mut output);
+        assert_eq!(err.unwrap_err(), GeometryError::Singular);
         assert!(output.is_empty());
     }
 
@@ -656,10 +846,10 @@ mod tests {
         // tol.abs=1. The old local-scale (`|query - center|`) formula certified a
         // bound (≈9007199254740990.0) that was numerically *below* the true
         // Euclidean distance (≈9007199254740990.586), violating the DistanceBound
-        // contract. Circle projection is now unconditionally `Uncertified`
-        // (pending certified trig), so this must always be reported as
-        // Uncertified — and if any bound is ever returned in the future, it
-        // must be a genuine upper bound.
+        // contract. Circle projection now derives its bound from exact
+        // BigRational arithmetic and certified directed sqrt rounding, so it is
+        // either a genuine upper bound or an honest `Uncertified` — never a
+        // numerically-too-small bound.
         let tol_1m = ToleranceContext::try_new(1.0, 0.0, 1e-10, 1e-12).unwrap();
         let radius = f64::powi(2.0, 53); // 2^53
         let c = Circle2::try_new(
@@ -669,7 +859,7 @@ mod tests {
         )
         .unwrap();
         let q = Point2::try_new(1.0, 1.0).unwrap();
-        let result = c.project(q, &tol_1m);
+        let result = c.project(q, &EvaluationContext::new(tol_1m));
         match result {
             Err(GeometryError::Uncertified { .. }) => {
                 // Correctly identified as uncertifiable at this scale/tolerance.
@@ -796,7 +986,10 @@ mod tests {
     }
 
     #[test]
-    fn circle3_evaluate_returns_uncertified_pending_trig() {
+    fn circle3_evaluate_matches_known_values() {
+        // center=(0,0,1), radius=2, normal=(0,0,1), x_axis=(1,0,0) ⇒
+        // y_axis = normal × x_axis = (0,1,0). At θ=0: p=(2,0,1). At θ=π/2:
+        // p=(0,2,1), p′=(-2,0,0), p″=(0,-2,0).
         let c = Circle3::try_new(
             Point3::try_new(0.0, 0.0, 1.0).unwrap(),
             2.0,
@@ -804,14 +997,27 @@ mod tests {
             Vector3::try_new(1.0, 0.0, 0.0).unwrap(),
         )
         .unwrap();
-        let err = c
-            .evaluate(0.0, DerivativeOrder::Position, &tol())
-            .unwrap_err();
-        assert_uncertified(&err);
-        let err = c
-            .evaluate(FRAC_PI_2, DerivativeOrder::Second, &tol())
-            .unwrap_err();
-        assert_uncertified(&err);
+        let eval = c.evaluate(0.0, DerivativeOrder::Position, &ctx()).unwrap();
+        let [px, py, pz] = eval.position.into_array();
+        assert!((px - 2.0).abs() < 1e-9, "px={px}");
+        assert!(py.abs() < 1e-9, "py={py}");
+        assert!((pz - 1.0).abs() < 1e-9, "pz={pz}");
+
+        let eval = c
+            .evaluate(FRAC_PI_2, DerivativeOrder::Second, &ctx())
+            .unwrap();
+        let [px, py, pz] = eval.position.into_array();
+        assert!(px.abs() < 1e-9, "px={px}");
+        assert!((py - 2.0).abs() < 1e-9, "py={py}");
+        assert!((pz - 1.0).abs() < 1e-9, "pz={pz}");
+        let [dx, dy, dz] = eval.first.unwrap().into_array();
+        assert!((dx - (-2.0)).abs() < 1e-9, "dx={dx}");
+        assert!(dy.abs() < 1e-9, "dy={dy}");
+        assert!(dz.abs() < 1e-9, "dz={dz}");
+        let [ddx, ddy, ddz] = eval.second.unwrap().into_array();
+        assert!(ddx.abs() < 1e-9, "ddx={ddx}");
+        assert!((ddy - (-2.0)).abs() < 1e-9, "ddy={ddy}");
+        assert!(ddz.abs() < 1e-9, "ddz={ddz}");
     }
 
     #[test]
@@ -824,17 +1030,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            c.evaluate(-0.001, DerivativeOrder::Position, &tol()),
+            c.evaluate(-0.001, DerivativeOrder::Position, &ctx()),
             Err(GeometryError::OutsideDomain)
         );
         assert_eq!(
-            c.evaluate(TAU, DerivativeOrder::Position, &tol()),
+            c.evaluate(TAU, DerivativeOrder::Position, &ctx()),
             Err(GeometryError::OutsideDomain)
         );
     }
 
     #[test]
-    fn circle3_project_returns_uncertified_pending_trig() {
+    fn circle3_project_matches_known_values() {
+        // center=(0,0,0), radius=5, normal=(0,0,1), x_axis=(1,0,0),
+        // y_axis=(0,1,0). q=(1,0,5): in-plane offset (1,0), out-of-plane 5.
+        // Nearest point = (5,0,0), distance = sqrt((1-5)^2 + 5^2) = sqrt(41).
         let c = Circle3::try_new(
             Point3::try_new(0.0, 0.0, 0.0).unwrap(),
             5.0,
@@ -843,12 +1052,24 @@ mod tests {
         )
         .unwrap();
         let q = Point3::try_new(1.0, 0.0, 5.0).unwrap();
-        let err = c.project(q, &tol()).unwrap_err();
-        assert_uncertified(&err);
+        let projs = c.project(q, &ctx()).unwrap();
+        assert_eq!(projs.len(), 1);
+        let p = &projs[0];
+        let [px, py, pz] = p.point.into_array();
+        assert!((px - 5.0).abs() < 1e-9, "px={px}");
+        assert!(py.abs() < 1e-9, "py={py}");
+        assert!(pz.abs() < 1e-9, "pz={pz}");
+        let expected_dist = 41.0_f64.sqrt();
+        assert!((p.distance_bound.get() - expected_dist).abs() < 1e-9);
+        assert!(p.parameter.get().abs() < 1e-9);
+        let actual = dist3(q, p.point);
+        assert!(actual <= p.distance_bound.get());
     }
 
     #[test]
     fn circle3_project_into_clears_output_on_error() {
+        // Querying exactly at the center is singular: the in-plane offset is
+        // zero, so there is no unique nearest point / well-defined angle.
         let c = Circle3::try_new(
             Point3::try_new(0.0, 0.0, 0.0).unwrap(),
             1.0,
@@ -857,8 +1078,8 @@ mod tests {
         )
         .unwrap();
         let mut output = vec![];
-        let err = c.project_into(Point3::try_new(1.0, 0.0, 0.0).unwrap(), &tol(), &mut output);
-        assert_uncertified(&err.unwrap_err());
+        let err = c.project_into(Point3::try_new(0.0, 0.0, 0.0).unwrap(), &ctx(), &mut output);
+        assert_eq!(err.unwrap_err(), GeometryError::Singular);
         assert!(output.is_empty());
     }
 

@@ -34,20 +34,21 @@
 
 use std::f64::consts::TAU;
 
-use amphion_foundation::{Point3, ToleranceContext, Transform3, UnitVector3, Vector3};
+use amphion_foundation::{Point3, Transform3, UnitVector3, Vector3};
 use serde::{Deserialize, Serialize};
 
 use crate::traits::SurfaceEvaluator;
 use crate::{
-    DerivativeOrder, GeometryError, ParameterRange, SurfaceDomain, SurfaceEvaluation, SurfaceKind,
-    SurfaceProjection,
+    DerivativeOrder, DistanceBound, EvaluationContext, FirstDerivativeBound, GeometryError,
+    ParameterRange, ParameterValue, PositionBound, SecondDerivativeBound, SurfaceDomain,
+    SurfaceEvaluation, SurfaceKind, SurfaceProjection,
 };
 
 use super::{
     ConstructionError, TransformError,
     helpers::{
-        ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite3, dot3, in_range, mag3,
-        normalization_to_construction, scale3, sub3,
+        ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite3, check_tolerance, dot3, exact_cylinder_eval,
+        exact_cylinder_project, in_range, mag3, normalization_to_construction, scale3, sub3,
     },
     transform::similarity_scale,
 };
@@ -261,12 +262,17 @@ impl SurfaceEvaluator for Cylinder {
         SurfaceDomain::new(angular_range(), unbounded_range())
     }
 
+    // Long due to certifying position plus first/second derivative bounds
+    // (each independently wrapped in its own `GeometryError`-mapped
+    // constructor) across every `DerivativeOrder`, not accidental
+    // complexity.
+    #[allow(clippy::too_many_lines)]
     fn evaluate(
         &self,
         u: f64,
         v: f64,
-        _order: DerivativeOrder,
-        _tolerance: &ToleranceContext,
+        order: DerivativeOrder,
+        context: &EvaluationContext,
     ) -> Result<SurfaceEvaluation, GeometryError> {
         if !u.is_finite() || !v.is_finite() {
             return Err(GeometryError::NonFiniteParameter);
@@ -274,38 +280,155 @@ impl SurfaceEvaluator for Cylinder {
         if !in_range(u, self.domain().u()) {
             return Err(GeometryError::OutsideDomain);
         }
-        // p(u, v) = axis_origin + v·axis_dir + r·cos(u)·x_axis + r·sin(u)·y_axis
-        // requires `cos` and `sin`. No pure-Rust, WASM-compatible,
-        // formally-proved correctly-rounded implementation of these
-        // functions currently exists (see the `analytic::helpers` module
-        // docs for the survey of candidates), so no certified error bound
-        // can be produced.
-        Err(GeometryError::Uncertified {
-            reason: "cylinder evaluation requires certified sin/cos; no formally-proved \
-                     WASM-compatible implementation is available. libm (MIT, WASM) gives \
-                     ~1-2 ULP empirically but is not formally proved. core-math (MIT, 0.5 ULP) \
-                     requires C FFI incompatible with WASM. IEEE 754-2019 §9.2 recommends but \
-                     does not require correctly-rounded transcendentals."
-                .to_owned(),
+        let o = self.axis_origin.into_array();
+        let ad = self.axis_dir.into_array();
+        let x_ax = self.x_axis.into_array();
+        let y_ax = self.y_axis.into_array();
+
+        let eval = exact_cylinder_eval(context.budget, o, ad, self.radius, x_ax, y_ax, u, v)?;
+        let pos = Point3::try_new(eval.point[0], eval.point[1], eval.point[2]).map_err(|_| {
+            GeometryError::Uncertified {
+                reason: "cylinder position is non-finite".to_owned(),
+            }
+        })?;
+        let position_error_bound =
+            PositionBound::try_new(eval.position_error_bound).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "position error bound overflowed representable range".to_owned(),
+                }
+            })?;
+        let eval_scale = mag3(o) + self.radius.abs() + v.abs();
+        check_tolerance(&context.tolerance, position_error_bound.get(), eval_scale)?;
+
+        let du_error_bound = FirstDerivativeBound::try_new(eval.du_error_bound).map_err(|_| {
+            GeometryError::Uncertified {
+                reason: "first derivative error bound overflowed representable range".to_owned(),
+            }
+        })?;
+        // ∂p/∂v = axis_dir is stored verbatim (no arithmetic), so it is
+        // exact; ∂²p/∂u∂v = ∂²p/∂v² = 0 exactly.
+        let dv_error_bound =
+            FirstDerivativeBound::try_new(0.0).map_err(|_| GeometryError::Uncertified {
+                reason: "zero derivative bound construction failed unexpectedly".to_owned(),
+            })?;
+        let duu_error_bound =
+            SecondDerivativeBound::try_new(eval.duu_error_bound).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "second derivative error bound overflowed representable range"
+                        .to_owned(),
+                }
+            })?;
+        let zero_second_bound =
+            SecondDerivativeBound::try_new(0.0).map_err(|_| GeometryError::Uncertified {
+                reason: "zero derivative bound construction failed unexpectedly".to_owned(),
+            })?;
+
+        let to_vec3 = |arr: [f64; 3], what: &'static str| {
+            Vector3::try_new(arr[0], arr[1], arr[2]).map_err(|_| GeometryError::Uncertified {
+                reason: format!("{what} non-finite"),
+            })
+        };
+
+        let (du, dv, duu, duv, dvv, first_u_eb, first_v_eb, duu_eb, duv_eb, dvv_eb) = match order {
+            DerivativeOrder::Position => {
+                (None, None, None, None, None, None, None, None, None, None)
+            }
+            DerivativeOrder::First => {
+                let du = to_vec3(eval.du, "cylinder first u-derivative")?;
+                let dv = to_vec3(ad, "axis_dir")?;
+                (
+                    Some(du),
+                    Some(dv),
+                    None,
+                    None,
+                    None,
+                    Some(du_error_bound),
+                    Some(dv_error_bound),
+                    None,
+                    None,
+                    None,
+                )
+            }
+            DerivativeOrder::Second => {
+                let du = to_vec3(eval.du, "cylinder first u-derivative")?;
+                let dv = to_vec3(ad, "axis_dir")?;
+                let duu = to_vec3(eval.duu, "cylinder second u-derivative")?;
+                let zero = to_vec3([0.0, 0.0, 0.0], "zero vector")?;
+                (
+                    Some(du),
+                    Some(dv),
+                    Some(duu),
+                    Some(zero),
+                    Some(zero),
+                    Some(du_error_bound),
+                    Some(dv_error_bound),
+                    Some(duu_error_bound),
+                    Some(zero_second_bound),
+                    Some(zero_second_bound),
+                )
+            }
+        };
+        Ok(SurfaceEvaluation {
+            position: pos,
+            du,
+            dv,
+            duu,
+            duv,
+            dvv,
+            position_error_bound,
+            first_u_error_bound: first_u_eb,
+            first_v_error_bound: first_v_eb,
+            second_uu_error_bound: duu_eb,
+            second_uv_error_bound: duv_eb,
+            second_vv_error_bound: dvv_eb,
         })
     }
 
     fn project_into(
         &self,
-        _point: Point3,
-        _tolerance: &ToleranceContext,
+        point: Point3,
+        context: &EvaluationContext,
         output: &mut Vec<SurfaceProjection>,
     ) -> Result<(), GeometryError> {
         output.clear();
-        // u = atan2(...) is an uncertified std transcendental; the
-        // sin(u)/cos(u) reconstruction of the projected point is also
-        // uncertified. See the `analytic::helpers` module docs.
-        Err(GeometryError::Uncertified {
-            reason: "cylinder projection requires certified atan2/sin/cos; pending certified \
-                     trig integration. See: libm crate (empirical accuracy only), core-math \
-                     (0.5 ULP, not WASM-compatible)."
-                .to_owned(),
-        })
+        let q = point.into_array();
+        let o = self.axis_origin.into_array();
+        let ad = self.axis_dir.into_array();
+        let x_ax = self.x_axis.into_array();
+        let y_ax = self.y_axis.into_array();
+
+        let result = exact_cylinder_project(context.budget, q, o, ad, self.radius, x_ax, y_ax)?;
+        let scale = mag3(q) + mag3(result.point);
+        check_tolerance(&context.tolerance, result.point_residual_bound, scale)?;
+
+        let proj =
+            Point3::try_new(result.point[0], result.point[1], result.point[2]).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "cylinder projection point is non-finite".to_owned(),
+                }
+            })?;
+        output.push(SurfaceProjection {
+            u: ParameterValue::try_new(result.u).map_err(|_| GeometryError::Uncertified {
+                reason: "cylinder projection u is non-finite".to_owned(),
+            })?,
+            v: ParameterValue::try_new(result.v).map_err(|_| GeometryError::Uncertified {
+                reason: "cylinder projection v is non-finite".to_owned(),
+            })?,
+            point: proj,
+            distance_bound: DistanceBound::try_new(result.distance_bound).map_err(|_| {
+                GeometryError::Uncertified {
+                    reason: "cylinder projection distance is non-finite or negative".to_owned(),
+                }
+            })?,
+            parameter_error_bound: result.parameter_error_bound,
+            point_residual_bound: PositionBound::try_new(result.point_residual_bound).map_err(
+                |_| GeometryError::Uncertified {
+                    reason: "cylinder projection point residual bound is non-finite or negative"
+                        .to_owned(),
+                },
+            )?,
+        });
+        Ok(())
     }
 }
 
@@ -318,7 +441,7 @@ mod tests {
 
     use crate::analytic::helpers::ILL_COND_THRESH;
     use crate::traits::SurfaceEvaluator;
-    use crate::{DerivativeOrder, GeometryError};
+    use crate::{DerivativeOrder, EvaluationContext, GeometryError};
 
     use super::{ConstructionError, Cylinder, CylinderRepr};
 
@@ -326,13 +449,14 @@ mod tests {
         ToleranceContext::try_new(1e-9, 1e-8, 1e-10, 1e-12).unwrap()
     }
 
-    fn assert_uncertified(err: &GeometryError) {
-        match err {
-            GeometryError::Uncertified { reason } => {
-                assert!(!reason.is_empty(), "reason string must not be empty");
-            }
-            other => panic!("expected Uncertified, got {other:?}"),
-        }
+    fn ctx() -> EvaluationContext {
+        EvaluationContext::new(tol())
+    }
+
+    fn dist3(a: Point3, b: Point3) -> f64 {
+        let [ax, ay, az] = a.into_array();
+        let [bx, by, bz] = b.into_array();
+        ((ax - bx).powi(2) + (ay - by).powi(2) + (az - bz).powi(2)).sqrt()
     }
 
     fn unit_cylinder() -> Cylinder {
@@ -408,26 +532,42 @@ mod tests {
     }
 
     #[test]
-    fn cylinder_evaluate_returns_uncertified_pending_trig() {
-        // No pure-Rust, WASM-compatible, formally-proved correctly-rounded
-        // sin/cos implementation exists; evaluate() must be honest about
-        // this rather than assert an unproven bound.
+    fn cylinder_evaluate_matches_known_values() {
+        // unit_cylinder: axis_origin=(0,0,0), axis_dir=(0,0,1), radius=1,
+        // x_axis=(1,0,0), y_axis=(0,1,0). At (u,v)=(0,0): p=(1,0,0). At
+        // (u,v)=(0,5): p=(1,0,5), du=(0,1,0), dv=(0,0,1), duu=(-1,0,0).
         let c = unit_cylinder();
-        let err = c
-            .evaluate(0.0, 0.0, DerivativeOrder::Position, &tol())
-            .unwrap_err();
-        assert_uncertified(&err);
-        let err = c
-            .evaluate(0.0, 5.0, DerivativeOrder::Second, &tol())
-            .unwrap_err();
-        assert_uncertified(&err);
+        let eval = c
+            .evaluate(0.0, 0.0, DerivativeOrder::Position, &ctx())
+            .unwrap();
+        let [px, py, pz] = eval.position.into_array();
+        assert!((px - 1.0).abs() < 1e-9, "px={px}");
+        assert!(py.abs() < 1e-9, "py={py}");
+        assert!(pz.abs() < 1e-9, "pz={pz}");
+
+        let eval = c
+            .evaluate(0.0, 5.0, DerivativeOrder::Second, &ctx())
+            .unwrap();
+        let [px, py, pz] = eval.position.into_array();
+        assert!((px - 1.0).abs() < 1e-9, "px={px}");
+        assert!(py.abs() < 1e-9, "py={py}");
+        assert!((pz - 5.0).abs() < 1e-9, "pz={pz}");
+        let [dux, duy, duz] = eval.du.unwrap().into_array();
+        assert!(dux.abs() < 1e-9, "dux={dux}");
+        assert!((duy - 1.0).abs() < 1e-9, "duy={duy}");
+        assert!(duz.abs() < 1e-9, "duz={duz}");
+        let [dvx, dvy, dvz] = eval.dv.unwrap().into_array();
+        assert!(dvx.abs() < 1e-9 && dvy.abs() < 1e-9 && (dvz - 1.0).abs() < 1e-9);
+        let [duux, duuy, duuz] = eval.duu.unwrap().into_array();
+        assert!((duux - (-1.0)).abs() < 1e-9, "duux={duux}");
+        assert!(duuy.abs() < 1e-9 && duuz.abs() < 1e-9);
     }
 
     #[test]
     fn cylinder_evaluate_rejects_out_of_domain() {
         let c = unit_cylinder();
         assert_eq!(
-            c.evaluate(-0.001, 0.0, DerivativeOrder::Position, &tol()),
+            c.evaluate(-0.001, 0.0, DerivativeOrder::Position, &ctx()),
             Err(GeometryError::OutsideDomain)
         );
         assert_eq!(
@@ -435,7 +575,7 @@ mod tests {
                 std::f64::consts::TAU,
                 0.0,
                 DerivativeOrder::Position,
-                &tol()
+                &ctx()
             ),
             Err(GeometryError::OutsideDomain)
         );
@@ -445,20 +585,20 @@ mod tests {
     fn cylinder_evaluate_rejects_non_finite() {
         let c = unit_cylinder();
         assert_eq!(
-            c.evaluate(f64::NAN, 0.0, DerivativeOrder::Position, &tol()),
+            c.evaluate(f64::NAN, 0.0, DerivativeOrder::Position, &ctx()),
             Err(GeometryError::NonFiniteParameter)
         );
         assert_eq!(
-            c.evaluate(0.0, f64::INFINITY, DerivativeOrder::Position, &tol()),
+            c.evaluate(0.0, f64::INFINITY, DerivativeOrder::Position, &ctx()),
             Err(GeometryError::NonFiniteParameter)
         );
     }
 
     #[test]
-    fn cylinder_project_returns_uncertified_pending_trig() {
-        // u = atan2(...) and its sin/cos reconstruction are uncertified std
-        // transcendentals; project_into must report Uncertified rather than
-        // a bound it cannot support.
+    fn cylinder_project_matches_known_values() {
+        // axis_origin=(0,0,0), axis_dir=(0,0,1), radius=3, x_axis=(1,0,0).
+        // q=(2,0,3): v=3, in-plane offset (2,0) ⇒ nearest point=(3,0,3),
+        // distance=|2-3|=1, u=atan2(0,2)=0.
         let c = Cylinder::try_new(
             Point3::try_new(0.0, 0.0, 0.0).unwrap(),
             Vector3::try_new(0.0, 0.0, 1.0).unwrap(),
@@ -467,16 +607,28 @@ mod tests {
         )
         .unwrap();
         let q = Point3::try_new(2.0, 0.0, 3.0).unwrap();
-        let err = c.project(q, &tol()).unwrap_err();
-        assert_uncertified(&err);
+        let projs = c.project(q, &ctx()).unwrap();
+        assert_eq!(projs.len(), 1);
+        let p = &projs[0];
+        let [px, py, pz] = p.point.into_array();
+        assert!((px - 3.0).abs() < 1e-9, "px={px}");
+        assert!(py.abs() < 1e-9, "py={py}");
+        assert!((pz - 3.0).abs() < 1e-9, "pz={pz}");
+        assert!((p.distance_bound.get() - 1.0).abs() < 1e-9);
+        assert!(p.u.get().abs() < 1e-9);
+        assert!((p.v.get() - 3.0).abs() < 1e-9);
+        let actual = dist3(q, p.point);
+        assert!(actual <= p.distance_bound.get());
     }
 
     #[test]
     fn cylinder_project_into_clears_output_on_error() {
+        // Querying exactly on the cylinder axis is singular: the in-plane
+        // offset is zero, so there is no unique nearest point / angle.
         let c = unit_cylinder();
         let mut output = vec![];
-        let err = c.project_into(Point3::try_new(1.0, 0.0, 0.0).unwrap(), &tol(), &mut output);
-        assert_uncertified(&err.unwrap_err());
+        let err = c.project_into(Point3::try_new(0.0, 0.0, 0.0).unwrap(), &ctx(), &mut output);
+        assert_eq!(err.unwrap_err(), GeometryError::Singular);
         assert!(output.is_empty());
     }
 
