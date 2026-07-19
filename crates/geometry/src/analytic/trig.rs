@@ -801,7 +801,7 @@ mod tests {
     ///
     /// With `series_terms = u32::MAX` and the old `2 * k + 1` (u32),
     /// the multiplication would overflow in debug builds once k ≥ 2^31.
-    /// With the u64 cast the arithmetic is safe; the rational_bits budget
+    /// With the u64 cast the arithmetic is safe; the `rational_bits` budget
     /// terminates the series before k reaches overflow-inducing values.
     #[test]
     fn trig_series_u32_max_terms_no_panic() {
@@ -825,7 +825,7 @@ mod tests {
 
     /// Regression: u32 index overflow in atan series.
     ///
-    /// atan_rational_series had `2 * k + 1` (u32); same fix via u64 cast.
+    /// `atan_rational_series` had `2 * k + 1` (u32); same fix via u64 cast.
     #[test]
     fn atan_series_u32_max_terms_no_panic() {
         let budget = CertificationBudget {

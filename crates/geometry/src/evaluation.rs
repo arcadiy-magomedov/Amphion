@@ -121,28 +121,119 @@ impl ParameterErrorBound {
     }
 }
 
+/// Declares a validated, non-negative derivative-limit newtype.
+///
+/// Construction goes through [`Self::try_new`], which rejects NaN and negative
+/// values but **accepts** `+∞` and [`f64::MAX`] (both mean "no effective
+/// limit"). This closes the NaN-bypass hole of a bare `f64` field: a limit of
+/// NaN would silently disable the check because `bound > NaN` is always false.
+macro_rules! derivative_limit_newtype {
+    ($(#[$meta:meta])* $name:ident, $unit:literal) => {
+        $(#[$meta])*
+        ///
+        #[doc = concat!("Units: ", $unit, ".")]
+        #[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Serialize, Deserialize)]
+        #[serde(try_from = "f64", into = "f64")]
+        pub struct $name(f64);
+
+        impl $name {
+            #[doc = concat!("Creates a validated `", stringify!($name), "`.")]
+            ///
+            /// # Errors
+            ///
+            /// Returns [`ProjectionValueError`] when `value` is NaN or negative.
+            /// `+∞` and [`f64::MAX`] are accepted and mean "no effective limit".
+            pub fn try_new(value: f64) -> Result<Self, ProjectionValueError> {
+                Self::try_from(value)
+            }
+
+            /// Returns the limit.
+            #[must_use]
+            pub const fn get(self) -> f64 {
+                self.0
+            }
+        }
+
+        impl TryFrom<f64> for $name {
+            type Error = ProjectionValueError;
+            fn try_from(value: f64) -> Result<Self, Self::Error> {
+                // `value >= 0.0` is false for NaN and for negatives, and true
+                // for +∞ and f64::MAX — exactly the desired acceptance set.
+                if value >= 0.0 {
+                    Ok(Self(value))
+                } else {
+                    Err(ProjectionValueError)
+                }
+            }
+        }
+
+        impl From<$name> for f64 {
+            fn from(value: $name) -> Self {
+                value.0
+            }
+        }
+    };
+}
+
+derivative_limit_newtype!(
+    /// Limit on the certified error bound of a curve's first derivative.
+    CurveFirstDerivativeLimit,
+    "metres per radian (circles) or metres per unit parameter (lines)"
+);
+derivative_limit_newtype!(
+    /// Limit on the certified error bound of a curve's second derivative.
+    CurveSecondDerivativeLimit,
+    "metres per radian² or metres per unit parameter²"
+);
+derivative_limit_newtype!(
+    /// Limit on the certified error bound of a surface `∂p/∂u`.
+    SurfaceDuLimit,
+    "metres per radian (u periodic) or metres per unit parameter"
+);
+derivative_limit_newtype!(
+    /// Limit on the certified error bound of a surface `∂p/∂v`.
+    SurfaceDvLimit,
+    "metres per unit parameter"
+);
+derivative_limit_newtype!(
+    /// Limit on the certified error bound of a surface `∂²p/∂u²`.
+    SurfaceDuuLimit,
+    "metres per radian² or metres per unit parameter²"
+);
+derivative_limit_newtype!(
+    /// Limit on the certified error bound of a surface `∂²p/∂u∂v`.
+    SurfaceDuvLimit,
+    "metres per (radian·unit) or metres per unit parameter²"
+);
+derivative_limit_newtype!(
+    /// Limit on the certified error bound of a surface `∂²p/∂v²`.
+    SurfaceDvvLimit,
+    "metres per unit parameter²"
+);
+
 /// Caller-supplied per-slot upper limits on certified derivative error bounds.
 ///
 /// Each field is `Some(limit)` to require that the corresponding certified
 /// derivative error bound must not exceed `limit`, or `None` to skip that
-/// check.  The limit units must match those documented on the corresponding
-/// `*DerivativeBound` type (metres per radian for angular-parameter slots,
-/// metres per unit parameter for linear-parameter slots).
+/// check. Because every limit is a validated newtype, a NaN limit can never be
+/// stored — the old `Option<f64>` fields silently disabled the check on NaN
+/// since `bound > NaN` is always false. To express "no effective limit"
+/// explicitly, construct a limit from `f64::MAX` or `f64::INFINITY`.
 ///
 /// Unrequested slots (i.e., derivatives not included in `order`) are not
 /// computed and their limits are never checked.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DerivativeLimits {
     /// Limit for the first derivative of a curve, or `∂p/∂u` for a surface.
-    pub first_or_du: Option<f64>,
+    pub first_or_du: Option<CurveFirstDerivativeLimit>,
     /// Limit for the second derivative of a curve, or `∂²p/∂u²` for a surface.
-    pub second_or_duu: Option<f64>,
+    pub second_or_duu: Option<CurveSecondDerivativeLimit>,
     /// Limit for `∂p/∂v` for a surface (ignored for curves).
-    pub dv: Option<f64>,
+    pub dv: Option<SurfaceDvLimit>,
     /// Limit for `∂²p/∂u∂v` for a surface (ignored for curves).
-    pub duv: Option<f64>,
+    pub duv: Option<SurfaceDuvLimit>,
     /// Limit for `∂²p/∂v²` for a surface (ignored for curves).
-    pub dvv: Option<f64>,
+    pub dvv: Option<SurfaceDvvLimit>,
 }
 
 /// Error returned for an invalid projection parameter or error bound.
@@ -397,18 +488,30 @@ impl Default for CertificationBudget {
 /// Combined context for evaluation and projection: tolerance limits plus a
 /// certified rational-arithmetic computation budget and optional per-slot
 /// derivative limits.
+///
+/// Fields are private and can only be set through [`EvaluationContext::new`],
+/// [`EvaluationContext::with_budget`], and [`EvaluationContext::with_limits`],
+/// each of which routes through validated newtypes. This prevents the
+/// struct-literal bypass where a NaN budget or derivative limit could be set
+/// without validation. Deserialization goes through the same path via a
+/// private validating surrogate (`EvaluationContextRepr`).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "EvaluationContextRepr", into = "EvaluationContextRepr")]
 pub struct EvaluationContext {
-    /// Modeling tolerance used to reject results whose certified error
-    /// exceeds the requested precision at the relevant world scale.
-    pub tolerance: ToleranceContext,
-    /// Budget capping certified rational-arithmetic computation (series
-    /// terms, intermediate bit-width).
-    pub budget: CertificationBudget,
-    /// Per-slot derivative error bound limits.  Defaults to all `None`
-    /// (no derivative bound checking beyond the position/distance bound
-    /// from `tolerance`).
-    pub derivative_limits: DerivativeLimits,
+    tolerance: ToleranceContext,
+    budget: CertificationBudget,
+    derivative_limits: DerivativeLimits,
+}
+
+/// Serde surrogate for [`EvaluationContext`]. Deserialization runs through
+/// [`EvaluationContext::try_from`], which validates the budget.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct EvaluationContextRepr {
+    tolerance: ToleranceContext,
+    #[serde(default)]
+    budget: CertificationBudget,
+    #[serde(default)]
+    derivative_limits: DerivativeLimits,
 }
 
 impl EvaluationContext {
@@ -420,6 +523,67 @@ impl EvaluationContext {
             tolerance,
             budget: CertificationBudget::default(),
             derivative_limits: DerivativeLimits::default(),
+        }
+    }
+
+    /// Constructs a context from an explicit tolerance and budget, with no
+    /// per-slot derivative limits.
+    #[must_use]
+    pub fn with_budget(tolerance: ToleranceContext, budget: CertificationBudget) -> Self {
+        Self {
+            tolerance,
+            budget,
+            derivative_limits: DerivativeLimits::default(),
+        }
+    }
+
+    /// Returns a copy of this context with the given derivative limits.
+    #[must_use]
+    pub fn with_limits(mut self, limits: DerivativeLimits) -> Self {
+        self.derivative_limits = limits;
+        self
+    }
+
+    /// Returns the modeling tolerance context.
+    #[must_use]
+    pub fn tolerance(&self) -> ToleranceContext {
+        self.tolerance
+    }
+
+    /// Returns the certification budget.
+    #[must_use]
+    pub fn budget(&self) -> CertificationBudget {
+        self.budget
+    }
+
+    /// Returns the per-slot derivative limits.
+    #[must_use]
+    pub fn derivative_limits(&self) -> DerivativeLimits {
+        self.derivative_limits
+    }
+}
+
+impl TryFrom<EvaluationContextRepr> for EvaluationContext {
+    type Error = ProjectionValueError;
+
+    fn try_from(repr: EvaluationContextRepr) -> Result<Self, Self::Error> {
+        if repr.budget.series_terms == 0 || repr.budget.rational_bits == 0 {
+            return Err(ProjectionValueError);
+        }
+        Ok(Self {
+            tolerance: repr.tolerance,
+            budget: repr.budget,
+            derivative_limits: repr.derivative_limits,
+        })
+    }
+}
+
+impl From<EvaluationContext> for EvaluationContextRepr {
+    fn from(context: EvaluationContext) -> Self {
+        Self {
+            tolerance: context.tolerance,
+            budget: context.budget,
+            derivative_limits: context.derivative_limits,
         }
     }
 }
@@ -570,4 +734,91 @@ pub struct SurfaceProjection {
     /// Certified upper bound on `‖point − true_nearest_point_on_primitive‖`
     /// in metres.
     pub point_residual_bound: PositionBound,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CertificationBudget, CurveFirstDerivativeLimit, DerivativeLimits, EvaluationContext,
+    };
+    use amphion_foundation::ToleranceContext;
+
+    fn tol() -> ToleranceContext {
+        ToleranceContext::try_new(1e-9, 1e-12, 1e-9, 1e-9).unwrap()
+    }
+
+    #[test]
+    fn derivative_limit_rejects_nan() {
+        assert!(CurveFirstDerivativeLimit::try_new(f64::NAN).is_err());
+    }
+
+    #[test]
+    fn derivative_limit_rejects_negative() {
+        assert!(CurveFirstDerivativeLimit::try_new(-1.0).is_err());
+    }
+
+    #[test]
+    fn derivative_limit_accepts_positive_infinity() {
+        let limit = CurveFirstDerivativeLimit::try_new(f64::INFINITY).expect("+inf accepted");
+        assert!(limit.get().is_infinite() && limit.get().is_sign_positive());
+    }
+
+    #[test]
+    fn derivative_limit_accepts_max() {
+        let limit = CurveFirstDerivativeLimit::try_new(f64::MAX).expect("MAX accepted");
+        assert_eq!(limit.get().to_bits(), f64::MAX.to_bits());
+    }
+
+    #[test]
+    fn evaluation_context_builders_round_trip() {
+        let ctx = EvaluationContext::new(tol());
+        assert_eq!(ctx.budget(), CertificationBudget::default());
+        assert_eq!(ctx.derivative_limits(), DerivativeLimits::default());
+
+        let limits = DerivativeLimits {
+            first_or_du: Some(CurveFirstDerivativeLimit::try_new(0.01).unwrap()),
+            ..Default::default()
+        };
+        let ctx = ctx.with_limits(limits);
+        assert_eq!(ctx.derivative_limits(), limits);
+    }
+
+    #[test]
+    fn evaluation_context_serde_round_trip() {
+        let ctx = EvaluationContext::new(tol()).with_limits(DerivativeLimits {
+            first_or_du: Some(CurveFirstDerivativeLimit::try_new(0.01).unwrap()),
+            ..Default::default()
+        });
+        let json = serde_json::to_string(&ctx).unwrap();
+        let back: EvaluationContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(ctx, back);
+    }
+
+    #[test]
+    fn evaluation_context_serde_rejects_negative_limit() {
+        // A negative derivative limit must be rejected by the validated
+        // newtype deserializer (the NaN-bypass hole is closed the same way).
+        let ctx = EvaluationContext::new(tol());
+        let json = serde_json::to_string(&ctx).unwrap();
+        let mutated = json.replace(
+            "\"derivative_limits\":{\"first_or_du\":null",
+            "\"derivative_limits\":{\"first_or_du\":-1.0",
+        );
+        assert_ne!(mutated, json, "expected to mutate the limits field");
+        let parsed: Result<EvaluationContext, _> = serde_json::from_str(&mutated);
+        assert!(
+            parsed.is_err(),
+            "negative derivative limit must be rejected"
+        );
+    }
+
+    #[test]
+    fn evaluation_context_serde_rejects_zero_budget() {
+        let ctx = EvaluationContext::new(tol());
+        let json = serde_json::to_string(&ctx).unwrap();
+        let mutated = json.replace("\"series_terms\":200", "\"series_terms\":0");
+        assert_ne!(mutated, json, "expected to mutate the budget field");
+        let parsed: Result<EvaluationContext, _> = serde_json::from_str(&mutated);
+        assert!(parsed.is_err(), "zero series_terms budget must be rejected");
+    }
 }

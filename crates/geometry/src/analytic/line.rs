@@ -22,7 +22,9 @@
     clippy::similar_names
 )]
 
-use amphion_foundation::{Point2, Point3, Transform3, UnitVector2, UnitVector3, Vector2, Vector3};
+use amphion_foundation::{
+    Point2, Point3, SchemaVersion, Transform3, UnitVector2, UnitVector3, Vector2, Vector3,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::traits::{Curve2Evaluator, Curve3Evaluator};
@@ -54,10 +56,13 @@ fn line_domain() -> ParameterRange {
 
 // ─── Line2 ───────────────────────────────────────────────────────────────────
 
+/// Current serialized schema version for this module's primitives.
+const SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 0);
+
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Line2Repr {
-    #[serde(default)]
-    version: u32,
+    version: SchemaVersion,
     origin: Point2,
     direction: UnitVector2,
 }
@@ -110,7 +115,7 @@ impl Line2 {
 impl TryFrom<Line2Repr> for Line2 {
     type Error = ConstructionError;
     fn try_from(repr: Line2Repr) -> Result<Self, Self::Error> {
-        if repr.version != 0 && repr.version != 1 {
+        if repr.version.major() != SCHEMA_VERSION.major() {
             return Err(ConstructionError::NonFiniteInput);
         }
         let origin = repr.origin.into_array();
@@ -127,7 +132,7 @@ impl TryFrom<Line2Repr> for Line2 {
 impl From<Line2> for Line2Repr {
     fn from(line: Line2) -> Self {
         Self {
-            version: 1,
+            version: SCHEMA_VERSION,
             origin: line.origin,
             direction: line.direction,
         }
@@ -155,7 +160,7 @@ impl Curve2Evaluator for Line2 {
         let o = self.origin.into_array();
         let d = self.direction.into_array();
 
-        let eval = exact_affine_eval2(context.budget, o, d, parameter)?;
+        let eval = exact_affine_eval2(context.budget(), o, d, parameter)?;
         let pos = Point2::try_new(eval.point[0], eval.point[1]).map_err(|_| {
             GeometryError::Uncertified {
                 reason: "line position is non-finite".to_owned(),
@@ -168,7 +173,7 @@ impl Curve2Evaluator for Line2 {
                 }
             })?;
         let eval_scale = mag2(o) + mag2(scale2(d, parameter));
-        check_tolerance(&context.tolerance, position_error_bound.get(), eval_scale)?;
+        check_tolerance(&context.tolerance(), position_error_bound.get(), eval_scale)?;
 
         // The first derivative is exactly the stored direction (no
         // arithmetic beyond returning the stored vector) and the second
@@ -226,10 +231,10 @@ impl Curve2Evaluator for Line2 {
         let o = self.origin.into_array();
         let d = self.direction.into_array();
 
-        let result = exact_line_project2(context.budget, q, o, d)?;
+        let result = exact_line_project2(context.budget(), q, o, d)?;
         let scale = mag2(q) + mag2(result.point);
-        check_tolerance(&context.tolerance, result.point_residual_bound, scale)?;
-        check_parametric_tolerance(&context.tolerance, result.parameter_error_bound)?;
+        check_tolerance(&context.tolerance(), result.point_residual_bound, scale)?;
+        check_parametric_tolerance(&context.tolerance(), result.parameter_error_bound)?;
 
         let proj = Point2::try_new(result.point[0], result.point[1]).map_err(|_| {
             GeometryError::Uncertified {
@@ -269,9 +274,9 @@ impl Curve2Evaluator for Line2 {
 // ─── Line3 ───────────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Line3Repr {
-    #[serde(default)]
-    version: u32,
+    version: SchemaVersion,
     origin: Point3,
     direction: UnitVector3,
 }
@@ -347,7 +352,7 @@ impl Line3 {
 impl TryFrom<Line3Repr> for Line3 {
     type Error = ConstructionError;
     fn try_from(repr: Line3Repr) -> Result<Self, Self::Error> {
-        if repr.version != 0 && repr.version != 1 {
+        if repr.version.major() != SCHEMA_VERSION.major() {
             return Err(ConstructionError::NonFiniteInput);
         }
         let origin = repr.origin.into_array();
@@ -364,7 +369,7 @@ impl TryFrom<Line3Repr> for Line3 {
 impl From<Line3> for Line3Repr {
     fn from(line: Line3) -> Self {
         Self {
-            version: 1,
+            version: SCHEMA_VERSION,
             origin: line.origin,
             direction: line.direction,
         }
@@ -392,7 +397,7 @@ impl Curve3Evaluator for Line3 {
         let o = self.origin.into_array();
         let d = self.direction.into_array();
 
-        let eval = exact_affine_eval3(context.budget, o, d, parameter)?;
+        let eval = exact_affine_eval3(context.budget(), o, d, parameter)?;
         let pos = Point3::try_new(eval.point[0], eval.point[1], eval.point[2]).map_err(|_| {
             GeometryError::Uncertified {
                 reason: "line position is non-finite".to_owned(),
@@ -405,7 +410,7 @@ impl Curve3Evaluator for Line3 {
                 }
             })?;
         let eval_scale = mag3(o) + mag3(scale3(d, parameter));
-        check_tolerance(&context.tolerance, position_error_bound.get(), eval_scale)?;
+        check_tolerance(&context.tolerance(), position_error_bound.get(), eval_scale)?;
 
         let direction_error_bound =
             FirstDerivativeBound::try_new(0.0).map_err(|_| GeometryError::Uncertified {
@@ -463,10 +468,10 @@ impl Curve3Evaluator for Line3 {
         let o = self.origin.into_array();
         let d = self.direction.into_array();
 
-        let result = exact_line_project3(context.budget, q, o, d)?;
+        let result = exact_line_project3(context.budget(), q, o, d)?;
         let scale = mag3(q) + mag3(result.point);
-        check_tolerance(&context.tolerance, result.point_residual_bound, scale)?;
-        check_parametric_tolerance(&context.tolerance, result.parameter_error_bound)?;
+        check_tolerance(&context.tolerance(), result.point_residual_bound, scale)?;
+        check_parametric_tolerance(&context.tolerance(), result.parameter_error_bound)?;
 
         let proj =
             Point3::try_new(result.point[0], result.point[1], result.point[2]).map_err(|_| {
@@ -889,28 +894,56 @@ mod tests {
         );
     }
 
+    /// Correction 10-G: mismatched `SchemaVersion` major and missing version
+    /// must both be rejected for `Line2`.
+    #[test]
+    fn line2_serde_version_rejection() {
+        assert!(
+            serde_json::from_str::<Line2>(
+                r#"{"version":{"major":99,"minor":0},"origin":[1.0,2.0],"direction":[1.0,0.0]}"#
+            )
+            .is_err(),
+            "major=99 must be rejected"
+        );
+        assert!(
+            serde_json::from_str::<Line2>(r#"{"origin":[1.0,2.0],"direction":[1.0,0.0]}"#).is_err(),
+            "missing version must be rejected"
+        );
+    }
+
     #[test]
     fn line2_serde_rejects_non_unit_direction() {
         assert!(
-            serde_json::from_str::<Line2>(r#"{"origin":[1.0,2.0],"direction":[2.0,0.0]}"#).is_err()
+            serde_json::from_str::<Line2>(
+                r#"{"version":{"major":1,"minor":0},"origin":[1.0,2.0],"direction":[2.0,0.0]}"#
+            )
+            .is_err()
         );
     }
 
     #[test]
     fn line2_serde_rejects_marginally_non_unit_direction() {
         assert!(
-            serde_json::from_str::<Line2>(r#"{"origin":[1.0,2.0],"direction":[1.1,0.0]}"#).is_err()
+            serde_json::from_str::<Line2>(
+                r#"{"version":{"major":1,"minor":0},"origin":[1.0,2.0],"direction":[1.1,0.0]}"#
+            )
+            .is_err()
         );
     }
 
     #[test]
     fn line2_serde_rejects_nan_and_inf_fields() {
         assert!(
-            serde_json::from_str::<Line2>(r#"{"origin":[NaN,0.0],"direction":[1.0,0.0]}"#).is_err()
+            serde_json::from_str::<Line2>(
+                r#"{"version":{"major":1,"minor":0},"origin":[NaN,0.0],"direction":[1.0,0.0]}"#
+            )
+            .is_err()
         );
         assert!(
-            serde_json::from_str::<Line2>(r#"{"origin":[0.0,0.0],"direction":[Infinity,0.0]}"#)
-                .is_err()
+            serde_json::from_str::<Line2>(
+                r#"{"version":{"major":1,"minor":0},"origin":[0.0,0.0],"direction":[Infinity,0.0]}"#
+            )
+            .is_err()
         );
     }
 
@@ -1058,7 +1091,7 @@ mod tests {
     #[test]
     fn line3_serde_rejects_non_unit_direction() {
         assert!(
-            serde_json::from_str::<Line3>(r#"{"origin":[1.0,2.0,3.0],"direction":[2.0,0.0,0.0]}"#)
+            serde_json::from_str::<Line3>(r#"{"version":{"major":1,"minor":0},"origin":[1.0,2.0,3.0],"direction":[2.0,0.0,0.0]}"#)
                 .is_err()
         );
     }
@@ -1066,7 +1099,7 @@ mod tests {
     #[test]
     fn line3_serde_rejects_marginally_non_unit_direction() {
         assert!(
-            serde_json::from_str::<Line3>(r#"{"origin":[1.0,2.0,3.0],"direction":[1.1,0.0,0.0]}"#)
+            serde_json::from_str::<Line3>(r#"{"version":{"major":1,"minor":0},"origin":[1.0,2.0,3.0],"direction":[1.1,0.0,0.0]}"#)
                 .is_err()
         );
     }
@@ -1074,12 +1107,12 @@ mod tests {
     #[test]
     fn line3_serde_rejects_nan_and_inf_fields() {
         assert!(
-            serde_json::from_str::<Line3>(r#"{"origin":[NaN,0.0,0.0],"direction":[1.0,0.0,0.0]}"#)
+            serde_json::from_str::<Line3>(r#"{"version":{"major":1,"minor":0},"origin":[NaN,0.0,0.0],"direction":[1.0,0.0,0.0]}"#)
                 .is_err()
         );
         assert!(
             serde_json::from_str::<Line3>(
-                r#"{"origin":[0.0,0.0,0.0],"direction":[Infinity,0.0,0.0]}"#
+                r#"{"version":{"major":1,"minor":0},"origin":[0.0,0.0,0.0],"direction":[Infinity,0.0,0.0]}"#
             )
             .is_err()
         );

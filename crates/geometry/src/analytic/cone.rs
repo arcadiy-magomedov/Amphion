@@ -42,15 +42,16 @@
 
 use std::f64::consts::TAU;
 
-use amphion_foundation::{Point3, Transform3, UnitVector3, Vector3};
+use amphion_foundation::{Point3, SchemaVersion, Transform3, UnitVector3, Vector3};
 use serde::{Deserialize, Serialize};
 
 use crate::traits::SurfaceEvaluator;
 use crate::{
-    AngularParameterBound, DerivativeOrder, DistanceBound, EvaluationContext, FirstDerivativeBound,
-    GeometryError, LinearParameterBound, ParameterErrorBound, ParameterRange, ParameterValue,
-    PositionBound, SecondDerivativeBound, SurfaceDomain, SurfaceEvaluation, SurfaceKind,
-    SurfaceProjection,
+    AngularParameterBound, CurveFirstDerivativeLimit, CurveSecondDerivativeLimit, DerivativeOrder,
+    DistanceBound, EvaluationContext, FirstDerivativeBound, GeometryError, LinearParameterBound,
+    ParameterErrorBound, ParameterRange, ParameterValue, PositionBound, SecondDerivativeBound,
+    SurfaceDomain, SurfaceDuvLimit, SurfaceDvLimit, SurfaceDvvLimit, SurfaceEvaluation,
+    SurfaceKind, SurfaceProjection,
 };
 
 use super::{
@@ -58,7 +59,7 @@ use super::{
     helpers::{
         ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite3, certified_tan_upper,
         check_angular_tolerance, check_derivative_limit, check_parametric_tolerance,
-        check_tolerance, dot3, exact_cone_eval, exact_cone_project, frame_deviation_bound,
+        check_tolerance, dot3, exact_cone_eval, exact_cone_project, frame_deviation_bound_terms,
         in_range, mag3, normalization_to_construction, scale3, sub3,
     },
     transform::similarity_scale,
@@ -78,10 +79,13 @@ fn unbounded_range() -> ParameterRange {
     }
 }
 
+/// Current serialized schema version for this module's primitive.
+const SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 0);
+
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConeRepr {
-    #[serde(default)]
-    version: u32,
+    version: SchemaVersion,
     apex: Point3,
     axis: UnitVector3,
     half_angle: f64,
@@ -230,7 +234,7 @@ impl Cone {
 impl TryFrom<ConeRepr> for Cone {
     type Error = ConstructionError;
     fn try_from(repr: ConeRepr) -> Result<Self, Self::Error> {
-        if repr.version != 0 && repr.version != 1 {
+        if repr.version.major() != SCHEMA_VERSION.major() {
             return Err(ConstructionError::NonFiniteInput);
         }
         let apex = repr.apex.into_array();
@@ -260,7 +264,7 @@ impl TryFrom<ConeRepr> for Cone {
 impl From<Cone> for ConeRepr {
     fn from(c: Cone) -> Self {
         Self {
-            version: 1,
+            version: SCHEMA_VERSION,
             apex: c.apex,
             axis: c.axis,
             half_angle: c.half_angle,
@@ -309,26 +313,35 @@ impl SurfaceEvaluator for Cone {
         let xa = self.x_axis.into_array();
         let ya = self.y_axis.into_array();
 
-        let eval = exact_cone_eval(context.budget, ap, ax, self.half_angle, xa, ya, u, v)?;
+        let eval = exact_cone_eval(context.budget(), ap, ax, self.half_angle, xa, ya, u, v)?;
         let pos = Point3::try_new(eval.point[0], eval.point[1], eval.point[2]).map_err(|_| {
             GeometryError::Uncertified {
                 reason: "cone position is non-finite".to_owned(),
             }
         })?;
-        // Include frame deviation from approximate stored UnitVector axes.
-        let raw_pos_bound =
-            eval.position_error_bound + frame_deviation_bound(v.abs() + self.half_angle.sin());
+        // Certified frame-deviation bound (exact rational). The cone position
+        // is apex + v·cos(α)·Z + v·sin(α)·(cos u·X + sin u·Y); each axis
+        // coefficient magnitude is bounded by |v| (since |sin|,|cos| ≤ 1), so
+        // |v| is a rigorous per-axis coefficient. This replaces the previous
+        // dimensionally inconsistent `|v| + sin(α)` scalar.
+        let raw_pos_bound = eval.position_error_bound
+            + frame_deviation_bound_terms(&[(&xa, v), (&ya, v), (&ax, v)]);
         let position_error_bound =
             PositionBound::try_new(raw_pos_bound).map_err(|_| GeometryError::Uncertified {
                 reason: "position error bound overflowed representable range".to_owned(),
             })?;
-        // Certified tan(half_angle) upper bound for eval scale; fall back to
-        // host f64 tan if budget exhausted (only used for position tolerance
-        // check, not for the certified result itself).
-        let tan_upper = certified_tan_upper(self.half_angle, context.budget)
-            .unwrap_or_else(|| self.half_angle.tan().abs().next_up());
+        // Certified tan(half_angle) upper bound for the eval scale. If the
+        // certified trig backend exhausts its budget, we must return
+        // Uncertified rather than silently substitute an uncertified host tan.
+        let tan_upper =
+            certified_tan_upper(self.half_angle, context.budget()).ok_or_else(|| {
+                GeometryError::Uncertified {
+                    reason: "cone half-angle tangent could not be certified within budget"
+                        .to_owned(),
+                }
+            })?;
         let eval_scale = mag3(ap) + v.abs() * (1.0 + tan_upper);
-        check_tolerance(&context.tolerance, position_error_bound.get(), eval_scale)?;
+        check_tolerance(&context.tolerance(), position_error_bound.get(), eval_scale)?;
 
         let du_error_bound = FirstDerivativeBound::try_new(eval.du_error_bound).map_err(|_| {
             GeometryError::Uncertified {
@@ -374,9 +387,15 @@ impl SurfaceEvaluator for Cone {
             DerivativeOrder::First => {
                 check_derivative_limit(
                     du_error_bound.get(),
-                    context.derivative_limits.first_or_du,
+                    context
+                        .derivative_limits()
+                        .first_or_du
+                        .map(CurveFirstDerivativeLimit::get),
                 )?;
-                check_derivative_limit(dv_error_bound.get(), context.derivative_limits.dv)?;
+                check_derivative_limit(
+                    dv_error_bound.get(),
+                    context.derivative_limits().dv.map(SurfaceDvLimit::get),
+                )?;
                 let du = to_vec3(eval.du, "cone first u-derivative")?;
                 let dv = to_vec3(eval.dv, "cone first v-derivative")?;
                 (
@@ -395,15 +414,30 @@ impl SurfaceEvaluator for Cone {
             DerivativeOrder::Second => {
                 check_derivative_limit(
                     du_error_bound.get(),
-                    context.derivative_limits.first_or_du,
+                    context
+                        .derivative_limits()
+                        .first_or_du
+                        .map(CurveFirstDerivativeLimit::get),
                 )?;
-                check_derivative_limit(dv_error_bound.get(), context.derivative_limits.dv)?;
+                check_derivative_limit(
+                    dv_error_bound.get(),
+                    context.derivative_limits().dv.map(SurfaceDvLimit::get),
+                )?;
                 check_derivative_limit(
                     duu_error_bound.get(),
-                    context.derivative_limits.second_or_duu,
+                    context
+                        .derivative_limits()
+                        .second_or_duu
+                        .map(CurveSecondDerivativeLimit::get),
                 )?;
-                check_derivative_limit(duv_error_bound.get(), context.derivative_limits.duv)?;
-                check_derivative_limit(zero_second_bound.get(), context.derivative_limits.dvv)?;
+                check_derivative_limit(
+                    duv_error_bound.get(),
+                    context.derivative_limits().duv.map(SurfaceDuvLimit::get),
+                )?;
+                check_derivative_limit(
+                    zero_second_bound.get(),
+                    context.derivative_limits().dvv.map(SurfaceDvvLimit::get),
+                )?;
                 let du = to_vec3(eval.du, "cone first u-derivative")?;
                 let dv = to_vec3(eval.dv, "cone first v-derivative")?;
                 let duu = to_vec3(eval.duu, "cone second u-derivative")?;
@@ -452,16 +486,16 @@ impl SurfaceEvaluator for Cone {
         let xa = self.x_axis.into_array();
         let ya = self.y_axis.into_array();
 
-        let result = exact_cone_project(context.budget, q, ap, ax, self.half_angle, xa, ya)?;
+        let result = exact_cone_project(context.budget(), q, ap, ax, self.half_angle, xa, ya)?;
         let mut certified = Vec::new();
         for projection in [Some(result.primary), result.secondary]
             .into_iter()
             .flatten()
         {
             let scale = mag3(q) + mag3(projection.point);
-            check_tolerance(&context.tolerance, projection.point_residual_bound, scale)?;
-            check_angular_tolerance(&context.tolerance, projection.u_error_bound)?;
-            check_parametric_tolerance(&context.tolerance, projection.v_error_bound)?;
+            check_tolerance(&context.tolerance(), projection.point_residual_bound, scale)?;
+            check_angular_tolerance(&context.tolerance(), projection.u_error_bound)?;
+            check_parametric_tolerance(&context.tolerance(), projection.v_error_bound)?;
 
             let proj = Point3::try_new(
                 projection.point[0],
@@ -551,6 +585,26 @@ mod tests {
             Vector3::try_new(1.0, 0.0, 0.0).unwrap(),
         )
         .unwrap()
+    }
+
+    /// Correction 10-E: when the certification budget is too small for the
+    /// certified tangent, cone evaluation returns `Uncertified` rather than
+    /// silently substituting an uncertified host `tan`.
+    #[test]
+    fn cone_eval_uncertified_on_starved_tan_budget() {
+        use crate::CertificationBudget;
+        let starved = EvaluationContext::with_budget(
+            tol(),
+            CertificationBudget {
+                series_terms: 1,
+                rational_bits: 1 << 20,
+            },
+        );
+        let result = std_cone().evaluate(0.5, 1.0, DerivativeOrder::Position, &starved);
+        assert!(
+            matches!(result, Err(GeometryError::Uncertified { .. })),
+            "starved tan budget must yield Uncertified, got {result:?}"
+        );
     }
 
     #[test]
@@ -776,12 +830,13 @@ mod tests {
     fn cone_serde_rejects_non_unit_axis_and_bad_angle() {
         assert!(
             serde_json::from_str::<Cone>(
-                r#"{"apex":[1.0,2.0,3.0],"axis":[2.0,0.0,0.0],"half_angle":0.5,"x_axis":[0.0,1.0,0.0]}"#
+                r#"{"version":{"major":1,"minor":0},"apex":[1.0,2.0,3.0],"axis":[2.0,0.0,0.0],"half_angle":0.5,"x_axis":[0.0,1.0,0.0]}"#
             )
             .is_err()
         );
 
         let bad_frame: ConeRepr = serde_json::from_value(json!({
+            "version": {"major": 1, "minor": 0},
             "apex": [1.0, 2.0, 3.0],
             "axis": [1.0, 0.0, 0.0],
             "half_angle": 0.5,
@@ -794,6 +849,7 @@ mod tests {
         );
 
         let bad_angle: ConeRepr = serde_json::from_value(json!({
+            "version": {"major": 1, "minor": 0},
             "apex": [1.0, 2.0, 3.0],
             "axis": [0.0, 0.0, 1.0],
             "half_angle": 0.0,
@@ -809,11 +865,11 @@ mod tests {
     #[test]
     fn cone_serde_rejects_nan_and_inf_fields() {
         assert!(serde_json::from_str::<Cone>(
-            r#"{"apex":[NaN,0.0,0.0],"axis":[0.0,0.0,1.0],"half_angle":0.5,"x_axis":[1.0,0.0,0.0]}"#
+            r#"{"version":{"major":1,"minor":0},"apex":[NaN,0.0,0.0],"axis":[0.0,0.0,1.0],"half_angle":0.5,"x_axis":[1.0,0.0,0.0]}"#
         )
         .is_err());
         assert!(serde_json::from_str::<Cone>(
-            r#"{"apex":[0.0,0.0,0.0],"axis":[Infinity,0.0,1.0],"half_angle":0.5,"x_axis":[1.0,0.0,0.0]}"#
+            r#"{"version":{"major":1,"minor":0},"apex":[0.0,0.0,0.0],"axis":[Infinity,0.0,1.0],"half_angle":0.5,"x_axis":[1.0,0.0,0.0]}"#
         )
         .is_err());
     }
@@ -907,18 +963,29 @@ mod tests {
         assert!(v_below < 0.0, "negative nappe: v={v_below} must be < 0");
     }
 
-    /// Blocker 4: Serde version=99 must be rejected.
+    /// Correction 10-G: mismatched `SchemaVersion` major must be rejected.
     #[test]
     fn cone_serde_version_rejection() {
         let invalid = serde_json::json!({
-            "version": 99,
+            "version": {"major": 99, "minor": 0},
             "apex": [0.0, 0.0, 0.0],
             "axis": [0.0, 0.0, 1.0],
             "half_angle": FRAC_PI_4,
             "x_axis": [1.0, 0.0, 0.0]
         });
         let result: Result<Cone, _> = serde_json::from_value(invalid);
-        assert!(result.is_err(), "version=99 must be rejected");
+        assert!(result.is_err(), "major=99 must be rejected");
+
+        let missing = serde_json::json!({
+            "apex": [0.0, 0.0, 0.0],
+            "axis": [0.0, 0.0, 1.0],
+            "half_angle": FRAC_PI_4,
+            "x_axis": [1.0, 0.0, 0.0]
+        });
+        assert!(
+            serde_json::from_value::<Cone>(missing).is_err(),
+            "missing version must be rejected"
+        );
     }
 
     /// Blocker 4: Serialization round-trip must be byte-identical for version=1.

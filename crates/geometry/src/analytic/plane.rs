@@ -24,7 +24,7 @@
     clippy::similar_names
 )]
 
-use amphion_foundation::{Point3, Transform3, UnitVector3, Vector3};
+use amphion_foundation::{Point3, SchemaVersion, Transform3, UnitVector3, Vector3};
 use serde::{Deserialize, Serialize};
 
 use crate::traits::SurfaceEvaluator;
@@ -50,10 +50,13 @@ fn unbounded_range() -> ParameterRange {
     }
 }
 
+/// Current serialized schema version for this module's primitive.
+const SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1, 0);
+
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PlaneRepr {
-    #[serde(default)]
-    version: u32,
+    version: SchemaVersion,
     origin: Point3,
     u_axis: UnitVector3,
     v_axis: UnitVector3,
@@ -178,7 +181,7 @@ impl Plane {
 impl TryFrom<PlaneRepr> for Plane {
     type Error = ConstructionError;
     fn try_from(repr: PlaneRepr) -> Result<Self, Self::Error> {
-        if repr.version != 0 && repr.version != 1 {
+        if repr.version.major() != SCHEMA_VERSION.major() {
             return Err(ConstructionError::NonFiniteInput);
         }
         let origin = repr.origin.into_array();
@@ -204,7 +207,7 @@ impl TryFrom<PlaneRepr> for Plane {
 impl From<Plane> for PlaneRepr {
     fn from(p: Plane) -> Self {
         Self {
-            version: 1,
+            version: SCHEMA_VERSION,
             origin: p.origin,
             u_axis: p.u_axis,
             v_axis: p.v_axis,
@@ -235,7 +238,7 @@ impl SurfaceEvaluator for Plane {
         let u_ax = self.u_axis.into_array();
         let v_ax = self.v_axis.into_array();
 
-        let eval = exact_plane_eval3(context.budget, o, u_ax, v_ax, u, v)?;
+        let eval = exact_plane_eval3(context.budget(), o, u_ax, v_ax, u, v)?;
         let pos = Point3::try_new(eval.point[0], eval.point[1], eval.point[2]).map_err(|_| {
             GeometryError::Uncertified {
                 reason: "plane position is non-finite".to_owned(),
@@ -248,7 +251,7 @@ impl SurfaceEvaluator for Plane {
                 }
             })?;
         let eval_scale = mag3(o) + mag3(scale3(u_ax, u)) + mag3(scale3(v_ax, v));
-        check_tolerance(&context.tolerance, position_error_bound.get(), eval_scale)?;
+        check_tolerance(&context.tolerance(), position_error_bound.get(), eval_scale)?;
 
         let to_vec3 = |arr: [f64; 3], what: &'static str| {
             Vector3::try_new(arr[0], arr[1], arr[2]).map_err(|_| GeometryError::Uncertified {
@@ -333,10 +336,10 @@ impl SurfaceEvaluator for Plane {
         let u_ax = self.u_axis.into_array();
         let v_ax = self.v_axis.into_array();
 
-        let result = exact_plane_project3(context.budget, q, o, u_ax, v_ax)?;
+        let result = exact_plane_project3(context.budget(), q, o, u_ax, v_ax)?;
         let scale = mag3(q) + mag3(result.point);
-        check_tolerance(&context.tolerance, result.point_residual_bound, scale)?;
-        check_parametric_tolerance(&context.tolerance, result.parameter_error_bound)?;
+        check_tolerance(&context.tolerance(), result.point_residual_bound, scale)?;
+        check_parametric_tolerance(&context.tolerance(), result.parameter_error_bound)?;
 
         let proj =
             Point3::try_new(result.point[0], result.point[1], result.point[2]).map_err(|_| {
@@ -635,11 +638,31 @@ mod tests {
         assert_eq!(p.v_axis().into_array(), decoded.v_axis().into_array());
     }
 
+    /// Correction 10-G: mismatched `SchemaVersion` major and missing version
+    /// must both be rejected for `Plane`.
+    #[test]
+    fn plane_serde_version_rejection() {
+        assert!(
+            serde_json::from_str::<Plane>(
+                r#"{"version":{"major":99,"minor":0},"origin":[0.0,0.0,0.0],"u_axis":[1.0,0.0,0.0],"v_axis":[0.0,1.0,0.0]}"#
+            )
+            .is_err(),
+            "major=99 must be rejected"
+        );
+        assert!(
+            serde_json::from_str::<Plane>(
+                r#"{"origin":[0.0,0.0,0.0],"u_axis":[1.0,0.0,0.0],"v_axis":[0.0,1.0,0.0]}"#
+            )
+            .is_err(),
+            "missing version must be rejected"
+        );
+    }
+
     #[test]
     fn plane_serde_rejects_non_unit_axes() {
         assert!(
             serde_json::from_str::<Plane>(
-                r#"{"origin":[1.0,2.0,3.0],"u_axis":[2.0,0.0,0.0],"v_axis":[0.0,1.0,0.0]}"#
+                r#"{"version":{"major":1,"minor":0},"origin":[1.0,2.0,3.0],"u_axis":[2.0,0.0,0.0],"v_axis":[0.0,1.0,0.0]}"#
             )
             .is_err()
         );
@@ -648,6 +671,7 @@ mod tests {
     #[test]
     fn plane_serde_rejects_non_orthogonal_axes() {
         let repr: PlaneRepr = serde_json::from_value(json!({
+            "version": {"major": 1, "minor": 0},
             "origin": [1.0, 2.0, 3.0],
             "u_axis": [1.0, 0.0, 0.0],
             "v_axis": [1.0, 0.0, 0.0]
@@ -660,13 +684,13 @@ mod tests {
     fn plane_serde_rejects_nan_and_inf_fields() {
         assert!(
             serde_json::from_str::<Plane>(
-                r#"{"origin":[NaN,0.0,0.0],"u_axis":[1.0,0.0,0.0],"v_axis":[0.0,1.0,0.0]}"#
+                r#"{"version":{"major":1,"minor":0},"origin":[NaN,0.0,0.0],"u_axis":[1.0,0.0,0.0],"v_axis":[0.0,1.0,0.0]}"#
             )
             .is_err()
         );
         assert!(
             serde_json::from_str::<Plane>(
-                r#"{"origin":[0.0,0.0,0.0],"u_axis":[Infinity,0.0,0.0],"v_axis":[0.0,1.0,0.0]}"#
+                r#"{"version":{"major":1,"minor":0},"origin":[0.0,0.0,0.0],"u_axis":[Infinity,0.0,0.0],"v_axis":[0.0,1.0,0.0]}"#
             )
             .is_err()
         );

@@ -203,28 +203,25 @@ pub(super) fn sqrt_up(sq_rat: &BigRational) -> Result<f64, ()> {
     if sq_rat > &max_sq {
         return Ok(f64::INFINITY);
     }
-    // Fast host-sqrt path: only valid when sq_rat rounds to a strictly positive
-    // f64 both ways (i.e., it lies in the normal f64 range).  When
-    // rat_to_f64_down(sq_rat) == 0, the rational is below the smallest
-    // representable positive f64 (minsub ≈ 5e-324); in that case
-    // rat_to_f64_up overshoots to minsub and sqrt(minsub) ≈ 2^{-537} is
-    // wildly loose — e.g. sqrt_up(1e-400) would return ~2.22e-162 instead of
-    // the true ~1e-200.  Route subnormal-range radicands to the exact BigInt
-    // isqrt path for a tight, adjacent bound.
-    if sq_rat <= &max {
-        let sq_lo = rat_to_f64_down(sq_rat);
-        if sq_lo > 0.0 {
-            let sq_hi = rat_to_f64_up(sq_rat);
-            let candidate = sq_hi.sqrt();
-            let candidate_rat = f64_to_rat(candidate);
-            let candidate_sq = &candidate_rat * &candidate_rat;
-            return Ok(if candidate_sq >= *sq_rat {
-                candidate
-            } else {
-                candidate.next_up()
-            });
-        }
-        // sq_rat is in the subnormal/underflow range: fall through to BigInt isqrt.
+    // Fast host-sqrt path: only valid when the radicand lies in the *normal*
+    // f64 range (sq_rat >= MIN_POSITIVE).  Below MIN_POSITIVE the directed
+    // conversions rat_to_f64_{down,up} land on adjacent subnormals whose square
+    // roots differ by a large relative factor.  Concrete counterexample:
+    // sq_rat = 3·2^{-1075} rounds down to 2^{-1074} (minsub) and up to
+    // 2^{-1073} (2·minsub); sqrt(minsub) = 2^{-537} and sqrt(2·minsub) =
+    // √2·2^{-537} differ by ~41%, so a single next_up cannot close the bracket
+    // around the true root √3·2^{-537.5}.  Route every subnormal-range radicand
+    // to the exact BigInt isqrt path, which yields a tight adjacent bound.
+    if sq_rat <= &max && sq_rat >= &f64_to_rat(f64::MIN_POSITIVE) {
+        let sq_hi = rat_to_f64_up(sq_rat);
+        let candidate = sq_hi.sqrt();
+        let candidate_rat = f64_to_rat(candidate);
+        let candidate_sq = &candidate_rat * &candidate_rat;
+        return Ok(if candidate_sq >= *sq_rat {
+            candidate
+        } else {
+            candidate.next_up()
+        });
     }
 
     // BigInt isqrt path: handles both huge radicands (sq_rat > MAX) and
@@ -261,23 +258,20 @@ pub(super) fn sqrt_down(sq_rat: &BigRational) -> Result<f64, ()> {
     if sq_rat > &max_sq {
         return Ok(f64::MAX);
     }
-    // Fast host-sqrt path: safe only when sq_rat rounds down to a positive f64.
-    // When sq_lo == 0, the rational is below the smallest positive f64; returning
-    // 0.0 is a valid lower bound but wildly loose for subnormal-range sq_rat.
-    // Route those through the exact BigInt isqrt path for a tight result.
-    if sq_rat <= &max {
+    // Fast host-sqrt path: valid only in the *normal* f64 range
+    // (sq_rat >= MIN_POSITIVE).  Subnormal-range radicands are routed to the
+    // exact BigInt isqrt path (see the sqrt_up counterexample for why directed
+    // conversions on subnormals cannot produce an adjacent bracket).
+    if sq_rat <= &max && sq_rat >= &f64_to_rat(f64::MIN_POSITIVE) {
         let sq_lo = rat_to_f64_down(sq_rat);
-        if sq_lo > 0.0 {
-            let candidate = sq_lo.sqrt();
-            let candidate_rat = f64_to_rat(candidate);
-            let candidate_sq = &candidate_rat * &candidate_rat;
-            return Ok(if candidate_sq <= *sq_rat {
-                candidate
-            } else {
-                candidate.next_down()
-            });
-        }
-        // sq_rat is in the subnormal/underflow range: fall through to BigInt isqrt.
+        let candidate = sq_lo.sqrt();
+        let candidate_rat = f64_to_rat(candidate);
+        let candidate_sq = &candidate_rat * &candidate_rat;
+        return Ok(if candidate_sq <= *sq_rat {
+            candidate
+        } else {
+            candidate.next_down()
+        });
     }
 
     // BigInt isqrt path: handles both huge radicands (sq_rat > MAX) and
@@ -405,10 +399,10 @@ mod tests {
 
     /// Regression: subnormal-range radicand.
     ///
-    /// sq_rat = (1e-200)² = 1e-400, which is below f64 minsub ≈ 5e-324.
+    /// `sq_rat` = (1e-200)² = 1e-400, which is below f64 minsub ≈ 5e-324.
     /// True sqrt is 1e-200 (a normal f64). The fast host-sqrt path previously
     /// returned sqrt(minsub) ≈ 2.22e-162 as `sqrt_up` — wildly too large.
-    /// With the BigInt isqrt path the result must bracket 1e-200 tightly.
+    /// With the `BigInt` isqrt path the result must bracket 1e-200 tightly.
     #[test]
     fn sqrt_tiny_radicand_subnormal_range() {
         let base = f64_to_rat(1e-200_f64);
@@ -471,5 +465,82 @@ mod tests {
         let sq_rat = BigRational::from_integer(BigInt::one() << 2200usize);
         assert_eq!(sqrt_up(&sq_rat).unwrap(), f64::INFINITY);
         assert_eq!(sqrt_down(&sq_rat).unwrap(), f64::MAX);
+    }
+
+    /// Regression (Correction 10-A): subnormal radicand 3·2^{-1075}.
+    ///
+    /// `rat_to_f64_down(3·2^{-1075}) = 2^{-1074}` (minsub, strictly positive),
+    /// so the old `sq_lo > 0.0` fast-path fired and `sqrt(minsub) = 2^{-537}`
+    /// left a ~41% gap around the true root √3·2^{-537.5}.  Gating on
+    /// `MIN_POSITIVE` routes it to the exact `BigInt` path, which must produce an
+    /// adjacent bracket: `sqrt_up == sqrt_down.next_up()`.
+    #[test]
+    fn sqrt_regression_subnormal_3_times_2_neg_1075() {
+        let sq_rat = BigRational::new(BigInt::from(3i64), BigInt::one() << 1075usize);
+        let up = sqrt_up(&sq_rat).unwrap();
+        let down = sqrt_down(&sq_rat).unwrap();
+
+        let down_rat = f64_to_rat(down);
+        let up_rat = f64_to_rat(up);
+        assert!(
+            &down_rat * &down_rat <= sq_rat,
+            "sqrt_down² must be ≤ sq_rat"
+        );
+        assert!(&up_rat * &up_rat >= sq_rat, "sqrt_up² must be ≥ sq_rat");
+        assert_eq!(
+            down.next_up(),
+            up,
+            "bracket must be adjacent: sqrt_down.next_up() == sqrt_up"
+        );
+    }
+
+    /// Regression (Correction 10-A): radicands straddling `MIN_POSITIVE`.
+    #[test]
+    fn sqrt_regression_around_min_positive() {
+        let min_pos = f64_to_rat(f64::MIN_POSITIVE);
+        let cases = [
+            rat_to_f64_down(&min_pos).next_down(), // just below MIN_POSITIVE
+            f64::MIN_POSITIVE,
+            f64::MIN_POSITIVE.next_up(),
+        ]
+        .map(f64_to_rat);
+        for sq_rat in cases {
+            let up = sqrt_up(&sq_rat).unwrap();
+            let down = sqrt_down(&sq_rat).unwrap();
+            let down_rat = f64_to_rat(down);
+            let up_rat = f64_to_rat(up);
+            assert!(
+                &down_rat * &down_rat <= sq_rat,
+                "sqrt_down² must be ≤ sq_rat"
+            );
+            assert!(&up_rat * &up_rat >= sq_rat, "sqrt_up² must be ≥ sq_rat");
+            assert!(
+                down == up || down.next_up() == up,
+                "bracket must be exact or adjacent, got down={down} up={up}"
+            );
+        }
+    }
+
+    /// Regression (Correction 10-A): root far below minsub.
+    ///
+    /// `sq_rat = minsub / 4` has true root `2^{-538}` which is itself a
+    /// subnormal f64; the exact path must bracket it adjacently.
+    #[test]
+    fn sqrt_regression_tiny_below_minsub() {
+        let minsub_rat = f64_to_rat(f64::from_bits(1));
+        let sq_rat = &minsub_rat / BigRational::from_integer(BigInt::from(4i64));
+        let up = sqrt_up(&sq_rat).unwrap();
+        let down = sqrt_down(&sq_rat).unwrap();
+        let down_rat = f64_to_rat(down);
+        let up_rat = f64_to_rat(up);
+        assert!(
+            &down_rat * &down_rat <= sq_rat,
+            "sqrt_down² must be ≤ sq_rat"
+        );
+        assert!(&up_rat * &up_rat >= sq_rat, "sqrt_up² must be ≥ sq_rat");
+        assert!(
+            down == up || down.next_up() == up,
+            "bracket must be exact or adjacent, got down={down} up={up}"
+        );
     }
 }

@@ -163,9 +163,9 @@ mod tests {
     /// Regression: uniform scale 1e-200.
     ///
     /// Column norm-squared = (1e-200)² = 1e-400, which is below f64 minsub.
-    /// The old sqrt_up fast path returned sqrt(minsub) ≈ 2.22e-162 instead of
+    /// The old `sqrt_up` fast path returned sqrt(minsub) ≈ 2.22e-162 instead of
     /// the tight result 1e-200, causing the transform to be classified with
-    /// the wrong scale.  With the BigInt isqrt fix, the exact scale is returned.
+    /// the wrong scale.  With the `BigInt` isqrt fix, the exact scale is returned.
     #[test]
     fn exact_similarity_accepts_tiny_scale() {
         let scale = 1.0e-200_f64;

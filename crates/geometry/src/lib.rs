@@ -23,10 +23,11 @@ pub use domain::{ParameterInterval, ParameterRange, ParameterRangeError, Surface
 pub use error::GeometryError;
 pub use evaluation::{
     AngularParameterBound, CertificationBudget, CurveEvaluation2, CurveEvaluation3,
-    CurveProjection2, CurveProjection3, DerivativeLimits, DerivativeOrder, DistanceBound,
-    EvaluationContext, FirstDerivativeBound, LinearParameterBound, ParameterErrorBound,
-    ParameterValue, PositionBound, ProjectionValueError, SecondDerivativeBound, SurfaceEvaluation,
-    SurfaceProjection,
+    CurveFirstDerivativeLimit, CurveProjection2, CurveProjection3, CurveSecondDerivativeLimit,
+    DerivativeLimits, DerivativeOrder, DistanceBound, EvaluationContext, FirstDerivativeBound,
+    LinearParameterBound, ParameterErrorBound, ParameterValue, PositionBound, ProjectionValueError,
+    SecondDerivativeBound, SurfaceDuLimit, SurfaceDuuLimit, SurfaceDuvLimit, SurfaceDvLimit,
+    SurfaceDvvLimit, SurfaceEvaluation, SurfaceProjection,
 };
 pub use id::{Curve2Id, Curve3Id, GeometryHandle, SurfaceId};
 pub use kind::{CurveKind, SurfaceKind};
