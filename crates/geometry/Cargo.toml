@@ -8,6 +8,10 @@ publish = false
 
 [dependencies]
 amphion-foundation = { path = "../foundation" }
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

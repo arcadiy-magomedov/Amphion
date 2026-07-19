@@ -10,6 +10,7 @@ publish = false
 amphion-foundation = { path = "../foundation" }
 amphion-geometry = { path = "../geometry" }
 amphion-topology = { path = "../topology" }
+serde.workspace = true
 
 [lints]
 workspace = true

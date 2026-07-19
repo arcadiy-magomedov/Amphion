@@ -61,8 +61,10 @@ The first milestone requires:
 - deep topology validation and permanent minimized regression cases;
 - no panics, silent healing, or mesh fallbacks.
 
-The complete dependency graph, agent ownership rules, and acceptance gates are
-in [EXECUTION_PLAN.md](EXECUTION_PLAN.md).
+The frozen kernel conventions are in [CONTRACTS.md](CONTRACTS.md). The kernel
+dependency graph, agent ownership rules, and acceptance gates are in
+[EXECUTION_PLAN.md](EXECUTION_PLAN.md). Human-visible milestones and the
+Fusion-familiar browser product contract are in [PRODUCT_PLAN.md](PRODUCT_PLAN.md).
 
 ## Quality strategy
 
