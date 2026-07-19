@@ -203,21 +203,32 @@ pub(super) fn sqrt_up(sq_rat: &BigRational) -> Result<f64, ()> {
     if sq_rat > &max_sq {
         return Ok(f64::INFINITY);
     }
+    // Fast host-sqrt path: only valid when sq_rat rounds to a strictly positive
+    // f64 both ways (i.e., it lies in the normal f64 range).  When
+    // rat_to_f64_down(sq_rat) == 0, the rational is below the smallest
+    // representable positive f64 (minsub ≈ 5e-324); in that case
+    // rat_to_f64_up overshoots to minsub and sqrt(minsub) ≈ 2^{-537} is
+    // wildly loose — e.g. sqrt_up(1e-400) would return ~2.22e-162 instead of
+    // the true ~1e-200.  Route subnormal-range radicands to the exact BigInt
+    // isqrt path for a tight, adjacent bound.
     if sq_rat <= &max {
-        let sq_hi = rat_to_f64_up(sq_rat);
-        if sq_hi == f64::INFINITY {
-            return Ok(f64::INFINITY);
+        let sq_lo = rat_to_f64_down(sq_rat);
+        if sq_lo > 0.0 {
+            let sq_hi = rat_to_f64_up(sq_rat);
+            let candidate = sq_hi.sqrt();
+            let candidate_rat = f64_to_rat(candidate);
+            let candidate_sq = &candidate_rat * &candidate_rat;
+            return Ok(if candidate_sq >= *sq_rat {
+                candidate
+            } else {
+                candidate.next_up()
+            });
         }
-        let candidate = sq_hi.sqrt();
-        let candidate_rat = f64_to_rat(candidate);
-        let candidate_sq = &candidate_rat * &candidate_rat;
-        return Ok(if candidate_sq >= *sq_rat {
-            candidate
-        } else {
-            candidate.next_up()
-        });
+        // sq_rat is in the subnormal/underflow range: fall through to BigInt isqrt.
     }
 
+    // BigInt isqrt path: handles both huge radicands (sq_rat > MAX) and
+    // subnormal-range radicands (rat_to_f64_down(sq_rat) == 0).
     let p = sq_rat.numer();
     let q = sq_rat.denom();
     let isqrt_p = bigint_isqrt(p);
@@ -250,21 +261,27 @@ pub(super) fn sqrt_down(sq_rat: &BigRational) -> Result<f64, ()> {
     if sq_rat > &max_sq {
         return Ok(f64::MAX);
     }
+    // Fast host-sqrt path: safe only when sq_rat rounds down to a positive f64.
+    // When sq_lo == 0, the rational is below the smallest positive f64; returning
+    // 0.0 is a valid lower bound but wildly loose for subnormal-range sq_rat.
+    // Route those through the exact BigInt isqrt path for a tight result.
     if sq_rat <= &max {
         let sq_lo = rat_to_f64_down(sq_rat);
-        if sq_lo <= 0.0_f64 {
-            return Ok(0.0_f64);
+        if sq_lo > 0.0 {
+            let candidate = sq_lo.sqrt();
+            let candidate_rat = f64_to_rat(candidate);
+            let candidate_sq = &candidate_rat * &candidate_rat;
+            return Ok(if candidate_sq <= *sq_rat {
+                candidate
+            } else {
+                candidate.next_down()
+            });
         }
-        let candidate = sq_lo.sqrt();
-        let candidate_rat = f64_to_rat(candidate);
-        let candidate_sq = &candidate_rat * &candidate_rat;
-        return Ok(if candidate_sq <= *sq_rat {
-            candidate
-        } else {
-            candidate.next_down()
-        });
+        // sq_rat is in the subnormal/underflow range: fall through to BigInt isqrt.
     }
 
+    // BigInt isqrt path: handles both huge radicands (sq_rat > MAX) and
+    // subnormal-range radicands (rat_to_f64_down(sq_rat) == 0).
     let p = sq_rat.numer();
     let q = sq_rat.denom();
     let isqrt_p = bigint_isqrt(p);
@@ -384,5 +401,75 @@ mod tests {
     fn sqrt_rejects_negative() {
         assert!(sqrt_up(&f64_to_rat(-1.0)).is_err());
         assert!(sqrt_down(&f64_to_rat(-1.0)).is_err());
+    }
+
+    /// Regression: subnormal-range radicand.
+    ///
+    /// sq_rat = (1e-200)² = 1e-400, which is below f64 minsub ≈ 5e-324.
+    /// True sqrt is 1e-200 (a normal f64). The fast host-sqrt path previously
+    /// returned sqrt(minsub) ≈ 2.22e-162 as `sqrt_up` — wildly too large.
+    /// With the BigInt isqrt path the result must bracket 1e-200 tightly.
+    #[test]
+    fn sqrt_tiny_radicand_subnormal_range() {
+        let base = f64_to_rat(1e-200_f64);
+        let sq_rat = &base * &base; // exact rational for (1e-200)²
+
+        let up = sqrt_up(&sq_rat).unwrap();
+        let down = sqrt_down(&sq_rat).unwrap();
+
+        // Both must bracket the true root.
+        assert!(
+            down <= 1e-200_f64,
+            "sqrt_down should be ≤ 1e-200, got {down}"
+        );
+        assert!(up >= 1e-200_f64, "sqrt_up should be ≥ 1e-200, got {up}");
+
+        // sqrt_up must NOT be the wrong fast-path result (sqrt(minsub) ≈ 2.22e-162).
+        // The wildly-wrong path returns a value ≈ 2.22e-162 >> 1e-200.
+        assert!(
+            up < 1e-160_f64,
+            "sqrt_up regressed to the loose minsub-sqrt path: {up}"
+        );
+
+        // Verify the corrected endpoints are each valid bounds.
+        let down_rat = f64_to_rat(down);
+        let up_rat = f64_to_rat(up);
+        let down_sq = &down_rat * &down_rat;
+        let up_sq = &up_rat * &up_rat;
+        assert!(down_sq <= sq_rat, "sqrt_down² must be ≤ sq_rat");
+        assert!(up_sq >= sq_rat, "sqrt_up² must be ≥ sq_rat");
+    }
+
+    /// Regression: minsub as radicand (subnormal root boundary).
+    ///
+    /// minsub = 2^{-1074}; sqrt(minsub) = 2^{-537} is representable as f64.
+    /// Both paths must return finite, tight bounds.
+    #[test]
+    fn sqrt_minsub_radicand() {
+        let minsub = f64::from_bits(1); // 2^{-1074}
+        let sq_rat = f64_to_rat(minsub);
+
+        let up = sqrt_up(&sq_rat).unwrap();
+        let down = sqrt_down(&sq_rat).unwrap();
+
+        let true_root = minsub.sqrt(); // 2^{-537}, finite normal f64
+        assert!(
+            down <= true_root,
+            "sqrt_down should be ≤ sqrt(minsub), got {down}"
+        );
+        assert!(
+            up >= true_root,
+            "sqrt_up should be ≥ sqrt(minsub), got {up}"
+        );
+        assert!(up.is_finite(), "sqrt_up(minsub) must be finite");
+        assert!(down >= 0.0, "sqrt_down(minsub) must be non-negative");
+    }
+
+    /// Regression: root-overflow — radicand > MAX² returns Inf / MAX.
+    #[test]
+    fn sqrt_root_overflow_inf() {
+        let sq_rat = BigRational::from_integer(BigInt::one() << 2200usize);
+        assert_eq!(sqrt_up(&sq_rat).unwrap(), f64::INFINITY);
+        assert_eq!(sqrt_down(&sq_rat).unwrap(), f64::MAX);
     }
 }

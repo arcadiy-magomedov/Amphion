@@ -159,4 +159,23 @@ mod tests {
         .unwrap();
         assert_eq!(similarity_scale(&transform), None);
     }
+
+    /// Regression: uniform scale 1e-200.
+    ///
+    /// Column norm-squared = (1e-200)² = 1e-400, which is below f64 minsub.
+    /// The old sqrt_up fast path returned sqrt(minsub) ≈ 2.22e-162 instead of
+    /// the tight result 1e-200, causing the transform to be classified with
+    /// the wrong scale.  With the BigInt isqrt fix, the exact scale is returned.
+    #[test]
+    fn exact_similarity_accepts_tiny_scale() {
+        let scale = 1.0e-200_f64;
+        let transform = Transform3::try_from_row_major([
+            scale, 0.0, 0.0, 0.0, //
+            0.0, scale, 0.0, 0.0, //
+            0.0, 0.0, scale, 0.0,
+        ])
+        .unwrap();
+        let result = similarity_scale(&transform);
+        assert_eq!(result, Some(scale), "scale should be exactly 1e-200");
+    }
 }

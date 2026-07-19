@@ -254,7 +254,7 @@ fn atan_rational_series(
     let threshold_denom = BigInt::one() << threshold_bits as usize;
 
     for k in 0..budget.series_terms {
-        let coeff_denom = BigInt::from(2 * k + 1) * &power_denom;
+        let coeff_denom = BigInt::from(2u64 * u64::from(k) + 1) * &power_denom;
         let term = BigRational::new(power_num.clone(), coeff_denom);
 
         if k % 2 == 0 {
@@ -270,7 +270,7 @@ fn atan_rational_series(
         // Next term magnitude: power_num / ((2k+3) * power_denom)
         // Compare with threshold = 1 / threshold_denom by cross-multiplication:
         // next < threshold iff power_num * threshold_denom < (2k+3) * power_denom
-        let next_coeff = BigInt::from(2 * k + 3);
+        let next_coeff = BigInt::from(2u64 * u64::from(k) + 3);
         let lhs = &power_num * &threshold_denom;
         let rhs = &next_coeff * &power_denom;
         if lhs < rhs {
@@ -466,11 +466,11 @@ fn taylor_alternating_series(
         if is_sin {
             // sin: term k → k+1: multiply x^(2k+1) by x^2, (2k+1)! by (2k+2)(2k+3)
             power = &power * &x2;
-            fact *= BigInt::from(2 * k + 2) * BigInt::from(2 * k + 3);
+            fact *= BigInt::from(2u64 * u64::from(k) + 2) * BigInt::from(2u64 * u64::from(k) + 3);
         } else {
             // cos: term k → k+1: multiply x^(2k) by x^2, (2k)! by (2k+1)(2k+2)
             power = &power * &x2;
-            fact *= BigInt::from(2 * k + 1) * BigInt::from(2 * k + 2);
+            fact *= BigInt::from(2u64 * u64::from(k) + 1) * BigInt::from(2u64 * u64::from(k) + 2);
         }
 
         // Convergence check: next_term = power_numer / (power_denom * fact).
@@ -795,5 +795,49 @@ mod tests {
         assert!(zero_point.contains_zero());
         let positive = super::RatInterval::point(BigRational::one());
         assert!(!positive.contains_zero());
+    }
+
+    /// Regression: u32 index overflow in trig series.
+    ///
+    /// With `series_terms = u32::MAX` and the old `2 * k + 1` (u32),
+    /// the multiplication would overflow in debug builds once k ≥ 2^31.
+    /// With the u64 cast the arithmetic is safe; the rational_bits budget
+    /// terminates the series before k reaches overflow-inducing values.
+    #[test]
+    fn trig_series_u32_max_terms_no_panic() {
+        // Large series_terms with small rational_bits to trigger early termination.
+        // This must not panic in either debug or release mode.
+        let budget = CertificationBudget {
+            series_terms: u32::MAX,
+            rational_bits: 256,
+        };
+        let x = f64_to_rat(1.0_f64);
+        // sin_cos_interval calls taylor_alternating_series which previously
+        // had 2*k+2, 2*k+3 (u32) index overflow.  With u64 cast it is safe.
+        let result = sin_cos_interval(&x, budget);
+        // May succeed (series converges before budget fires) or return
+        // BudgetExhausted; either is correct.  Must not panic.
+        assert!(
+            result.is_ok() || result == Err(TrigError::BudgetExhausted),
+            "unexpected error: {result:?}"
+        );
+    }
+
+    /// Regression: u32 index overflow in atan series.
+    ///
+    /// atan_rational_series had `2 * k + 1` (u32); same fix via u64 cast.
+    #[test]
+    fn atan_series_u32_max_terms_no_panic() {
+        let budget = CertificationBudget {
+            series_terms: u32::MAX,
+            rational_bits: 256,
+        };
+        let one = BigRational::one();
+        // atan2(1, 1) = pi/4; calls atan_rational_series.
+        let result = atan2_interval(&one, &one, budget);
+        assert!(
+            result.is_ok() || result == Err(TrigError::BudgetExhausted),
+            "unexpected error: {result:?}"
+        );
     }
 }
