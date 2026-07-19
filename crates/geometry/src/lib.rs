@@ -2,6 +2,14 @@
 //!
 //! Geometry remains canonical. Tessellation is a derived representation and is
 //! intentionally absent from these evaluator traits.
+//!
+//! # Analytic primitives
+//!
+//! The [`analytic`] module provides ready-to-use implementations of every
+//! primitive required for the first kernel milestone: lines, circles, planes,
+//! cylinders, and cones.
+
+pub mod analytic;
 
 mod domain;
 mod error;
@@ -10,6 +18,7 @@ mod id;
 mod kind;
 mod traits;
 
+pub use analytic::{Circle2, Circle3, Cone, ConstructionError, Cylinder, Line2, Line3, Plane};
 pub use domain::{ParameterInterval, ParameterRange, ParameterRangeError, SurfaceDomain};
 pub use error::GeometryError;
 pub use evaluation::{
