@@ -17,9 +17,10 @@ The long-term parity target includes the complete Fusion-class workflow:
 - electronics and PCB workflows;
 - scripting, extensions, data management, versions, and collaboration.
 
-The capability inventory is a product contract, not a claim that all domains
-will ship in the first release. Each capability must have an explicit
-dependency graph, delivery milestone, platform status, and acceptance tests.
+The versioned [capability inventory](CAPABILITY_INVENTORY.md) is a product
+contract, not a claim that all domains will ship in the first release. Each
+capability must have an explicit dependency graph, delivery milestone,
+platform status, and acceptance tests.
 
 ## Clean-room Fusion familiarity
 
@@ -312,4 +313,3 @@ Targets for a parity milestone:
 - Camera and input systems are independent of modeling commands.
 - The same behavioral conformance suite applies to every future client.
 - Product UI code and the headless kernel remain separately replaceable.
-
