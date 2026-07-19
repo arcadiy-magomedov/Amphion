@@ -8,7 +8,10 @@ CAD applications. Analytic geometry and B-Rep topology are canonical; triangle
 meshes are derived data used only for rendering and interchange formats that
 require them.
 
-> **Status:** architecture bootstrap. No modeling API is usable yet.
+> **Status:** kernel foundations, topology, QA infrastructure, and the STEP
+> subset contract are integrated. Analytic Geometry is still under proof-level
+> review, so no modeling API is usable yet. See
+> [DEVELOPMENT_STATUS.md](DEVELOPMENT_STATUS.md) for the current handoff.
 
 ## Design goals
 
