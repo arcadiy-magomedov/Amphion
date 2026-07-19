@@ -5,46 +5,58 @@
 //! types, call [`crate::GeometryError`]-returning helpers from the parent
 //! module.
 //!
-//! # Certified distance bounds
+//! # Provisional distance bounds
 //!
-//! `certified_distance_bound2` and `certified_distance_bound3` derive a
-//! certified upper bound on the true geometric distance from a query point
-//! to a projected surface/curve point, accounting for accumulated
-//! floating-point rounding.
+//! `projection_distance_bound2` and `projection_distance_bound3` derive an
+//! upper bound on the true geometric distance from a query point to a
+//! projected surface/curve point, accounting for accumulated floating-point
+//! rounding.
 //!
-//! ## Error analysis (Higham 2002)
+//! ## What the bound covers
 //!
-//! We use the standard model (Higham, *Accuracy and Stability of Numerical
-//! Algorithms*, 2nd ed., SIAM 2002, §2.2): for any elementary floating-point
-//! operation `fl(a ⊕ b) = (a ⊕ b)(1 + δ)` with `|δ| ≤ u = ε/2`.
+//! The bound is `residual + fp_err`, where `residual` is the naively
+//! computed Euclidean distance between `query` and `projection`, and
+//! `fp_err = C · ε · s_world` is a heuristic allowance for rounding error
+//! accumulated while producing `projection` from `query`.
 //!
-//! For an inner product of two 3-vectors, Higham Theorem 3.5 gives
-//! `|fl(aᵀb) − aᵀb| ≤ γ₃|a||b|` where `γₙ = nε/(1−nε) ≤ 2nε`.
+//! The scale `s_world = |query| + |projection|` is deliberately a
+//! **world-coordinate** magnitude, not a translation-invariant local
+//! displacement.  A local scale such as `|query − anchor|` can be far smaller
+//! than the magnitudes actually manipulated during projection (e.g. when a
+//! circle has a huge radius but the query happens to land near the anchor),
+//! which silently discards the rounding error accumulated in the large
+//! intermediate coordinates and can produce a bound that is *below* the true
+//! distance. `s_world` bounds every intermediate magnitude the projection
+//! arithmetic can plausibly produce, so `fp_err` is a valid allowance for the
+//! rounding accumulated while computing `projection` regardless of where the
+//! query sits relative to the primitive's anchor.
 //!
-//! A projection computation involves `≤ 64` elementary operations (dot
-//! products, additions, trig calls count as a single correctly-rounded op by
-//! IEEE 754). Using `n = 64` and `γ₆₄ ≤ 128ε`:
+//! `C = 64` is a **heuristic** constant intended to loosely cover a chain of
+//! `~32` elementary floating-point operations (dot products, additions,
+//! subtractions) plus a `2×` margin for the non-elementary trigonometric
+//! calls (`sin`, `cos`, `atan2`) used by curved primitives. This is
+//! **provisional**: it is not a formally derived certificate. In particular,
+//! IEEE 754-2019 only *recommends* (does not require) correctly-rounded
+//! transcendental functions, so no portable bound on `sin`/`cos`/`atan2`
+//! error can be assumed; and general elementary-operation error models (e.g.
+//! Higham, *Accuracy and Stability of Numerical Algorithms*, 2nd ed., SIAM
+//! 2002, §2.2) do not by themselves bound trigonometric or square-root
+//! operations. Formal certification requires interval arithmetic over the
+//! actual operation sequence, which is not yet available in this crate.
 //!
-//! ```text
-//! |bound_computed − actual_distance| ≤ 128ε · s_local
-//! ```
+//! **Rejection criterion**: if `fp_err > effective_length(s_world)`, the
+//! heuristic numerical error allowance exceeds the caller's tolerance at this
+//! scale, and we return `GeometryError::Uncertified` rather than assert a
+//! bound we cannot support.
 //!
-//! where `s_local = |query − anchor|` is the **translation-invariant** local
-//! displacement from the primitive's anchor (origin/center/apex), avoiding
-//! world-origin inflation that would arise from using `|query| + |proj|`.
+//! ## Foundation dependency
 //!
-//! **Rejection criterion**: if `128ε · s_local > effective_length(s_local)`,
-//! the numerical error exceeds the caller's tolerance, and we return
-//! `GeometryError::Uncertified`.  For typical tolerances (absolute 1e-9,
-//! relative 1e-8) this triggers only when `s_local ≫ 1/(128ε·relative) ≈ 4e13`,
-//! i.e., astronomical coordinate scales.
-//!
-//! ## Foundation API gap
-//!
-//! Interval arithmetic primitives (`UnitVector2/3`, checked norms, tight
-//! interval residuals) would tighten these bounds and remove the constant-64
-//! conservatism.  Until `amphion-foundation` exposes such types, this module
-//! duplicates their logic locally.
+//! Commit `cf85555` (not yet merged onto this branch) adds `UnitVector2/3`,
+//! `Interval`, checked vector norms, and `Transform3` point/vector
+//! application to `amphion-foundation`. Once available, this module's
+//! heuristic bound should be replaced by a formally certified interval-based
+//! bound derived from the actual operation sequence, and this doc comment
+//! should be updated accordingly.
 
 use amphion_foundation::ToleranceContext;
 
@@ -53,9 +65,12 @@ use crate::{GeometryError, ParameterRange};
 use super::ConstructionError;
 
 /// Serde validation tolerance: accept vectors whose squared-norm differs from
-/// 1 by at most `8ε`.  This passes honest round-tripped values (which have
-/// `||v||² − 1| ≤ 2ε`) while rejecting clearly non-unit vectors.
-pub(super) const UNIT_VECTOR_TOL: f64 = 8.0 * f64::EPSILON;
+/// 1 by at most `4ε`, matching the magnitude-deviation guarantee of the
+/// `UnitVector2`/`UnitVector3` types introduced in foundation commit
+/// `cf85555`. Honest round-tripped values produced by this module's own
+/// normalization have `||v||² − 1| ≤ 2ε`, so they pass with a `2×` margin;
+/// clearly corrupted or hand-crafted non-unit vectors are rejected.
+pub(super) const UNIT_VECTOR_TOL: f64 = 4.0 * f64::EPSILON;
 
 /// Ill-conditioning threshold for Gram-Schmidt orthogonalization.  If the
 /// component of the supplied x-axis perpendicular to the main axis has
@@ -64,10 +79,10 @@ pub(super) const UNIT_VECTOR_TOL: f64 = 8.0 * f64::EPSILON;
 /// would be unreliable.
 pub(super) const ILL_COND_THRESH: f64 = 2.384_185_791_015_625e-7;
 
-/// Conservative FP-operation count used in `certified_distance_bound*`.
-/// Covers all projection types at `n ≤ 64` elementary operations.
-/// See module-level documentation for the derivation.
-const C_FP: f64 = 128.0;
+/// Heuristic FP-error constant used in `projection_distance_bound*`.
+/// See module-level documentation for what this covers and its provisional
+/// status.
+const C_FP: f64 = 64.0;
 
 // ─── 3-D helpers ────────────────────────────────────────────────────────────
 
@@ -247,32 +262,34 @@ pub(super) fn validate_orthogonal3(a: [f64; 3], b: [f64; 3]) -> Result<(), Const
     Ok(())
 }
 
-/// Returns a certified upper bound on `|query − projection|` for a 2-D
-/// projection, and checks that the floating-point error certificate fits
-/// within `tolerance`.
+/// Returns a provisional upper bound on `|query − projection|` for a 2-D
+/// projection, and checks that the heuristic floating-point error allowance
+/// fits within `tolerance`.
 ///
-/// `anchor` is a translation-invariant reference point of the primitive
-/// (e.g. circle center).  The characteristic scale `s_local = |query − anchor|`
-/// avoids world-origin inflation.
+/// The characteristic scale `s_world = |query| + |projection|` is a
+/// world-coordinate magnitude (not translation-invariant); see the
+/// module-level documentation for why this is required for the bound to be
+/// valid at all coordinate scales.
 ///
 /// # Errors
 ///
-/// Returns [`GeometryError::Uncertified`] if the FP error bound exceeds
-/// `tolerance.effective_length(s_local)`.
-pub(super) fn certified_distance_bound2(
-    anchor: [f64; 2],
+/// Returns [`GeometryError::Uncertified`] if the heuristic FP error allowance
+/// exceeds `tolerance.effective_length(s_world)`, i.e. the primitive's scale
+/// is too large relative to the requested tolerance for this provisional
+/// bound to be trustworthy.
+pub(super) fn projection_distance_bound2(
     query: [f64; 2],
     projection: [f64; 2],
     tolerance: &ToleranceContext,
 ) -> Result<f64, GeometryError> {
-    let s_local = mag2(sub2(query, anchor));
+    let s_world = mag2(query) + mag2(projection);
     let residual = mag2(sub2(query, projection));
-    let fp_err = C_FP * f64::EPSILON * s_local;
+    let fp_err = C_FP * f64::EPSILON * s_world;
     let bound = residual + fp_err;
     let eff_tol = tolerance
-        .effective_length(s_local)
+        .effective_length(s_world)
         .map_err(|_| GeometryError::Uncertified {
-            reason: "invalid local scale for certification".to_owned(),
+            reason: "invalid world scale for certification".to_owned(),
         })?;
     if fp_err > eff_tol {
         return Err(GeometryError::Uncertified {
@@ -283,22 +300,21 @@ pub(super) fn certified_distance_bound2(
     Ok(bound)
 }
 
-/// Returns a certified upper bound on `|query − projection|` for a 3-D
-/// projection.  See [`certified_distance_bound2`] for the derivation.
-pub(super) fn certified_distance_bound3(
-    anchor: [f64; 3],
+/// Returns a provisional upper bound on `|query − projection|` for a 3-D
+/// projection.  See [`projection_distance_bound2`] for the derivation.
+pub(super) fn projection_distance_bound3(
     query: [f64; 3],
     projection: [f64; 3],
     tolerance: &ToleranceContext,
 ) -> Result<f64, GeometryError> {
-    let s_local = mag3(sub3(query, anchor));
+    let s_world = mag3(query) + mag3(projection);
     let residual = mag3(sub3(query, projection));
-    let fp_err = C_FP * f64::EPSILON * s_local;
+    let fp_err = C_FP * f64::EPSILON * s_world;
     let bound = residual + fp_err;
     let eff_tol = tolerance
-        .effective_length(s_local)
+        .effective_length(s_world)
         .map_err(|_| GeometryError::Uncertified {
-            reason: "invalid local scale for certification".to_owned(),
+            reason: "invalid world scale for certification".to_owned(),
         })?;
     if fp_err > eff_tol {
         return Err(GeometryError::Uncertified {
@@ -336,7 +352,11 @@ pub(super) fn certify_h_sign(h: f64, d_mag: f64) -> Option<core::cmp::Ordering> 
 mod tests {
     use std::f64::consts::{PI, TAU};
 
-    use super::{angle_to_full_turn, mag2, mag3, normalize2, normalize3};
+    use super::{
+        UNIT_VECTOR_TOL, angle_to_full_turn, mag2, mag3, normalize2, normalize3, validate_unit2,
+        validate_unit3,
+    };
+    use crate::analytic::ConstructionError;
 
     #[test]
     fn angle_to_full_turn_preserves_tiny_positive_angles() {
@@ -387,5 +407,39 @@ mod tests {
         let unit_small = normalize2([f64::MIN_POSITIVE, f64::MIN_POSITIVE]).unwrap();
         assert!((mag2(unit_large) - 1.0).abs() < 1e-15);
         assert!((mag2(unit_small) - 1.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn unit_vector_tol_rejects_vector_deviating_by_more_than_4eps() {
+        // v = 1.0 + 4*eps is 4 ULPs away from 1.0 on the f64 grid near 1.0
+        // (grid spacing there is exactly `eps`), so this is exact, not a
+        // rounding artefact of the decimal literal.
+        let eps = f64::EPSILON;
+        let v = 1.0 + 4.0 * eps;
+        let deviation = (v * v - 1.0).abs();
+        assert!(
+            deviation > UNIT_VECTOR_TOL,
+            "test fixture must exceed the tightened 4ε tolerance: deviation={deviation:e}, \
+             tol={UNIT_VECTOR_TOL:e}"
+        );
+        assert_eq!(
+            validate_unit2([v, 0.0]),
+            Err(ConstructionError::DegenerateAxis)
+        );
+        assert_eq!(
+            validate_unit3([v, 0.0, 0.0]),
+            Err(ConstructionError::DegenerateAxis)
+        );
+    }
+
+    #[test]
+    fn unit_vector_tol_accepts_normalize_round_trip_with_2x_margin() {
+        // This module's own normalization guarantees `||v||² − 1| ≤ 2ε`, so
+        // round-tripped unit vectors must pass the tightened 4ε tolerance
+        // with a 2× margin.
+        let v2 = normalize2([3.0, 4.0]).unwrap();
+        assert!(validate_unit2(v2).is_ok());
+        let v3 = normalize3([1.0, 2.0, 2.0]).unwrap();
+        assert!(validate_unit3(v3).is_ok());
     }
 }

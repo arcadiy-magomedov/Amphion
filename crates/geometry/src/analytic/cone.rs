@@ -42,7 +42,7 @@
 
 use std::f64::consts::{PI, TAU};
 
-use amphion_foundation::{Point3, ToleranceContext, Vector3};
+use amphion_foundation::{Point3, ToleranceContext, Transform3, Vector3};
 use serde::{Deserialize, Serialize};
 
 use crate::traits::SurfaceEvaluator;
@@ -52,22 +52,28 @@ use crate::{
 };
 
 use super::{
-    ConstructionError,
+    ConstructionError, TransformError,
     helpers::{
-        ILL_COND_THRESH, add3, all_finite3, angle_to_full_turn, certified_distance_bound3,
-        certify_h_sign, cross3, dot3, in_range, mag3, normalize3, scale3, sub3,
-        validate_orthogonal3, validate_unit3,
+        ILL_COND_THRESH, add3, all_finite3, angle_to_full_turn, certify_h_sign, cross3, dot3,
+        in_range, mag3, normalize3, projection_distance_bound3, scale3, sub3, validate_orthogonal3,
+        validate_unit3,
     },
+    transform::{apply_to_point, apply_to_vector, similarity_scale},
 };
 
 fn angular_range() -> ParameterRange {
+    // (0.0, TAU, TAU) is a compile-time constant with lo < hi; this is not
+    // an input-dependent path, so a static-invariant `expect` is acceptable
+    // here (see CONTRACTS.md).
     ParameterRange::try_new(Some(0.0), Some(TAU), Some(TAU))
-        .unwrap_or_else(|_| unreachable!("angular [0, 2π) domain is always valid"))
+        .expect("angular [0, 2π) domain is always valid")
 }
 
 fn unbounded_range() -> ParameterRange {
-    ParameterRange::try_new(None, None, None)
-        .unwrap_or_else(|_| unreachable!("unbounded domain is always valid"))
+    // (None, None, None) is a compile-time constant and always valid; this
+    // is not an input-dependent path, so a static-invariant `expect` is
+    // acceptable here (see CONTRACTS.md).
+    ParameterRange::try_new(None, None, None).expect("unbounded domain is always valid")
 }
 
 #[derive(Serialize, Deserialize)]
@@ -92,6 +98,7 @@ pub struct Cone {
     axis: Vector3,
     half_angle: f64,
     x_axis: Vector3,
+    y_axis: Vector3,
 }
 
 impl Cone {
@@ -136,6 +143,7 @@ impl Cone {
             return Err(ConstructionError::IllConditionedAxes);
         }
         let x_unit = normalize3(x_perp).ok_or(ConstructionError::DependentAxes)?;
+        let y_arr = cross3(a_unit, x_unit);
         Ok(Self {
             apex: Point3::try_new(ap[0], ap[1], ap[2])
                 .map_err(|_| ConstructionError::NonFiniteInput)?,
@@ -143,6 +151,8 @@ impl Cone {
                 .map_err(|_| ConstructionError::NonFiniteInput)?,
             half_angle,
             x_axis: Vector3::try_new(x_unit[0], x_unit[1], x_unit[2])
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
+            y_axis: Vector3::try_new(y_arr[0], y_arr[1], y_arr[2])
                 .map_err(|_| ConstructionError::NonFiniteInput)?,
         })
     }
@@ -174,12 +184,45 @@ impl Cone {
     /// Returns the unit y-axis: `axis × x_axis`.
     #[must_use]
     pub fn y_axis(&self) -> Vector3 {
-        let a = self.axis.into_array();
-        let x = self.x_axis.into_array();
-        let y = cross3(a, x);
-        Vector3::try_new(y[0], y[1], y[2]).unwrap_or_else(|_| {
-            unreachable!("cross product of stored orthonormal pair is always a unit vector")
-        })
+        self.y_axis
+    }
+
+    /// Applies a similarity `transform` (rigid motion plus uniform scale, no
+    /// reflection) to this cone, returning a new cone with the same
+    /// `half_angle` (an angle is invariant under a similarity transform).
+    ///
+    /// A general affine transform does not map a circular cone to a
+    /// circular cone, so only similarity transforms are accepted; see the
+    /// `transform` module documentation for the (provisional, heuristic)
+    /// similarity test.
+    ///
+    /// # Errors
+    ///
+    /// - [`TransformError::NotSimilarity`] — the transform's linear part is
+    ///   not (within tolerance) a uniform-scale rotation
+    /// - [`TransformError::NonFiniteResult`] — the transformed apex or axes
+    ///   contain a non-finite component
+    /// - [`TransformError::DegenerateResult`] — the transformed axes fail
+    ///   cone construction
+    pub fn try_transform(&self, transform: &Transform3) -> Result<Self, TransformError> {
+        let m = transform.into_row_major();
+        // The scale factor itself is irrelevant to a cone (half_angle and
+        // the apex-relative direction fully determine its shape); only its
+        // existence certifies that `transform` is a similarity.
+        similarity_scale(m).ok_or(TransformError::NotSimilarity)?;
+        let ap =
+            apply_to_point(m, self.apex.into_array()).ok_or(TransformError::NonFiniteResult)?;
+        let a =
+            apply_to_vector(m, self.axis.into_array()).ok_or(TransformError::NonFiniteResult)?;
+        let x =
+            apply_to_vector(m, self.x_axis.into_array()).ok_or(TransformError::NonFiniteResult)?;
+        Self::try_new(
+            Point3::try_new(ap[0], ap[1], ap[2]).map_err(|_| TransformError::NonFiniteResult)?,
+            Vector3::try_new(a[0], a[1], a[2]).map_err(|_| TransformError::NonFiniteResult)?,
+            self.half_angle,
+            Vector3::try_new(x[0], x[1], x[2]).map_err(|_| TransformError::NonFiniteResult)?,
+        )
+        .map_err(|_| TransformError::DegenerateResult)
     }
 }
 
@@ -202,11 +245,14 @@ impl TryFrom<ConeRepr> for Cone {
         validate_unit3(axis)?;
         validate_unit3(x_axis)?;
         validate_orthogonal3(axis, x_axis)?;
+        let y_arr = cross3(axis, x_axis);
         Ok(Self {
             apex: repr.apex,
             axis: repr.axis,
             half_angle: repr.half_angle,
             x_axis: repr.x_axis,
+            y_axis: Vector3::try_new(y_arr[0], y_arr[1], y_arr[2])
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
         })
     }
 }
@@ -250,7 +296,7 @@ impl SurfaceEvaluator for Cone {
         let ap = self.apex.into_array();
         let a = self.axis.into_array();
         let x = self.x_axis.into_array();
-        let y = cross3(a, x);
+        let y = self.y_axis.into_array();
         let tan_a = self.half_angle.tan();
         let (cos_u, sin_u) = (u.cos(), u.sin());
 
@@ -311,7 +357,10 @@ impl SurfaceEvaluator for Cone {
                         reason: "cone duv non-finite".to_owned(),
                     }
                 })?;
-                let zero = Vector3::try_new(0.0, 0.0, 0.0).expect("zero is finite");
+                let zero =
+                    Vector3::try_new(0.0, 0.0, 0.0).map_err(|_| GeometryError::Uncertified {
+                        reason: "zero vector construction failed unexpectedly".to_owned(),
+                    })?;
                 (Some(du), Some(dv), Some(duu), Some(duv), Some(zero))
             }
         };
@@ -336,7 +385,7 @@ impl SurfaceEvaluator for Cone {
         let ap = self.apex.into_array();
         let a = self.axis.into_array();
         let x = self.x_axis.into_array();
-        let y = cross3(a, x);
+        let y = self.y_axis.into_array();
         let alpha = self.half_angle;
         let (cos_a, sin_a) = (alpha.cos(), alpha.sin());
 
@@ -381,7 +430,7 @@ impl SurfaceEvaluator for Cone {
                     reason: "cone projection point is non-finite".to_owned(),
                 }
             })?;
-            let dist = certified_distance_bound3(ap, q, proj_arr, tolerance)?;
+            let dist = projection_distance_bound3(q, proj_arr, tolerance)?;
             Ok(SurfaceProjection {
                 u: ParameterValue::try_new(u_proj).map_err(|_| GeometryError::Uncertified {
                     reason: "cone u is non-finite".to_owned(),
@@ -409,12 +458,26 @@ impl SurfaceEvaluator for Cone {
                 match certify_h_sign(h, d_mag) {
                     Some(core::cmp::Ordering::Greater) => [Some(cand1), None],
                     Some(core::cmp::Ordering::Less) => [None, Some(cand2)],
-                    Some(core::cmp::Ordering::Equal) | None => {
-                        // Equatorial plane or numerically ambiguous: return both.
-                        // certify_h_sign returning None means the sign cannot be
-                        // certified; rather than returning Uncertified (which would
-                        // suppress valid projections), we conservatively include both.
+                    Some(core::cmp::Ordering::Equal) => {
+                        // Exactly on the equatorial plane (h == 0.0): the two
+                        // nappes are genuinely equidistant, not merely
+                        // numerically ambiguous. Returning both is correct.
                         [Some(cand1), Some(cand2)]
+                    }
+                    None => {
+                        // `None` means the axial coordinate's sign cannot be
+                        // certified against the floating-point error bound —
+                        // it is NOT the same as "tied". Returning both
+                        // candidates here would silently report a spurious
+                        // second projection whenever the true minimum could
+                        // not be established. Report Uncertified instead;
+                        // formal disambiguation requires interval arithmetic
+                        // (see cf85555).
+                        return Err(GeometryError::Uncertified {
+                            reason: "axial coordinate is within FP error bound; cannot certify \
+                                     global minimum without interval arithmetic (cf85555)"
+                                .to_owned(),
+                        });
                     }
                 }
             }
@@ -423,23 +486,25 @@ impl SurfaceEvaluator for Cone {
             (false, false) => return Err(GeometryError::Singular),
         };
 
-        // Collect valid candidates onto a fixed-size stack, sort, then push atomically.
-        let mut sorted: [Option<SurfaceProjection>; 2] = [None, None];
-        let mut count = 0;
-        for c in candidates.into_iter().flatten() {
-            sorted[count] = Some(c);
-            count += 1;
-        }
-        sorted[..count].sort_by(|a_opt, b_opt| {
-            let a_c = a_opt.as_ref().unwrap();
-            let b_c = b_opt.as_ref().unwrap();
-            a_c.u
-                .get()
-                .total_cmp(&b_c.u.get())
-                .then(a_c.v.get().total_cmp(&b_c.v.get()))
-        });
-        for opt in &sorted[..count] {
-            output.push(*opt.as_ref().unwrap());
+        // Push valid candidates in a stable, deterministic order (sorted by
+        // `u` then `v`) without unwrapping the `Option` slots: exhaustive
+        // pattern matching over the fixed 2-element array statically proves
+        // there is nothing to unwrap.
+        match candidates {
+            [Some(c1), Some(c2)] => {
+                let key = |c: &SurfaceProjection| (c.u.get(), c.v.get());
+                let (ku1, kv1) = key(&c1);
+                let (ku2, kv2) = key(&c2);
+                if ku1.total_cmp(&ku2).then(kv1.total_cmp(&kv2)) == core::cmp::Ordering::Greater {
+                    output.push(c2);
+                    output.push(c1);
+                } else {
+                    output.push(c1);
+                    output.push(c2);
+                }
+            }
+            [Some(c), None] | [None, Some(c)] => output.push(c),
+            [None, None] => {}
         }
         Ok(())
     }
@@ -934,13 +999,18 @@ mod tests {
             "equatorial h=0 must return both nappes"
         );
 
-        // Below FP threshold: h = 1e-300 < 8ε·d_mag ≈ 1.8e-15 → certify_h_sign = None → both.
+        // Below FP threshold: h = 1e-300 < 8ε·d_mag ≈ 1.8e-15 → certify_h_sign = None →
+        // cannot certify which nappe is the global minimum, so the projection is
+        // Uncertified rather than silently returning both (or one) candidate.
         let q_tiny = Point3::try_new(1.0, 0.0, 1e-300).unwrap();
-        let projs_tiny = c.project(q_tiny, &tol()).unwrap();
         assert_eq!(
-            projs_tiny.len(),
-            2,
-            "sub-threshold h should return both nappes"
+            c.project(q_tiny, &tol()),
+            Err(GeometryError::Uncertified {
+                reason: "axial coordinate is within FP error bound; cannot certify \
+                         global minimum without interval arithmetic (cf85555)"
+                    .to_owned(),
+            }),
+            "sub-threshold h must be reported as Uncertified, not both/either nappe"
         );
 
         // Certified positive h: h = 1e-12 >> 8ε·d_mag ≈ 1.8e-15 → only nappe 1 returned.
@@ -1040,5 +1110,47 @@ mod tests {
             r#"{"apex":[0.0,0.0,0.0],"axis":[Infinity,0.0,1.0],"half_angle":0.5,"x_axis":[1.0,0.0,0.0]}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn cone_try_transform_identity_is_noop() {
+        let c = std_cone();
+        let out = c
+            .try_transform(&amphion_foundation::Transform3::IDENTITY)
+            .unwrap();
+        assert_eq!(out, c);
+    }
+
+    #[test]
+    fn cone_try_transform_similarity_preserves_half_angle() {
+        // Rotation by 90° about Z, uniform scale 2, plus translation.
+        let m = [
+            0.0, -2.0, 0.0, 5.0, //
+            2.0, 0.0, 0.0, -3.0, //
+            0.0, 0.0, 2.0, 7.0,
+        ];
+        let t = amphion_foundation::Transform3::try_from_row_major(m).unwrap();
+        let c = std_cone();
+        let out = c.try_transform(&t).unwrap();
+        assert!((out.half_angle() - FRAC_PI_4).abs() < 1e-9);
+        let [ax, ay, az] = out.apex().into_array();
+        assert!((ax - 5.0).abs() < 1e-9);
+        assert!((ay - (-3.0)).abs() < 1e-9);
+        assert!((az - 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cone_try_transform_rejects_non_similarity() {
+        let m = [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 2.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0,
+        ];
+        let t = amphion_foundation::Transform3::try_from_row_major(m).unwrap();
+        let c = std_cone();
+        assert_eq!(
+            c.try_transform(&t),
+            Err(super::TransformError::NotSimilarity)
+        );
     }
 }

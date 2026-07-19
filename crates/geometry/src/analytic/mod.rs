@@ -15,9 +15,18 @@
 //! | [`Plane`] | plane | `p(u,v) = origin + u·u_axis + v·v_axis`, `u,v ∈ ℝ` |
 //! | [`Cylinder`] | cylinder | `p(u,v) = axis_origin + v·axis + r·radial(u)`, `u ∈ [0,2π)`, `v ∈ ℝ` |
 //! | [`Cone`] | cone | `p(u,v) = apex + v·axis + v·tan α·radial(u)`, `u ∈ [0,2π)`, `v ∈ ℝ` |
+//!
+//! # Transforms
+//!
+//! `Line3`, `Plane`, `Circle3`, `Cylinder`, and `Cone` support checked
+//! transformation via `try_transform` (see [`TransformError`] for the error
+//! set and each type's `try_transform` docs for the exact required transform
+//! class). `Line2` and `Circle2` are not yet supported: the current
+//! foundation has no 2-D transform type.
 
 mod error;
 mod helpers;
+mod transform;
 
 pub mod circle;
 pub mod cone;
@@ -31,3 +40,4 @@ pub use cylinder::Cylinder;
 pub use error::ConstructionError;
 pub use line::{Line2, Line3};
 pub use plane::Plane;
+pub use transform::TransformError;

@@ -30,7 +30,7 @@
 
 use std::f64::consts::TAU;
 
-use amphion_foundation::{Point2, Point3, ToleranceContext, Vector2, Vector3};
+use amphion_foundation::{Point2, Point3, ToleranceContext, Transform3, Vector2, Vector3};
 use serde::{Deserialize, Serialize};
 
 use crate::traits::{Curve2Evaluator, Curve3Evaluator};
@@ -40,18 +40,22 @@ use crate::{
 };
 
 use super::{
-    ConstructionError,
+    ConstructionError, TransformError,
     helpers::{
-        ILL_COND_THRESH, add2, add3, all_finite2, all_finite3, angle_to_full_turn,
-        certified_distance_bound2, certified_distance_bound3, cross3, dot2, dot3, in_range, mag2,
-        mag3, normalize2, normalize3, perp2, scale2, scale3, sub2, sub3, validate_orthogonal3,
+        ILL_COND_THRESH, add2, add3, all_finite2, all_finite3, angle_to_full_turn, cross3, dot2,
+        dot3, in_range, mag2, mag3, normalize2, normalize3, perp2, projection_distance_bound2,
+        projection_distance_bound3, scale2, scale3, sub2, sub3, validate_orthogonal3,
         validate_unit2, validate_unit3,
     },
+    transform::{apply_to_point, apply_to_vector, similarity_scale},
 };
 
 fn circle_domain() -> ParameterRange {
+    // (0.0, TAU, TAU) is a compile-time constant with lo < hi; this is not
+    // an input-dependent path, so a static-invariant `expect` is acceptable
+    // here (see CONTRACTS.md).
     ParameterRange::try_new(Some(0.0), Some(TAU), Some(TAU))
-        .unwrap_or_else(|_| unreachable!("circle domain [0, 2π) is always valid"))
+        .expect("circle domain [0, 2π) is always valid")
 }
 
 // ─── Circle2 ─────────────────────────────────────────────────────────────────
@@ -73,6 +77,7 @@ pub struct Circle2 {
     center: Point2,
     radius: f64,
     x_axis: Vector2,
+    y_axis: Vector2,
 }
 
 impl Circle2 {
@@ -99,10 +104,13 @@ impl Circle2 {
             return Err(ConstructionError::NotPositive);
         }
         let x_unit = normalize2(x).ok_or(ConstructionError::DegenerateAxis)?;
+        let y_arr = perp2(x_unit);
         Ok(Self {
             center: Point2::try_new(c[0], c[1]).map_err(|_| ConstructionError::NonFiniteInput)?,
             radius,
             x_axis: Vector2::try_new(x_unit[0], x_unit[1])
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
+            y_axis: Vector2::try_new(y_arr[0], y_arr[1])
                 .map_err(|_| ConstructionError::NonFiniteInput)?,
         })
     }
@@ -128,10 +136,7 @@ impl Circle2 {
     /// Returns the unit y-axis (90° CCW rotation of `x_axis`).
     #[must_use]
     pub fn y_axis(&self) -> Vector2 {
-        let x = self.x_axis.into_array();
-        let y = perp2(x);
-        Vector2::try_new(y[0], y[1])
-            .unwrap_or_else(|_| unreachable!("perp of stored unit vector is always a unit vector"))
+        self.y_axis
     }
 }
 
@@ -147,10 +152,13 @@ impl TryFrom<Circle2Repr> for Circle2 {
             return Err(ConstructionError::NotPositive);
         }
         validate_unit2(x_axis)?;
+        let y_arr = perp2(x_axis);
         Ok(Self {
             center: repr.center,
             radius: repr.radius,
             x_axis: repr.x_axis,
+            y_axis: Vector2::try_new(y_arr[0], y_arr[1])
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
         })
     }
 }
@@ -187,7 +195,7 @@ impl Curve2Evaluator for Circle2 {
         }
         let c = self.center.into_array();
         let x = self.x_axis.into_array();
-        let y = perp2(x);
+        let y = self.y_axis.into_array();
         let r = self.radius;
         let (cos_t, sin_t) = (parameter.cos(), parameter.sin());
 
@@ -237,7 +245,7 @@ impl Curve2Evaluator for Circle2 {
         let q = point.into_array();
         let c = self.center.into_array();
         let x = self.x_axis.into_array();
-        let y = perp2(x);
+        let y = self.y_axis.into_array();
         let r = self.radius;
         let diff = sub2(q, c);
         let s_local = mag2(diff);
@@ -259,8 +267,8 @@ impl Curve2Evaluator for Circle2 {
                 reason: "circle projection parameter is non-finite".to_owned(),
             })?,
             point: proj,
-            distance_bound: DistanceBound::try_new(certified_distance_bound2(
-                c, q, proj_arr, tolerance,
+            distance_bound: DistanceBound::try_new(projection_distance_bound2(
+                q, proj_arr, tolerance,
             )?)
             .map_err(|_| GeometryError::Uncertified {
                 reason: "circle projection distance is non-finite or negative".to_owned(),
@@ -295,6 +303,7 @@ pub struct Circle3 {
     radius: f64,
     normal: Vector3,
     x_axis: Vector3,
+    y_axis: Vector3,
 }
 
 impl Circle3 {
@@ -340,6 +349,7 @@ impl Circle3 {
             return Err(ConstructionError::IllConditionedAxes);
         }
         let x_unit = normalize3(x_perp).ok_or(ConstructionError::DependentAxes)?;
+        let y_arr = cross3(n_unit, x_unit);
         Ok(Self {
             center: Point3::try_new(c[0], c[1], c[2])
                 .map_err(|_| ConstructionError::NonFiniteInput)?,
@@ -347,6 +357,8 @@ impl Circle3 {
             normal: Vector3::try_new(n_unit[0], n_unit[1], n_unit[2])
                 .map_err(|_| ConstructionError::NonFiniteInput)?,
             x_axis: Vector3::try_new(x_unit[0], x_unit[1], x_unit[2])
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
+            y_axis: Vector3::try_new(y_arr[0], y_arr[1], y_arr[2])
                 .map_err(|_| ConstructionError::NonFiniteInput)?,
         })
     }
@@ -378,12 +390,42 @@ impl Circle3 {
     /// Returns the unit y-axis: `normal × x_axis`.
     #[must_use]
     pub fn y_axis(&self) -> Vector3 {
-        let n = self.normal.into_array();
-        let x = self.x_axis.into_array();
-        let y = cross3(n, x);
-        Vector3::try_new(y[0], y[1], y[2]).unwrap_or_else(|_| {
-            unreachable!("cross product of stored orthonormal pair is always a unit vector")
-        })
+        self.y_axis
+    }
+
+    /// Applies a similarity `transform` (rigid motion plus uniform scale, no
+    /// reflection) to this circle, returning a new circle whose radius is
+    /// scaled accordingly.
+    ///
+    /// A general affine transform does not map a circle to a circle, so
+    /// only similarity transforms are accepted; see the `transform` module
+    /// documentation for the (provisional, heuristic) similarity test.
+    ///
+    /// # Errors
+    ///
+    /// - [`TransformError::NotSimilarity`] — the transform's linear part is
+    ///   not (within tolerance) a uniform-scale rotation
+    /// - [`TransformError::NonFiniteResult`] — the transformed center or
+    ///   axes contain a non-finite component
+    /// - [`TransformError::DegenerateResult`] — the transformed axes or
+    ///   scaled radius fail circle construction
+    pub fn try_transform(&self, transform: &Transform3) -> Result<Self, TransformError> {
+        let m = transform.into_row_major();
+        let scale = similarity_scale(m).ok_or(TransformError::NotSimilarity)?;
+        let c =
+            apply_to_point(m, self.center.into_array()).ok_or(TransformError::NonFiniteResult)?;
+        let n =
+            apply_to_vector(m, self.normal.into_array()).ok_or(TransformError::NonFiniteResult)?;
+        let x =
+            apply_to_vector(m, self.x_axis.into_array()).ok_or(TransformError::NonFiniteResult)?;
+        let new_radius = self.radius * scale;
+        Self::try_new(
+            Point3::try_new(c[0], c[1], c[2]).map_err(|_| TransformError::NonFiniteResult)?,
+            new_radius,
+            Vector3::try_new(n[0], n[1], n[2]).map_err(|_| TransformError::NonFiniteResult)?,
+            Vector3::try_new(x[0], x[1], x[2]).map_err(|_| TransformError::NonFiniteResult)?,
+        )
+        .map_err(|_| TransformError::DegenerateResult)
     }
 }
 
@@ -406,11 +448,14 @@ impl TryFrom<Circle3Repr> for Circle3 {
         validate_unit3(normal)?;
         validate_unit3(x_axis)?;
         validate_orthogonal3(normal, x_axis)?;
+        let y_arr = cross3(normal, x_axis);
         Ok(Self {
             center: repr.center,
             radius: repr.radius,
             normal: repr.normal,
             x_axis: repr.x_axis,
+            y_axis: Vector3::try_new(y_arr[0], y_arr[1], y_arr[2])
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
         })
     }
 }
@@ -448,7 +493,7 @@ impl Curve3Evaluator for Circle3 {
         }
         let c = self.center.into_array();
         let x = self.x_axis.into_array();
-        let y = cross3(self.normal.into_array(), x);
+        let y = self.y_axis.into_array();
         let r = self.radius;
         let (cos_t, sin_t) = (parameter.cos(), parameter.sin());
 
@@ -499,7 +544,7 @@ impl Curve3Evaluator for Circle3 {
         let c = self.center.into_array();
         let n = self.normal.into_array();
         let x = self.x_axis.into_array();
-        let y = cross3(n, x);
+        let y = self.y_axis.into_array();
         let r = self.radius;
         let diff = sub3(q, c);
         // In-plane component (project off the normal direction).
@@ -526,8 +571,8 @@ impl Curve3Evaluator for Circle3 {
                 reason: "circle projection parameter is non-finite".to_owned(),
             })?,
             point: proj,
-            distance_bound: DistanceBound::try_new(certified_distance_bound3(
-                c, q, proj_arr, tolerance,
+            distance_bound: DistanceBound::try_new(projection_distance_bound3(
+                q, proj_arr, tolerance,
             )?)
             .map_err(|_| GeometryError::Uncertified {
                 reason: "circle projection distance is non-finite or negative".to_owned(),
@@ -833,6 +878,79 @@ mod tests {
             assert!(actual <= projection.distance_bound.get(), "{query:?}");
             assert!(projection.distance_bound.get() >= 0.0);
             assert!(projection.parameter.get() < TAU);
+        }
+    }
+
+    #[test]
+    fn circle2_distance_bound_large_radius_is_valid_upper_bound_or_uncertified() {
+        // Concrete counterexample from review: Circle2(radius=2^53), query=(1,1),
+        // tol.abs=1. The old local-scale (`|query - center|`) formula certified a
+        // bound (≈9007199254740990.0) that was numerically *below* the true
+        // Euclidean distance (≈9007199254740990.586), violating the DistanceBound
+        // contract. With the world-scale formula, fp_err ≈ 64·ε·radius ≈ 128 far
+        // exceeds abs_tol=1, so this must now be reported as Uncertified — and if
+        // any bound is ever returned, it must be a genuine upper bound.
+        let tol_1m = ToleranceContext::try_new(1.0, 0.0, 1e-10, 1e-12).unwrap();
+        let radius = f64::powi(2.0, 53); // 2^53
+        let c = Circle2::try_new(
+            Point2::try_new(0.0, 0.0).unwrap(),
+            radius,
+            Vector2::try_new(1.0, 0.0).unwrap(),
+        )
+        .unwrap();
+        let q = Point2::try_new(1.0, 1.0).unwrap();
+        let result = c.project(q, &tol_1m);
+        match result {
+            Err(GeometryError::Uncertified { .. }) => {
+                // Correctly identified as uncertifiable at this scale/tolerance.
+            }
+            Ok(projs) => {
+                // If a bound is returned, it MUST be a valid upper bound.
+                for p in &projs {
+                    let actual = dist2(q, p.point);
+                    assert!(
+                        actual <= p.distance_bound.get(),
+                        "distance_bound={} < actual_distance={actual}",
+                        p.distance_bound.get()
+                    );
+                }
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn circle2_distance_bound_is_valid_upper_bound_over_adversarial_cases() {
+        // For normal-scale circles, verify actual_distance <= distance_bound for
+        // many cases spanning tiny to huge coordinate scales.
+        let tol = ToleranceContext::try_new(1e-9, 1e-8, 1e-10, 1e-12).unwrap();
+        let cases = [
+            // (radius, center_x, center_y, query_x, query_y)
+            (1.0, 0.0, 0.0, 2.0, 0.0),
+            (1.0, 100.0, 200.0, 101.0, 200.0),
+            (10.0, -5.0, 3.0, 0.0, 0.0),
+            (1e-6, 0.0, 0.0, 1e-5, 0.0),
+            (1e6, 0.0, 0.0, 1e6 + 1.0, 0.0),
+        ];
+        for (r, cx, cy, qx, qy) in cases {
+            let c = Circle2::try_new(
+                Point2::try_new(cx, cy).unwrap(),
+                r,
+                Vector2::try_new(1.0, 0.0).unwrap(),
+            )
+            .unwrap();
+            let q = Point2::try_new(qx, qy).unwrap();
+            if let Ok(projs) = c.project(q, &tol) {
+                for p in &projs {
+                    let actual = dist2(q, p.point);
+                    assert!(
+                        actual <= p.distance_bound.get(),
+                        "r={r} center=({cx},{cy}) q=({qx},{qy}): \
+                        distance_bound={} < actual={actual}",
+                        p.distance_bound.get()
+                    );
+                }
+            }
         }
     }
 
@@ -1220,5 +1338,67 @@ mod tests {
             r#"{"center":[0.0,0.0,0.0],"radius":1.0,"normal":[Infinity,0.0,1.0],"x_axis":[1.0,0.0,0.0]}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn circle3_try_transform_identity_is_noop() {
+        let c = Circle3::try_new(
+            Point3::try_new(1.0, 2.0, 3.0).unwrap(),
+            2.0,
+            Vector3::try_new(0.0, 0.0, 1.0).unwrap(),
+            Vector3::try_new(1.0, 0.0, 0.0).unwrap(),
+        )
+        .unwrap();
+        let out = c
+            .try_transform(&amphion_foundation::Transform3::IDENTITY)
+            .unwrap();
+        assert_eq!(out, c);
+    }
+
+    #[test]
+    fn circle3_try_transform_similarity_scales_radius() {
+        // Rotation by 90° about Z, uniform scale 2, plus translation.
+        let m = [
+            0.0, -2.0, 0.0, 5.0, //
+            2.0, 0.0, 0.0, -3.0, //
+            0.0, 0.0, 2.0, 7.0,
+        ];
+        let t = amphion_foundation::Transform3::try_from_row_major(m).unwrap();
+        let c = Circle3::try_new(
+            Point3::try_new(0.0, 0.0, 0.0).unwrap(),
+            3.0,
+            Vector3::try_new(0.0, 0.0, 1.0).unwrap(),
+            Vector3::try_new(1.0, 0.0, 0.0).unwrap(),
+        )
+        .unwrap();
+        let out = c.try_transform(&t).unwrap();
+        assert!((out.radius() - 6.0).abs() < 1e-9);
+        let [cx, cy, cz] = out.center().into_array();
+        assert!((cx - 5.0).abs() < 1e-9);
+        assert!((cy - (-3.0)).abs() < 1e-9);
+        assert!((cz - 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn circle3_try_transform_rejects_non_similarity() {
+        // Non-uniform scale (shear-free but anisotropic) is not a
+        // similarity: it distorts a circle into an ellipse.
+        let m = [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 2.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0,
+        ];
+        let t = amphion_foundation::Transform3::try_from_row_major(m).unwrap();
+        let c = Circle3::try_new(
+            Point3::try_new(0.0, 0.0, 0.0).unwrap(),
+            1.0,
+            Vector3::try_new(0.0, 0.0, 1.0).unwrap(),
+            Vector3::try_new(1.0, 0.0, 0.0).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            c.try_transform(&t),
+            Err(super::TransformError::NotSimilarity)
+        );
     }
 }

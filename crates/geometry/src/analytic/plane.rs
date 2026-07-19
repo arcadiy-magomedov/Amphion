@@ -24,7 +24,7 @@
     clippy::similar_names
 )]
 
-use amphion_foundation::{Point3, ToleranceContext, Vector3};
+use amphion_foundation::{Point3, ToleranceContext, Transform3, Vector3};
 use serde::{Deserialize, Serialize};
 
 use crate::traits::SurfaceEvaluator;
@@ -34,16 +34,19 @@ use crate::{
 };
 
 use super::{
-    ConstructionError,
+    ConstructionError, TransformError,
     helpers::{
-        ILL_COND_THRESH, add3, all_finite3, certified_distance_bound3, cross3, dot3, mag3,
-        normalize3, scale3, sub3, validate_orthogonal3, validate_unit3,
+        ILL_COND_THRESH, add3, all_finite3, cross3, dot3, mag3, normalize3,
+        projection_distance_bound3, scale3, sub3, validate_orthogonal3, validate_unit3,
     },
+    transform::{apply_to_point, apply_to_vector},
 };
 
 fn unbounded_range() -> ParameterRange {
-    ParameterRange::try_new(None, None, None)
-        .unwrap_or_else(|_| unreachable!("unbounded domain is always valid"))
+    // (None, None, None) is a compile-time constant and always valid; this
+    // is not an input-dependent path, so a static-invariant `expect` is
+    // acceptable here (see CONTRACTS.md).
+    ParameterRange::try_new(None, None, None).expect("unbounded domain is always valid")
 }
 
 #[derive(Serialize, Deserialize)]
@@ -63,6 +66,7 @@ pub struct Plane {
     origin: Point3,
     u_axis: Vector3,
     v_axis: Vector3,
+    normal: Vector3,
 }
 
 impl Plane {
@@ -102,12 +106,15 @@ impl Plane {
             return Err(ConstructionError::IllConditionedAxes);
         }
         let v_unit = normalize3(v_perp).ok_or(ConstructionError::DependentAxes)?;
+        let n_arr = cross3(u_unit, v_unit);
         Ok(Self {
             origin: Point3::try_new(o[0], o[1], o[2])
                 .map_err(|_| ConstructionError::NonFiniteInput)?,
             u_axis: Vector3::try_new(u_unit[0], u_unit[1], u_unit[2])
                 .map_err(|_| ConstructionError::NonFiniteInput)?,
             v_axis: Vector3::try_new(v_unit[0], v_unit[1], v_unit[2])
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
+            normal: Vector3::try_new(n_arr[0], n_arr[1], n_arr[2])
                 .map_err(|_| ConstructionError::NonFiniteInput)?,
         })
     }
@@ -133,12 +140,37 @@ impl Plane {
     /// Returns the outward unit normal `u_axis × v_axis`.
     #[must_use]
     pub fn normal(&self) -> Vector3 {
-        let u = self.u_axis.into_array();
-        let v = self.v_axis.into_array();
-        let n = cross3(u, v);
-        Vector3::try_new(n[0], n[1], n[2]).unwrap_or_else(|_| {
-            unreachable!("cross product of stored orthonormal pair is always a unit vector")
-        })
+        self.normal
+    }
+
+    /// Applies an affine `transform` to this plane, returning a new plane.
+    ///
+    /// Any non-degenerate affine transform is accepted: the affine image of
+    /// a plane is a plane as long as the transformed spanning vectors stay
+    /// independent. `try_new` re-orthonormalizes the transformed axes, so a
+    /// non-similarity (shearing) transform is accepted but its effect on
+    /// `v_axis` is Gram-Schmidt-corrected against the transformed `u_axis`.
+    ///
+    /// # Errors
+    ///
+    /// - [`TransformError::NonFiniteResult`] — the transformed origin or
+    ///   axes contain a non-finite component
+    /// - [`TransformError::DegenerateResult`] — the transformed axes become
+    ///   zero-length, dependent, or ill-conditioned
+    pub fn try_transform(&self, transform: &Transform3) -> Result<Self, TransformError> {
+        let m = transform.into_row_major();
+        let o =
+            apply_to_point(m, self.origin.into_array()).ok_or(TransformError::NonFiniteResult)?;
+        let u =
+            apply_to_vector(m, self.u_axis.into_array()).ok_or(TransformError::NonFiniteResult)?;
+        let v =
+            apply_to_vector(m, self.v_axis.into_array()).ok_or(TransformError::NonFiniteResult)?;
+        Self::try_new(
+            Point3::try_new(o[0], o[1], o[2]).map_err(|_| TransformError::NonFiniteResult)?,
+            Vector3::try_new(u[0], u[1], u[2]).map_err(|_| TransformError::NonFiniteResult)?,
+            Vector3::try_new(v[0], v[1], v[2]).map_err(|_| TransformError::NonFiniteResult)?,
+        )
+        .map_err(|_| TransformError::DegenerateResult)
     }
 }
 
@@ -154,10 +186,13 @@ impl TryFrom<PlaneRepr> for Plane {
         validate_unit3(u_axis)?;
         validate_unit3(v_axis)?;
         validate_orthogonal3(u_axis, v_axis)?;
+        let n_arr = cross3(u_axis, v_axis);
         Ok(Self {
             origin: repr.origin,
             u_axis: repr.u_axis,
             v_axis: repr.v_axis,
+            normal: Vector3::try_new(n_arr[0], n_arr[1], n_arr[2])
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
         })
     }
 }
@@ -225,8 +260,10 @@ impl SurfaceEvaluator for Plane {
                         reason: "v_axis non-finite".to_owned(),
                     }
                 })?;
-                let zero = Vector3::try_new(0.0, 0.0, 0.0)
-                    .unwrap_or_else(|_| unreachable!("zero vector is always finite"));
+                let zero =
+                    Vector3::try_new(0.0, 0.0, 0.0).map_err(|_| GeometryError::Uncertified {
+                        reason: "zero vector construction failed unexpectedly".to_owned(),
+                    })?;
                 (Some(du), Some(dv), Some(zero), Some(zero), Some(zero))
             }
         };
@@ -273,8 +310,8 @@ impl SurfaceEvaluator for Plane {
                 reason: "plane projection v is non-finite".to_owned(),
             })?,
             point: proj,
-            distance_bound: DistanceBound::try_new(certified_distance_bound3(
-                o, q, proj_arr, tolerance,
+            distance_bound: DistanceBound::try_new(projection_distance_bound3(
+                q, proj_arr, tolerance,
             )?)
             .map_err(|_| GeometryError::Uncertified {
                 reason: "plane projection distance is non-finite or negative".to_owned(),
@@ -555,6 +592,58 @@ mod tests {
                 r#"{"origin":[0.0,0.0,0.0],"u_axis":[Infinity,0.0,0.0],"v_axis":[0.0,1.0,0.0]}"#
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn plane_try_transform_identity_is_noop() {
+        let p = xy_plane();
+        let out = p
+            .try_transform(&amphion_foundation::Transform3::IDENTITY)
+            .unwrap();
+        assert_eq!(out, p);
+    }
+
+    #[test]
+    fn plane_try_transform_scale_rotation_translation() {
+        // Rotation by 90° about Z, uniform scale 2, plus translation.
+        let m = [
+            0.0, -2.0, 0.0, 5.0, //
+            2.0, 0.0, 0.0, -3.0, //
+            0.0, 0.0, 2.0, 7.0,
+        ];
+        let t = amphion_foundation::Transform3::try_from_row_major(m).unwrap();
+        let p = xy_plane();
+        let out = p.try_transform(&t).unwrap();
+        let [ox, oy, oz] = out.origin().into_array();
+        assert!((ox - 5.0).abs() < 1e-9);
+        assert!((oy - (-3.0)).abs() < 1e-9);
+        assert!((oz - 7.0).abs() < 1e-9);
+        // u_axis (1,0,0) -> (0,2,0) normalized -> (0,1,0)
+        let [ux, uy, uz] = out.u_axis().into_array();
+        assert!((ux - 0.0).abs() < 1e-9);
+        assert!((uy - 1.0).abs() < 1e-9);
+        assert!((uz - 0.0).abs() < 1e-9);
+        // normal should still be a unit vector.
+        let n = out.normal().into_array();
+        let mag = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        assert!((mag - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn plane_try_transform_rejects_degenerate_result() {
+        // A rank-deficient linear part collapses u_axis and v_axis onto the
+        // same line, which cannot form a plane.
+        let m = [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 0.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0,
+        ];
+        let t = amphion_foundation::Transform3::try_from_row_major(m).unwrap();
+        let p = xy_plane();
+        assert_eq!(
+            p.try_transform(&t),
+            Err(super::TransformError::DegenerateResult)
         );
     }
 }

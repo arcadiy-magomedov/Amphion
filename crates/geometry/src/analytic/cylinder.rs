@@ -34,7 +34,7 @@
 
 use std::f64::consts::TAU;
 
-use amphion_foundation::{Point3, ToleranceContext, Vector3};
+use amphion_foundation::{Point3, ToleranceContext, Transform3, Vector3};
 use serde::{Deserialize, Serialize};
 
 use crate::traits::SurfaceEvaluator;
@@ -44,21 +44,27 @@ use crate::{
 };
 
 use super::{
-    ConstructionError,
+    ConstructionError, TransformError,
     helpers::{
-        ILL_COND_THRESH, add3, all_finite3, angle_to_full_turn, certified_distance_bound3, cross3,
-        dot3, in_range, mag3, normalize3, scale3, sub3, validate_orthogonal3, validate_unit3,
+        ILL_COND_THRESH, add3, all_finite3, angle_to_full_turn, cross3, dot3, in_range, mag3,
+        normalize3, projection_distance_bound3, scale3, sub3, validate_orthogonal3, validate_unit3,
     },
+    transform::{apply_to_point, apply_to_vector, similarity_scale},
 };
 
 fn angular_range() -> ParameterRange {
+    // (0.0, TAU, TAU) is a compile-time constant with lo < hi; this is not
+    // an input-dependent path, so a static-invariant `expect` is acceptable
+    // here (see CONTRACTS.md).
     ParameterRange::try_new(Some(0.0), Some(TAU), Some(TAU))
-        .unwrap_or_else(|_| unreachable!("angular [0, 2π) domain is always valid"))
+        .expect("angular [0, 2π) domain is always valid")
 }
 
 fn unbounded_range() -> ParameterRange {
-    ParameterRange::try_new(None, None, None)
-        .unwrap_or_else(|_| unreachable!("unbounded domain is always valid"))
+    // (None, None, None) is a compile-time constant and always valid; this
+    // is not an input-dependent path, so a static-invariant `expect` is
+    // acceptable here (see CONTRACTS.md).
+    ParameterRange::try_new(None, None, None).expect("unbounded domain is always valid")
 }
 
 #[derive(Serialize, Deserialize)]
@@ -83,6 +89,7 @@ pub struct Cylinder {
     axis_dir: Vector3,
     radius: f64,
     x_axis: Vector3,
+    y_axis: Vector3,
 }
 
 impl Cylinder {
@@ -127,6 +134,7 @@ impl Cylinder {
             return Err(ConstructionError::IllConditionedAxes);
         }
         let x_unit = normalize3(x_perp).ok_or(ConstructionError::DependentAxes)?;
+        let y_arr = cross3(a_unit, x_unit);
         Ok(Self {
             axis_origin: Point3::try_new(o[0], o[1], o[2])
                 .map_err(|_| ConstructionError::NonFiniteInput)?,
@@ -134,6 +142,8 @@ impl Cylinder {
                 .map_err(|_| ConstructionError::NonFiniteInput)?,
             radius,
             x_axis: Vector3::try_new(x_unit[0], x_unit[1], x_unit[2])
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
+            y_axis: Vector3::try_new(y_arr[0], y_arr[1], y_arr[2])
                 .map_err(|_| ConstructionError::NonFiniteInput)?,
         })
     }
@@ -165,12 +175,43 @@ impl Cylinder {
     /// Returns the unit y-axis: `axis_dir × x_axis`.
     #[must_use]
     pub fn y_axis(&self) -> Vector3 {
-        let a = self.axis_dir.into_array();
-        let x = self.x_axis.into_array();
-        let y = cross3(a, x);
-        Vector3::try_new(y[0], y[1], y[2]).unwrap_or_else(|_| {
-            unreachable!("cross product of stored orthonormal pair is always a unit vector")
-        })
+        self.y_axis
+    }
+
+    /// Applies a similarity `transform` (rigid motion plus uniform scale, no
+    /// reflection) to this cylinder, returning a new cylinder whose radius
+    /// is scaled accordingly.
+    ///
+    /// A general affine transform does not map a circular cylinder to a
+    /// circular cylinder, so only similarity transforms are accepted; see
+    /// the `transform` module documentation for the (provisional, heuristic)
+    /// similarity test.
+    ///
+    /// # Errors
+    ///
+    /// - [`TransformError::NotSimilarity`] — the transform's linear part is
+    ///   not (within tolerance) a uniform-scale rotation
+    /// - [`TransformError::NonFiniteResult`] — the transformed axis origin
+    ///   or axes contain a non-finite component
+    /// - [`TransformError::DegenerateResult`] — the transformed axes or
+    ///   scaled radius fail cylinder construction
+    pub fn try_transform(&self, transform: &Transform3) -> Result<Self, TransformError> {
+        let m = transform.into_row_major();
+        let scale = similarity_scale(m).ok_or(TransformError::NotSimilarity)?;
+        let o = apply_to_point(m, self.axis_origin.into_array())
+            .ok_or(TransformError::NonFiniteResult)?;
+        let a = apply_to_vector(m, self.axis_dir.into_array())
+            .ok_or(TransformError::NonFiniteResult)?;
+        let x =
+            apply_to_vector(m, self.x_axis.into_array()).ok_or(TransformError::NonFiniteResult)?;
+        let new_radius = self.radius * scale;
+        Self::try_new(
+            Point3::try_new(o[0], o[1], o[2]).map_err(|_| TransformError::NonFiniteResult)?,
+            Vector3::try_new(a[0], a[1], a[2]).map_err(|_| TransformError::NonFiniteResult)?,
+            new_radius,
+            Vector3::try_new(x[0], x[1], x[2]).map_err(|_| TransformError::NonFiniteResult)?,
+        )
+        .map_err(|_| TransformError::DegenerateResult)
     }
 }
 
@@ -193,11 +234,14 @@ impl TryFrom<CylinderRepr> for Cylinder {
         validate_unit3(axis_dir)?;
         validate_unit3(x_axis)?;
         validate_orthogonal3(axis_dir, x_axis)?;
+        let y_arr = cross3(axis_dir, x_axis);
         Ok(Self {
             axis_origin: repr.axis_origin,
             axis_dir: repr.axis_dir,
             radius: repr.radius,
             x_axis: repr.x_axis,
+            y_axis: Vector3::try_new(y_arr[0], y_arr[1], y_arr[2])
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
         })
     }
 }
@@ -238,7 +282,7 @@ impl SurfaceEvaluator for Cylinder {
         let o = self.axis_origin.into_array();
         let a = self.axis_dir.into_array();
         let x = self.x_axis.into_array();
-        let y = cross3(a, x);
+        let y = self.y_axis.into_array();
         let r = self.radius;
         let (cos_u, sin_u) = (u.cos(), u.sin());
 
@@ -283,8 +327,10 @@ impl SurfaceEvaluator for Cylinder {
                         reason: "cylinder duu non-finite".to_owned(),
                     }
                 })?;
-                let zero = Vector3::try_new(0.0, 0.0, 0.0)
-                    .unwrap_or_else(|_| unreachable!("zero vector is always finite"));
+                let zero =
+                    Vector3::try_new(0.0, 0.0, 0.0).map_err(|_| GeometryError::Uncertified {
+                        reason: "zero vector construction failed unexpectedly".to_owned(),
+                    })?;
                 (Some(du), Some(dv), Some(duu), Some(zero), Some(zero))
             }
         };
@@ -309,7 +355,7 @@ impl SurfaceEvaluator for Cylinder {
         let o = self.axis_origin.into_array();
         let a = self.axis_dir.into_array();
         let x = self.x_axis.into_array();
-        let y = cross3(a, x);
+        let y = self.y_axis.into_array();
         let r = self.radius;
         let diff = sub3(q, o);
         let v_val = dot3(diff, a);
@@ -340,8 +386,8 @@ impl SurfaceEvaluator for Cylinder {
                 reason: "cylinder projection v is non-finite".to_owned(),
             })?,
             point: proj,
-            distance_bound: DistanceBound::try_new(certified_distance_bound3(
-                o, q, proj_arr, tolerance,
+            distance_bound: DistanceBound::try_new(projection_distance_bound3(
+                q, proj_arr, tolerance,
             )?)
             .map_err(|_| GeometryError::Uncertified {
                 reason: "cylinder projection distance is non-finite or negative".to_owned(),
@@ -773,5 +819,47 @@ mod tests {
             r#"{"axis_origin":[0.0,0.0,0.0],"axis_dir":[Infinity,0.0,1.0],"radius":1.0,"x_axis":[1.0,0.0,0.0]}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn cylinder_try_transform_identity_is_noop() {
+        let c = unit_cylinder();
+        let out = c
+            .try_transform(&amphion_foundation::Transform3::IDENTITY)
+            .unwrap();
+        assert_eq!(out, c);
+    }
+
+    #[test]
+    fn cylinder_try_transform_similarity_scales_radius() {
+        // Rotation by 90° about Z, uniform scale 2, plus translation.
+        let m = [
+            0.0, -2.0, 0.0, 5.0, //
+            2.0, 0.0, 0.0, -3.0, //
+            0.0, 0.0, 2.0, 7.0,
+        ];
+        let t = amphion_foundation::Transform3::try_from_row_major(m).unwrap();
+        let c = unit_cylinder();
+        let out = c.try_transform(&t).unwrap();
+        assert!((out.radius() - 2.0).abs() < 1e-9);
+        let [ox, oy, oz] = out.axis_origin().into_array();
+        assert!((ox - 5.0).abs() < 1e-9);
+        assert!((oy - (-3.0)).abs() < 1e-9);
+        assert!((oz - 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cylinder_try_transform_rejects_non_similarity() {
+        let m = [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 2.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0,
+        ];
+        let t = amphion_foundation::Transform3::try_from_row_major(m).unwrap();
+        let c = unit_cylinder();
+        assert_eq!(
+            c.try_transform(&t),
+            Err(super::TransformError::NotSimilarity)
+        );
     }
 }

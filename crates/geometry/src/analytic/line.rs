@@ -20,7 +20,7 @@
     clippy::similar_names
 )]
 
-use amphion_foundation::{Point2, Point3, ToleranceContext, Vector2, Vector3};
+use amphion_foundation::{Point2, Point3, ToleranceContext, Transform3, Vector2, Vector3};
 use serde::{Deserialize, Serialize};
 
 use crate::traits::{Curve2Evaluator, Curve3Evaluator};
@@ -30,20 +30,23 @@ use crate::{
 };
 
 use super::{
-    ConstructionError,
+    ConstructionError, TransformError,
     helpers::{
-        add2, add3, all_finite2, all_finite3, certified_distance_bound2, certified_distance_bound3,
-        dot2, dot3, normalize2, normalize3, scale2, scale3, sub2, sub3, validate_unit2,
-        validate_unit3,
+        add2, add3, all_finite2, all_finite3, dot2, dot3, normalize2, normalize3,
+        projection_distance_bound2, projection_distance_bound3, scale2, scale3, sub2, sub3,
+        validate_unit2, validate_unit3,
     },
+    transform::{apply_to_point, apply_to_vector},
 };
 
 // ─── Helpers shared by both line types ──────────────────────────────────────
 
 /// Infinite line domain: no bounds, no period.
 fn line_domain() -> ParameterRange {
-    ParameterRange::try_new(None, None, None)
-        .unwrap_or_else(|_| unreachable!("unbounded domain is always valid"))
+    // (None, None, None) is a compile-time constant and always valid; this
+    // is not an input-dependent path, so a static-invariant `expect` is
+    // acceptable here (see CONTRACTS.md).
+    ParameterRange::try_new(None, None, None).expect("unbounded domain is always valid")
 }
 
 // ─── Line2 ───────────────────────────────────────────────────────────────────
@@ -163,7 +166,9 @@ impl Curve2Evaluator for Line2 {
                 let v = Vector2::try_new(d[0], d[1]).map_err(|_| GeometryError::Uncertified {
                     reason: "line direction is non-finite".to_owned(),
                 })?;
-                let zero = Vector2::try_new(0.0, 0.0).expect("zero is finite");
+                let zero = Vector2::try_new(0.0, 0.0).map_err(|_| GeometryError::Uncertified {
+                    reason: "zero vector construction failed unexpectedly".to_owned(),
+                })?;
                 (Some(v), Some(zero))
             }
         };
@@ -196,7 +201,7 @@ impl Curve2Evaluator for Line2 {
             Point2::try_new(proj_arr[0], proj_arr[1]).map_err(|_| GeometryError::Uncertified {
                 reason: "line projection point is non-finite".to_owned(),
             })?;
-        let dist = certified_distance_bound2(o, q, proj_arr, tolerance)?;
+        let dist = projection_distance_bound2(q, proj_arr, tolerance)?;
         output.push(CurveProjection2 {
             parameter: ParameterValue::try_new(t).map_err(|_| GeometryError::Uncertified {
                 reason: "line projection parameter is non-finite".to_owned(),
@@ -266,6 +271,31 @@ impl Line3 {
     pub fn direction(&self) -> Vector3 {
         self.direction
     }
+
+    /// Applies an affine `transform` to this line, returning a new line.
+    ///
+    /// Any non-degenerate affine transform is accepted: the affine image of
+    /// a line is always a line, as long as the transformed direction does
+    /// not collapse to zero.
+    ///
+    /// # Errors
+    ///
+    /// - [`TransformError::NonFiniteResult`] — the transformed origin or
+    ///   direction contains a non-finite component
+    /// - [`TransformError::DegenerateResult`] — the transformed direction has
+    ///   zero length
+    pub fn try_transform(&self, transform: &Transform3) -> Result<Self, TransformError> {
+        let m = transform.into_row_major();
+        let o =
+            apply_to_point(m, self.origin.into_array()).ok_or(TransformError::NonFiniteResult)?;
+        let d = apply_to_vector(m, self.direction.into_array())
+            .ok_or(TransformError::NonFiniteResult)?;
+        Self::try_new(
+            Point3::try_new(o[0], o[1], o[2]).map_err(|_| TransformError::NonFiniteResult)?,
+            Vector3::try_new(d[0], d[1], d[2]).map_err(|_| TransformError::NonFiniteResult)?,
+        )
+        .map_err(|_| TransformError::DegenerateResult)
+    }
 }
 
 impl TryFrom<Line3Repr> for Line3 {
@@ -332,7 +362,10 @@ impl Curve3Evaluator for Line3 {
                     Vector3::try_new(d[0], d[1], d[2]).map_err(|_| GeometryError::Uncertified {
                         reason: "line direction is non-finite".to_owned(),
                     })?;
-                let zero = Vector3::try_new(0.0, 0.0, 0.0).expect("zero is finite");
+                let zero =
+                    Vector3::try_new(0.0, 0.0, 0.0).map_err(|_| GeometryError::Uncertified {
+                        reason: "zero vector construction failed unexpectedly".to_owned(),
+                    })?;
                 (Some(v), Some(zero))
             }
         };
@@ -366,7 +399,7 @@ impl Curve3Evaluator for Line3 {
                 reason: "line projection point is non-finite".to_owned(),
             }
         })?;
-        let dist = certified_distance_bound3(o, q, proj_arr, tolerance)?;
+        let dist = projection_distance_bound3(q, proj_arr, tolerance)?;
         output.push(CurveProjection3 {
             parameter: ParameterValue::try_new(t).map_err(|_| GeometryError::Uncertified {
                 reason: "line projection parameter is non-finite".to_owned(),
@@ -647,6 +680,23 @@ mod tests {
     }
 
     #[test]
+    fn line2_serde_rejects_marginally_non_unit_direction() {
+        // UNIT_VECTOR_TOL was tightened from 8ε to 4ε to match the cf85555
+        // UnitVector2/3 magnitude-deviation guarantee. `1.000_000_000_000_000_9`
+        // is 4 ULPs above 1.0, giving |v·v − 1| = 8ε > 4ε, so this direction
+        // must now be rejected even though it is very close to unit length.
+        let repr: Line2Repr = serde_json::from_value(json!({
+            "origin": [1.0, 2.0],
+            "direction": [1.000_000_000_000_000_9, 0.0]
+        }))
+        .unwrap();
+        assert_eq!(
+            Line2::try_from(repr),
+            Err(ConstructionError::DegenerateAxis)
+        );
+    }
+
+    #[test]
     fn line2_serde_rejects_nan_and_inf_fields() {
         assert!(
             serde_json::from_str::<Line2>(r#"{"origin":[NaN,0.0],"direction":[1.0,0.0]}"#).is_err()
@@ -803,6 +853,22 @@ mod tests {
     }
 
     #[test]
+    fn line3_serde_rejects_marginally_non_unit_direction() {
+        // See `line2_serde_rejects_marginally_non_unit_direction`: 4 ULPs
+        // above 1.0 gives |v·v − 1| = 8ε, which exceeds the tightened 4ε
+        // UNIT_VECTOR_TOL and must be rejected.
+        let repr: Line3Repr = serde_json::from_value(json!({
+            "origin": [1.0, 2.0, 3.0],
+            "direction": [1.000_000_000_000_000_9, 0.0, 0.0]
+        }))
+        .unwrap();
+        assert_eq!(
+            Line3::try_from(repr),
+            Err(ConstructionError::DegenerateAxis)
+        );
+    }
+
+    #[test]
     fn line3_serde_rejects_nan_and_inf_fields() {
         assert!(
             serde_json::from_str::<Line3>(r#"{"origin":[NaN,0.0,0.0],"direction":[1.0,0.0,0.0]}"#)
@@ -813,6 +879,67 @@ mod tests {
                 r#"{"origin":[0.0,0.0,0.0],"direction":[Infinity,0.0,0.0]}"#
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn line3_try_transform_identity_is_noop() {
+        let l = Line3::try_new(
+            Point3::try_new(1.0, 2.0, 3.0).unwrap(),
+            Vector3::try_new(1.0, 0.0, 0.0).unwrap(),
+        )
+        .unwrap();
+        let out = l
+            .try_transform(&amphion_foundation::Transform3::IDENTITY)
+            .unwrap();
+        assert_eq!(out, l);
+    }
+
+    #[test]
+    fn line3_try_transform_scale_rotation_translation() {
+        // Rotation by 90° about Z, uniform scale 2, plus translation.
+        let m = [
+            0.0, -2.0, 0.0, 5.0, //
+            2.0, 0.0, 0.0, -3.0, //
+            0.0, 0.0, 2.0, 7.0,
+        ];
+        let t = amphion_foundation::Transform3::try_from_row_major(m).unwrap();
+        let l = Line3::try_new(
+            Point3::try_new(1.0, 0.0, 0.0).unwrap(),
+            Vector3::try_new(1.0, 0.0, 0.0).unwrap(),
+        )
+        .unwrap();
+        let out = l.try_transform(&t).unwrap();
+        let [ox, oy, oz] = out.origin().into_array();
+        // origin (1,0,0) -> (0*1-2*0+0*0+5, 2*1+0*0+0*0-3, 0*1+0*0+2*0+7) = (5,-1,7)
+        assert!((ox - 5.0).abs() < 1e-9);
+        assert!((oy - (-1.0)).abs() < 1e-9);
+        assert!((oz - 7.0).abs() < 1e-9);
+        // direction (1,0,0) -> (0,2,0) normalized -> (0,1,0)
+        let [dx, dy, dz] = out.direction().into_array();
+        assert!((dx - 0.0).abs() < 1e-9);
+        assert!((dy - 1.0).abs() < 1e-9);
+        assert!((dz - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn line3_try_transform_rejects_non_finite_result() {
+        // An extreme finite scale causes the point application to overflow
+        // to infinity, even though the transform itself was constructed
+        // from finite values.
+        let huge = f64::MAX;
+        let m = [
+            huge, 0.0, 0.0, 0.0, 0.0, huge, 0.0, 0.0, 0.0, 0.0, huge, 0.0,
+        ];
+        let t = amphion_foundation::Transform3::try_from_row_major(m).unwrap();
+        let l = Line3::try_new(
+            Point3::try_new(2.0, 0.0, 0.0).unwrap(),
+            Vector3::try_new(1.0, 0.0, 0.0).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            l.try_transform(&t),
+            Err(super::TransformError::NonFiniteResult)
         );
     }
 }
