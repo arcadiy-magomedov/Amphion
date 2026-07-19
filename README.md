@@ -65,6 +65,8 @@ The frozen kernel conventions are in [CONTRACTS.md](CONTRACTS.md). The kernel
 dependency graph, agent ownership rules, and acceptance gates are in
 [EXECUTION_PLAN.md](EXECUTION_PLAN.md). Human-visible milestones and the
 Fusion-familiar browser product contract are in [PRODUCT_PLAN.md](PRODUCT_PLAN.md).
+The versioned clean-room parity index is in
+[CAPABILITY_INVENTORY.md](CAPABILITY_INVENTORY.md).
 
 ## Quality strategy
 

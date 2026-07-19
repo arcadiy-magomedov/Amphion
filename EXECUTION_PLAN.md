@@ -74,6 +74,29 @@ ready. Do not create empty placeholder crates.
 8. A review agent performs a read-only correctness review at every wave gate.
 9. No task may suppress a failure, widen a tolerance merely to pass a test, or
    replace analytic geometry with a mesh fallback.
+10. Non-trivial mathematical, numerical, geometric, and systems tasks follow
+    the algorithm research protocol below before inventing a new method.
+
+## Algorithm research protocol
+
+- Search primary research literature without restricting publication language.
+  Use translated and native-language queries across papers, theses, conference
+  proceedings, technical reports, and standards, including English, Chinese,
+  Russian, and other relevant languages.
+- Prefer original algorithm sources over summaries. Extract the stated
+  assumptions, invariants, proofs, error bounds, degeneracy handling,
+  complexity, and known failure cases.
+- Compare credible algorithms against Amphion's exact/tolerant contracts,
+  deterministic execution, Rust and WASM constraints, licensing, implementation
+  cost, and testability. Do not select a method only because it is familiar or
+  has an available implementation.
+- Record citations, the selection rationale, rejected alternatives, and any
+  unresolved uncertainty in the task result. Clearly distinguish a published
+  guarantee from an implementor observation or an Amphion design decision.
+- Implement from the algorithm and public specification in a clean-room manner;
+  do not copy incompatible source code or protected explanatory text. Convert
+  published adversarial examples and boundary cases into independently written
+  permanent tests where licensing permits.
 
 ## Universal definition of done
 
