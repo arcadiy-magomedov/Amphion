@@ -8,6 +8,10 @@ publish = false
 
 [dependencies]
 serde.workspace = true
+# Exact dyadic integer arithmetic for certified geometric predicates.
+# License: MIT OR Apache-2.0.
+num-bigint = "0.4"
+num-traits = "0.2"
 
 [dev-dependencies]
 serde_json.workspace = true
