@@ -1,4 +1,22 @@
 //! Thread-safe evaluator interfaces.
+//!
+//! # CONTRACTS.md change needed
+//!
+//! This module's `evaluate()` signature was extended to take an explicit
+//! `tolerance: &ToleranceContext` parameter, and `CurveEvaluation2`,
+//! `CurveEvaluation3`, and `SurfaceEvaluation` gained certified error-bound
+//! fields (`position_error_bound: DistanceBound`,
+//! `first_error_bound`/`first_u_error_bound`/`first_v_error_bound: Option<DistanceBound>`,
+//! `second_error_bound`/`second_uu_error_bound`/`second_uv_error_bound`/`second_vv_error_bound: Option<DistanceBound>`).
+//! Evaluators must return [`GeometryError::Uncertified`] when the
+//! implementation cannot bound the evaluation error within the supplied
+//! tolerance. Trig-dependent evaluators (`Circle2`, `Circle3`, `Cylinder`,
+//! `Cone`) return `Uncertified` from both `evaluate()` and `project_into()`
+//! until a formally-proved, WASM-compatible transcendental implementation is
+//! integrated (no such pure-Rust library currently exists; see the
+//! `analytic::helpers` module docs for the survey of candidates). This
+//! doc comment records the exact CONTRACTS.md wording change required; the
+//! contracts document itself is out of scope for this crate.
 
 use amphion_foundation::{Point2, Point3, ToleranceContext};
 
@@ -26,6 +44,7 @@ pub trait Curve2Evaluator: Send + Sync + 'static {
         &self,
         parameter: f64,
         order: DerivativeOrder,
+        tolerance: &ToleranceContext,
     ) -> Result<CurveEvaluation2, GeometryError>;
 
     /// Finds every certified projection inside the declared domain.
@@ -79,6 +98,7 @@ pub trait Curve3Evaluator: Send + Sync + 'static {
         &self,
         parameter: f64,
         order: DerivativeOrder,
+        tolerance: &ToleranceContext,
     ) -> Result<CurveEvaluation3, GeometryError>;
 
     /// Finds every certified projection inside the declared domain.
@@ -133,6 +153,7 @@ pub trait SurfaceEvaluator: Send + Sync + 'static {
         u: f64,
         v: f64,
         order: DerivativeOrder,
+        tolerance: &ToleranceContext,
     ) -> Result<SurfaceEvaluation, GeometryError>;
 
     /// Finds every certified projection inside the declared domain.

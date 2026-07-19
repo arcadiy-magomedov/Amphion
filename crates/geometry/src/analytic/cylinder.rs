@@ -39,15 +39,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::traits::SurfaceEvaluator;
 use crate::{
-    DerivativeOrder, DistanceBound, GeometryError, ParameterRange, ParameterValue, SurfaceDomain,
-    SurfaceEvaluation, SurfaceKind, SurfaceProjection,
+    DerivativeOrder, GeometryError, ParameterRange, SurfaceDomain, SurfaceEvaluation, SurfaceKind,
+    SurfaceProjection,
 };
 
 use super::{
     ConstructionError, TransformError,
     helpers::{
-        ILL_COND_THRESH, add3, all_finite3, angle_to_full_turn, cross3, dot3, in_range, mag3,
-        normalize3, projection_distance_bound3, scale3, sub3, validate_orthogonal3, validate_unit3,
+        ILL_COND_THRESH, all_finite3, cross3, dot3, in_range, mag3, normalize3, scale3, sub3,
+        validate_orthogonal3, validate_unit3,
     },
     transform::{apply_to_point, apply_to_vector, similarity_scale},
 };
@@ -270,7 +270,8 @@ impl SurfaceEvaluator for Cylinder {
         &self,
         u: f64,
         v: f64,
-        order: DerivativeOrder,
+        _order: DerivativeOrder,
+        _tolerance: &ToleranceContext,
     ) -> Result<SurfaceEvaluation, GeometryError> {
         if !u.is_finite() || !v.is_finite() {
             return Err(GeometryError::NonFiniteParameter);
@@ -278,123 +279,38 @@ impl SurfaceEvaluator for Cylinder {
         if !in_range(u, self.domain().u()) {
             return Err(GeometryError::OutsideDomain);
         }
-        // v is unbounded; finiteness already checked above.
-        let o = self.axis_origin.into_array();
-        let a = self.axis_dir.into_array();
-        let x = self.x_axis.into_array();
-        let y = self.y_axis.into_array();
-        let r = self.radius;
-        let (cos_u, sin_u) = (u.cos(), u.sin());
-
-        // p = axis_origin + v·a + r·cos(u)·x + r·sin(u)·y
-        let radial = add3(scale3(x, r * cos_u), scale3(y, r * sin_u));
-        let pos_arr = add3(add3(o, scale3(a, v)), radial);
-        let pos = Point3::try_new(pos_arr[0], pos_arr[1], pos_arr[2]).map_err(|_| {
-            GeometryError::Uncertified {
-                reason: "cylinder position is non-finite".to_owned(),
-            }
-        })?;
-
-        let (du, dv, duu, duv, dvv) = match order {
-            DerivativeOrder::Position => (None, None, None, None, None),
-            DerivativeOrder::First => {
-                let du_arr = add3(scale3(x, -r * sin_u), scale3(y, r * cos_u));
-                let du = Vector3::try_new(du_arr[0], du_arr[1], du_arr[2]).map_err(|_| {
-                    GeometryError::Uncertified {
-                        reason: "cylinder du non-finite".to_owned(),
-                    }
-                })?;
-                let dv =
-                    Vector3::try_new(a[0], a[1], a[2]).map_err(|_| GeometryError::Uncertified {
-                        reason: "cylinder dv non-finite".to_owned(),
-                    })?;
-                (Some(du), Some(dv), None, None, None)
-            }
-            DerivativeOrder::Second => {
-                let du_arr = add3(scale3(x, -r * sin_u), scale3(y, r * cos_u));
-                let du = Vector3::try_new(du_arr[0], du_arr[1], du_arr[2]).map_err(|_| {
-                    GeometryError::Uncertified {
-                        reason: "cylinder du non-finite".to_owned(),
-                    }
-                })?;
-                let dv =
-                    Vector3::try_new(a[0], a[1], a[2]).map_err(|_| GeometryError::Uncertified {
-                        reason: "cylinder dv non-finite".to_owned(),
-                    })?;
-                let duu_arr = add3(scale3(x, -r * cos_u), scale3(y, -r * sin_u));
-                let duu = Vector3::try_new(duu_arr[0], duu_arr[1], duu_arr[2]).map_err(|_| {
-                    GeometryError::Uncertified {
-                        reason: "cylinder duu non-finite".to_owned(),
-                    }
-                })?;
-                let zero =
-                    Vector3::try_new(0.0, 0.0, 0.0).map_err(|_| GeometryError::Uncertified {
-                        reason: "zero vector construction failed unexpectedly".to_owned(),
-                    })?;
-                (Some(du), Some(dv), Some(duu), Some(zero), Some(zero))
-            }
-        };
-        Ok(SurfaceEvaluation {
-            position: pos,
-            du,
-            dv,
-            duu,
-            duv,
-            dvv,
+        // p(u, v) = axis_origin + v·axis_dir + r·cos(u)·x_axis + r·sin(u)·y_axis
+        // requires `cos` and `sin`. No pure-Rust, WASM-compatible,
+        // formally-proved correctly-rounded implementation of these
+        // functions currently exists (see the `analytic::helpers` module
+        // docs for the survey of candidates), so no certified error bound
+        // can be produced.
+        Err(GeometryError::Uncertified {
+            reason: "cylinder evaluation requires certified sin/cos; no formally-proved \
+                     WASM-compatible implementation is available. libm (MIT, WASM) gives \
+                     ~1-2 ULP empirically but is not formally proved. core-math (MIT, 0.5 ULP) \
+                     requires C FFI incompatible with WASM. IEEE 754-2019 §9.2 recommends but \
+                     does not require correctly-rounded transcendentals."
+                .to_owned(),
         })
     }
 
     fn project_into(
         &self,
-        point: Point3,
-        tolerance: &ToleranceContext,
+        _point: Point3,
+        _tolerance: &ToleranceContext,
         output: &mut Vec<SurfaceProjection>,
     ) -> Result<(), GeometryError> {
         output.clear();
-        let q = point.into_array();
-        let o = self.axis_origin.into_array();
-        let a = self.axis_dir.into_array();
-        let x = self.x_axis.into_array();
-        let y = self.y_axis.into_array();
-        let r = self.radius;
-        let diff = sub3(q, o);
-        let v_val = dot3(diff, a);
-        let radial_vec = sub3(diff, scale3(a, v_val));
-        let radial_len = mag3(radial_vec);
-        let eff_tol = tolerance
-            .effective_length(r)
-            .unwrap_or_else(|_| tolerance.absolute_length());
-        if radial_len < eff_tol {
-            return Err(GeometryError::Singular);
-        }
-        let u_val = angle_to_full_turn(dot3(radial_vec, y).atan2(dot3(radial_vec, x)));
-        let (cos_u, sin_u) = (u_val.cos(), u_val.sin());
-        let proj_arr = add3(
-            add3(o, scale3(a, v_val)),
-            add3(scale3(x, r * cos_u), scale3(y, r * sin_u)),
-        );
-        let proj = Point3::try_new(proj_arr[0], proj_arr[1], proj_arr[2]).map_err(|_| {
-            GeometryError::Uncertified {
-                reason: "cylinder projection point is non-finite".to_owned(),
-            }
-        })?;
-        let local = SurfaceProjection {
-            u: ParameterValue::try_new(u_val).map_err(|_| GeometryError::Uncertified {
-                reason: "cylinder projection u is non-finite".to_owned(),
-            })?,
-            v: ParameterValue::try_new(v_val).map_err(|_| GeometryError::Uncertified {
-                reason: "cylinder projection v is non-finite".to_owned(),
-            })?,
-            point: proj,
-            distance_bound: DistanceBound::try_new(projection_distance_bound3(
-                q, proj_arr, tolerance,
-            )?)
-            .map_err(|_| GeometryError::Uncertified {
-                reason: "cylinder projection distance is non-finite or negative".to_owned(),
-            })?,
-        };
-        output.push(local);
-        Ok(())
+        // u = atan2(...) is an uncertified std transcendental; the
+        // sin(u)/cos(u) reconstruction of the projected point is also
+        // uncertified. See the `analytic::helpers` module docs.
+        Err(GeometryError::Uncertified {
+            reason: "cylinder projection requires certified atan2/sin/cos; pending certified \
+                     trig integration. See: libm crate (empirical accuracy only), core-math \
+                     (0.5 ULP, not WASM-compatible)."
+                .to_owned(),
+        })
     }
 }
 
@@ -402,8 +318,6 @@ impl SurfaceEvaluator for Cylinder {
 
 #[cfg(test)]
 mod tests {
-    use std::f64::consts::{FRAC_PI_2, PI, TAU};
-
     use amphion_foundation::{Point3, ToleranceContext, Vector3};
     use serde_json::json;
 
@@ -417,10 +331,13 @@ mod tests {
         ToleranceContext::try_new(1e-9, 1e-8, 1e-10, 1e-12).unwrap()
     }
 
-    fn dist3(a: Point3, b: Point3) -> f64 {
-        let [ax, ay, az] = a.into_array();
-        let [bx, by, bz] = b.into_array();
-        (ax - bx).hypot((ay - by).hypot(az - bz))
+    fn assert_uncertified(err: &GeometryError) {
+        match err {
+            GeometryError::Uncertified { reason } => {
+                assert!(!reason.is_empty(), "reason string must not be empty");
+            }
+            other => panic!("expected Uncertified, got {other:?}"),
+        }
     }
 
     fn unit_cylinder() -> Cylinder {
@@ -496,174 +413,35 @@ mod tests {
     }
 
     #[test]
-    fn cylinder_evaluate_position_at_cardinal_angles() {
+    fn cylinder_evaluate_returns_uncertified_pending_trig() {
+        // No pure-Rust, WASM-compatible, formally-proved correctly-rounded
+        // sin/cos implementation exists; evaluate() must be honest about
+        // this rather than assert an unproven bound.
         let c = unit_cylinder();
-        let p0 = c
-            .evaluate(0.0, 0.0, DerivativeOrder::Position)
-            .unwrap()
-            .position;
-        let p90 = c
-            .evaluate(FRAC_PI_2, 0.0, DerivativeOrder::Position)
-            .unwrap()
-            .position;
-        let p_axial = c
-            .evaluate(0.0, 5.0, DerivativeOrder::Position)
-            .unwrap()
-            .position;
-        // u=0: (1, 0, 0)
-        assert!((p0.x() - 1.0).abs() < 1e-13 && p0.y().abs() < 1e-13 && p0.z().abs() < 1e-13);
-        // u=π/2: (0, 1, 0)
-        assert!(p90.x().abs() < 1e-13 && (p90.y() - 1.0).abs() < 1e-13 && p90.z().abs() < 1e-13);
-        // v=5: z=5
-        assert!((p_axial.z() - 5.0).abs() < 1e-13);
-    }
-
-    #[test]
-    fn cylinder_evaluate_derivatives_at_known_angle() {
-        let c = unit_cylinder();
-        let ev = c.evaluate(0.0, 0.0, DerivativeOrder::Second).unwrap();
-        let du = ev.du.unwrap().into_array();
-        let dv = ev.dv.unwrap().into_array();
-        let duu = ev.duu.unwrap().into_array();
-        // u=0: du = r*(−sin0·x + cos0·y) = (0,1,0)
-        assert!(du[0].abs() < 1e-14 && (du[1] - 1.0).abs() < 1e-14 && du[2].abs() < 1e-14);
-        // dv = axis_dir = (0,0,1)
-        assert!(dv[0].abs() < 1e-14 && dv[1].abs() < 1e-14 && (dv[2] - 1.0).abs() < 1e-14);
-        // duu = −r*(cos0·x + sin0·y) = (−1,0,0)
-        assert!((duu[0] + 1.0).abs() < 1e-14 && duu[1].abs() < 1e-14 && duu[2].abs() < 1e-14);
-    }
-
-    #[test]
-    fn cylinder_duu_equals_negative_radial_position() {
-        // p″_uu = −r·(cos u·x + sin u·y) = −(p_radial_part)
-        let c = Cylinder::try_new(
-            Point3::try_new(0.0, 0.0, 0.0).unwrap(),
-            Vector3::try_new(0.0, 0.0, 1.0).unwrap(),
-            3.0,
-            Vector3::try_new(1.0, 0.0, 0.0).unwrap(),
-        )
-        .unwrap();
-        for u in [0.1_f64, 1.0, 2.5, PI, 4.7] {
-            let ev = c.evaluate(u, 1.0, DerivativeOrder::Second).unwrap();
-            let pos = ev.position.into_array();
-            let duu = ev.duu.unwrap().into_array();
-            // The radial part of p is (pos[0], pos[1], 0) for axis_dir=Z.
-            // duu should equal -radial_part
-            assert!(
-                (duu[0] + pos[0]).abs() < 1e-12,
-                "u={u} duu[0]={} pos[0]={}",
-                duu[0],
-                pos[0]
-            );
-            assert!(
-                (duu[1] + pos[1]).abs() < 1e-12,
-                "u={u} duu[1]={} pos[1]={}",
-                duu[1],
-                pos[1]
-            );
-            assert!(duu[2].abs() < 1e-12, "duu[2] should be 0");
-        }
-    }
-
-    #[test]
-    fn cylinder_evaluate_fd_check() {
-        let c = Cylinder::try_new(
-            Point3::try_new(1.0, -2.0, 0.5).unwrap(),
-            Vector3::try_new(0.0, 0.0, 1.0).unwrap(),
-            2.0,
-            Vector3::try_new(1.0, 0.0, 0.0).unwrap(),
-        )
-        .unwrap();
-        let h = 1e-7_f64;
-        for u in [0.5_f64, 2.0, 4.0] {
-            let p_plus = c
-                .evaluate(u + h, 1.0, DerivativeOrder::Position)
-                .unwrap()
-                .position
-                .into_array();
-            let p_minus = c
-                .evaluate(u - h, 1.0, DerivativeOrder::Position)
-                .unwrap()
-                .position
-                .into_array();
-            let fd_du: [f64; 3] = std::array::from_fn(|i| (p_plus[i] - p_minus[i]) / (2.0 * h));
-            let analytic_du = c
-                .evaluate(u, 1.0, DerivativeOrder::First)
-                .unwrap()
-                .du
-                .unwrap()
-                .into_array();
-            for i in 0..3 {
-                assert!(
-                    (fd_du[i] - analytic_du[i]).abs() < 1e-5,
-                    "u={u} component {i}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn cylinder_periodic_equivalence() {
-        let c = unit_cylinder();
-        let eps = 1e-12_f64;
-        let p0 = c
-            .evaluate(0.0, 2.0, DerivativeOrder::Position)
-            .unwrap()
-            .position
-            .into_array();
-        let p_near = c
-            .evaluate(TAU - eps, 2.0, DerivativeOrder::Position)
-            .unwrap()
-            .position
-            .into_array();
-        let d = (0..3)
-            .map(|i| (p0[i] - p_near[i]).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        assert!(d < 1e-10, "seam continuity distance={d}");
-    }
-
-    #[test]
-    fn cylinder_projection_round_trip() {
-        let c = Cylinder::try_new(
-            Point3::try_new(0.0, 0.0, 0.0).unwrap(),
-            Vector3::try_new(0.0, 0.0, 1.0).unwrap(),
-            3.0,
-            Vector3::try_new(1.0, 0.0, 0.0).unwrap(),
-        )
-        .unwrap();
-        for (u0, v0) in [(0.0, 0.0), (FRAC_PI_2, 1.0), (PI, -5.0), (5.0, 10.0)] {
-            let pt = c
-                .evaluate(u0, v0, DerivativeOrder::Position)
-                .unwrap()
-                .position;
-            let projs = c.project(pt, &tol()).unwrap();
-            assert_eq!(projs.len(), 1, "u={u0} v={v0}");
-            assert!((projs[0].u.get() - u0).abs() < 1e-11, "u round-trip u={u0}");
-            assert!((projs[0].v.get() - v0).abs() < 1e-11, "v round-trip v={v0}");
-            assert!(projs[0].distance_bound.get() < 1e-11);
-        }
-    }
-
-    #[test]
-    fn cylinder_projection_singular_on_axis() {
-        let c = unit_cylinder();
-        // Point on the Z-axis: all u equidistant.
-        let q = Point3::try_new(0.0, 0.0, 3.0).unwrap();
-        assert_eq!(c.project(q, &tol()), Err(GeometryError::Singular));
-        let near_axis = Point3::try_new(0.5e-9, 0.0, 3.0).unwrap();
-        assert_eq!(c.project(near_axis, &tol()), Err(GeometryError::Singular));
+        let err = c
+            .evaluate(0.0, 0.0, DerivativeOrder::Position, &tol())
+            .unwrap_err();
+        assert_uncertified(&err);
+        let err = c
+            .evaluate(0.0, 5.0, DerivativeOrder::Second, &tol())
+            .unwrap_err();
+        assert_uncertified(&err);
     }
 
     #[test]
     fn cylinder_evaluate_rejects_out_of_domain() {
         let c = unit_cylinder();
         assert_eq!(
-            c.evaluate(-0.001, 0.0, DerivativeOrder::Position),
+            c.evaluate(-0.001, 0.0, DerivativeOrder::Position, &tol()),
             Err(GeometryError::OutsideDomain)
         );
         assert_eq!(
-            c.evaluate(TAU, 0.0, DerivativeOrder::Position),
+            c.evaluate(
+                std::f64::consts::TAU,
+                0.0,
+                DerivativeOrder::Position,
+                &tol()
+            ),
             Err(GeometryError::OutsideDomain)
         );
     }
@@ -672,13 +450,39 @@ mod tests {
     fn cylinder_evaluate_rejects_non_finite() {
         let c = unit_cylinder();
         assert_eq!(
-            c.evaluate(f64::NAN, 0.0, DerivativeOrder::Position),
+            c.evaluate(f64::NAN, 0.0, DerivativeOrder::Position, &tol()),
             Err(GeometryError::NonFiniteParameter)
         );
         assert_eq!(
-            c.evaluate(0.0, f64::INFINITY, DerivativeOrder::Position),
+            c.evaluate(0.0, f64::INFINITY, DerivativeOrder::Position, &tol()),
             Err(GeometryError::NonFiniteParameter)
         );
+    }
+
+    #[test]
+    fn cylinder_project_returns_uncertified_pending_trig() {
+        // u = atan2(...) and its sin/cos reconstruction are uncertified std
+        // transcendentals; project_into must report Uncertified rather than
+        // a bound it cannot support.
+        let c = Cylinder::try_new(
+            Point3::try_new(0.0, 0.0, 0.0).unwrap(),
+            Vector3::try_new(0.0, 0.0, 1.0).unwrap(),
+            3.0,
+            Vector3::try_new(1.0, 0.0, 0.0).unwrap(),
+        )
+        .unwrap();
+        let q = Point3::try_new(2.0, 0.0, 3.0).unwrap();
+        let err = c.project(q, &tol()).unwrap_err();
+        assert_uncertified(&err);
+    }
+
+    #[test]
+    fn cylinder_project_into_clears_output_on_error() {
+        let c = unit_cylinder();
+        let mut output = vec![];
+        let err = c.project_into(Point3::try_new(1.0, 0.0, 0.0).unwrap(), &tol(), &mut output);
+        assert_uncertified(&err.unwrap_err());
+        assert!(output.is_empty());
     }
 
     #[test]
@@ -698,76 +502,6 @@ mod tests {
         let json = serde_json::to_string(&c).unwrap();
         let decoded: Cylinder = serde_json::from_str(&json).unwrap();
         assert_eq!(c, decoded);
-    }
-
-    #[test]
-    fn cylinder_distance_bounds_certify_actual_distance_at_extreme_scales() {
-        let tiny_tol = ToleranceContext::try_new(1e-15, 1e-8, 1e-10, 1e-12).unwrap();
-        let unit = unit_cylinder();
-        let tiny = Cylinder::try_new(
-            Point3::try_new(0.0, 0.0, 0.0).unwrap(),
-            Vector3::try_new(0.0, 0.0, 1.0).unwrap(),
-            1.0e-12,
-            Vector3::try_new(1.0, 0.0, 0.0).unwrap(),
-        )
-        .unwrap();
-        for (cylinder, query, tolerance) in [
-            (
-                unit.clone(),
-                unit.evaluate(0.25, 2.0, DerivativeOrder::Position)
-                    .unwrap()
-                    .position,
-                tol(),
-            ),
-            (unit.clone(), Point3::try_new(2.0, 0.0, 3.0).unwrap(), tol()),
-            (
-                unit.clone(),
-                Point3::try_new(1.0e12, 1.0, 3.0).unwrap(),
-                tol(),
-            ),
-            (
-                tiny.clone(),
-                Point3::try_new(2.0e-12, 0.0, 3.0e-12).unwrap(),
-                tiny_tol,
-            ),
-            (
-                unit.clone(),
-                Point3::try_new(1.0, 1.0e-12, 2.0).unwrap(),
-                tol(),
-            ),
-        ] {
-            let projection = cylinder.project(query, &tolerance).unwrap().remove(0);
-            let actual = dist3(query, projection.point);
-            assert!(actual <= projection.distance_bound.get(), "{query:?}");
-            assert!(projection.distance_bound.get() >= 0.0);
-            assert!(projection.u.get() < TAU);
-        }
-    }
-
-    #[test]
-    fn cylinder_project_into_clears_output_on_error() {
-        let c = unit_cylinder();
-        let mut output = c
-            .project(Point3::try_new(1.0, 0.0, 0.0).unwrap(), &tol())
-            .unwrap();
-        let err = c.project_into(Point3::try_new(0.0, 0.0, 3.0).unwrap(), &tol(), &mut output);
-        assert_eq!(err, Err(GeometryError::Singular));
-        assert!(output.is_empty());
-    }
-
-    #[test]
-    fn cylinder_projection_seam_stays_in_range() {
-        let c = unit_cylinder();
-        let eps = 1e-12_f64;
-        for u in [TAU - eps, eps] {
-            let query = c
-                .evaluate(u, 1.0, DerivativeOrder::Position)
-                .unwrap()
-                .position;
-            let projection = c.project(query, &tol()).unwrap().remove(0);
-            assert!(projection.u.get() >= 0.0);
-            assert!(projection.u.get() < TAU);
-        }
     }
 
     #[test]

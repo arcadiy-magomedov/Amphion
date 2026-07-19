@@ -32,9 +32,9 @@ use crate::{
 use super::{
     ConstructionError, TransformError,
     helpers::{
-        add2, add3, all_finite2, all_finite3, dot2, dot3, normalize2, normalize3,
-        projection_distance_bound2, projection_distance_bound3, scale2, scale3, sub2, sub3,
-        validate_unit2, validate_unit3,
+        add2, add3, all_finite2, all_finite3, arithmetic_eval_bound, arithmetic_proj_bound2,
+        arithmetic_proj_bound3, dot2, dot3, mag2, mag3, normalize2, normalize3, scale2, scale3,
+        sub2, sub3, validate_unit2, validate_unit3,
     },
     transform::{apply_to_point, apply_to_vector},
 };
@@ -142,6 +142,7 @@ impl Curve2Evaluator for Line2 {
         &self,
         parameter: f64,
         order: DerivativeOrder,
+        tolerance: &ToleranceContext,
     ) -> Result<CurveEvaluation2, GeometryError> {
         if !parameter.is_finite() {
             return Err(GeometryError::NonFiniteParameter);
@@ -149,18 +150,45 @@ impl Curve2Evaluator for Line2 {
         // Infinite domain: no bound check needed.
         let o = self.origin.into_array();
         let d = self.direction.into_array();
-        let pos_arr = add2(o, scale2(d, parameter));
+        let scaled_d = scale2(d, parameter);
+        let pos_arr = add2(o, scaled_d);
         let pos =
             Point2::try_new(pos_arr[0], pos_arr[1]).map_err(|_| GeometryError::Uncertified {
                 reason: "line position is non-finite".to_owned(),
             })?;
-        let (first, second) = match order {
-            DerivativeOrder::Position => (None, None),
+
+        // Line evaluation is arithmetic-only (no trig); the Higham bound
+        // applies. `eval_scale` bounds every intermediate magnitude the
+        // evaluation arithmetic can plausibly produce.
+        let eval_scale = mag2(o) + mag2(scaled_d);
+        let position_error_bound = arithmetic_eval_bound(eval_scale)?;
+        let eff_tol =
+            tolerance
+                .effective_length(eval_scale)
+                .map_err(|_| GeometryError::Uncertified {
+                    reason: "world scale is invalid for tolerance computation".to_owned(),
+                })?;
+        if position_error_bound.get() > eff_tol {
+            return Err(GeometryError::Uncertified {
+                reason: "position error bound exceeds requested tolerance at this scale".to_owned(),
+            });
+        }
+
+        // The direction is a stored unit vector: its own arithmetic error
+        // is bounded by the same certified constant applied to unit scale.
+        let direction_error_bound = arithmetic_eval_bound(1.0)?;
+        let zero_error_bound =
+            DistanceBound::try_new(0.0).map_err(|_| GeometryError::Uncertified {
+                reason: "zero distance bound construction failed unexpectedly".to_owned(),
+            })?;
+
+        let (first, first_error_bound, second, second_error_bound) = match order {
+            DerivativeOrder::Position => (None, None, None, None),
             DerivativeOrder::First => {
                 let v = Vector2::try_new(d[0], d[1]).map_err(|_| GeometryError::Uncertified {
                     reason: "line direction is non-finite".to_owned(),
                 })?;
-                (Some(v), None)
+                (Some(v), Some(direction_error_bound), None, None)
             }
             DerivativeOrder::Second => {
                 let v = Vector2::try_new(d[0], d[1]).map_err(|_| GeometryError::Uncertified {
@@ -169,13 +197,21 @@ impl Curve2Evaluator for Line2 {
                 let zero = Vector2::try_new(0.0, 0.0).map_err(|_| GeometryError::Uncertified {
                     reason: "zero vector construction failed unexpectedly".to_owned(),
                 })?;
-                (Some(v), Some(zero))
+                (
+                    Some(v),
+                    Some(direction_error_bound),
+                    Some(zero),
+                    Some(zero_error_bound),
+                )
             }
         };
         Ok(CurveEvaluation2 {
             position: pos,
             first,
             second,
+            position_error_bound,
+            first_error_bound,
+            second_error_bound,
         })
     }
 
@@ -201,7 +237,7 @@ impl Curve2Evaluator for Line2 {
             Point2::try_new(proj_arr[0], proj_arr[1]).map_err(|_| GeometryError::Uncertified {
                 reason: "line projection point is non-finite".to_owned(),
             })?;
-        let dist = projection_distance_bound2(q, proj_arr, tolerance)?;
+        let dist = arithmetic_proj_bound2(q, proj_arr, tolerance)?;
         output.push(CurveProjection2 {
             parameter: ParameterValue::try_new(t).map_err(|_| GeometryError::Uncertified {
                 reason: "line projection parameter is non-finite".to_owned(),
@@ -336,26 +372,49 @@ impl Curve3Evaluator for Line3 {
         &self,
         parameter: f64,
         order: DerivativeOrder,
+        tolerance: &ToleranceContext,
     ) -> Result<CurveEvaluation3, GeometryError> {
         if !parameter.is_finite() {
             return Err(GeometryError::NonFiniteParameter);
         }
         let o = self.origin.into_array();
         let d = self.direction.into_array();
-        let pos_arr = add3(o, scale3(d, parameter));
+        let scaled_d = scale3(d, parameter);
+        let pos_arr = add3(o, scaled_d);
         let pos = Point3::try_new(pos_arr[0], pos_arr[1], pos_arr[2]).map_err(|_| {
             GeometryError::Uncertified {
                 reason: "line position is non-finite".to_owned(),
             }
         })?;
-        let (first, second) = match order {
-            DerivativeOrder::Position => (None, None),
+
+        let eval_scale = mag3(o) + mag3(scaled_d);
+        let position_error_bound = arithmetic_eval_bound(eval_scale)?;
+        let eff_tol =
+            tolerance
+                .effective_length(eval_scale)
+                .map_err(|_| GeometryError::Uncertified {
+                    reason: "world scale is invalid for tolerance computation".to_owned(),
+                })?;
+        if position_error_bound.get() > eff_tol {
+            return Err(GeometryError::Uncertified {
+                reason: "position error bound exceeds requested tolerance at this scale".to_owned(),
+            });
+        }
+
+        let direction_error_bound = arithmetic_eval_bound(1.0)?;
+        let zero_error_bound =
+            DistanceBound::try_new(0.0).map_err(|_| GeometryError::Uncertified {
+                reason: "zero distance bound construction failed unexpectedly".to_owned(),
+            })?;
+
+        let (first, first_error_bound, second, second_error_bound) = match order {
+            DerivativeOrder::Position => (None, None, None, None),
             DerivativeOrder::First => {
                 let v =
                     Vector3::try_new(d[0], d[1], d[2]).map_err(|_| GeometryError::Uncertified {
                         reason: "line direction is non-finite".to_owned(),
                     })?;
-                (Some(v), None)
+                (Some(v), Some(direction_error_bound), None, None)
             }
             DerivativeOrder::Second => {
                 let v =
@@ -366,13 +425,21 @@ impl Curve3Evaluator for Line3 {
                     Vector3::try_new(0.0, 0.0, 0.0).map_err(|_| GeometryError::Uncertified {
                         reason: "zero vector construction failed unexpectedly".to_owned(),
                     })?;
-                (Some(v), Some(zero))
+                (
+                    Some(v),
+                    Some(direction_error_bound),
+                    Some(zero),
+                    Some(zero_error_bound),
+                )
             }
         };
         Ok(CurveEvaluation3 {
             position: pos,
             first,
             second,
+            position_error_bound,
+            first_error_bound,
+            second_error_bound,
         })
     }
 
@@ -399,7 +466,7 @@ impl Curve3Evaluator for Line3 {
                 reason: "line projection point is non-finite".to_owned(),
             }
         })?;
-        let dist = projection_distance_bound3(q, proj_arr, tolerance)?;
+        let dist = arithmetic_proj_bound3(q, proj_arr, tolerance)?;
         output.push(CurveProjection3 {
             parameter: ParameterValue::try_new(t).map_err(|_| GeometryError::Uncertified {
                 reason: "line projection parameter is non-finite".to_owned(),
@@ -509,10 +576,13 @@ mod tests {
             Vector2::try_new(1.0, 0.0).unwrap(),
         )
         .unwrap();
-        let ev = line.evaluate(3.0, DerivativeOrder::Position).unwrap();
+        let ev = line
+            .evaluate(3.0, DerivativeOrder::Position, &tol())
+            .unwrap();
         assert!((ev.position.x() - 4.0).abs() < 1e-14);
         assert!((ev.position.y() - 2.0).abs() < 1e-14);
         assert!(ev.first.is_none());
+        assert!(ev.position_error_bound.get() >= 0.0);
     }
 
     #[test]
@@ -522,7 +592,7 @@ mod tests {
             Vector2::try_new(1.0, 0.0).unwrap(),
         )
         .unwrap();
-        let ev = line.evaluate(5.0, DerivativeOrder::Second).unwrap();
+        let ev = line.evaluate(5.0, DerivativeOrder::Second, &tol()).unwrap();
         let d1 = ev.first.unwrap().into_array();
         let d2 = ev.second.unwrap().into_array();
         assert!(
@@ -533,6 +603,9 @@ mod tests {
             d2[0].abs() < 1e-14 && d2[1].abs() < 1e-14,
             "d2 should be zero"
         );
+        assert!(ev.position_error_bound.get() >= 0.0);
+        assert!(ev.first_error_bound.unwrap().get() >= 0.0);
+        assert!(ev.second_error_bound.unwrap().get() >= 0.0);
     }
 
     #[test]
@@ -546,12 +619,12 @@ mod tests {
         let h = 1e-7_f64;
         let t0 = 2.0_f64;
         let p_plus = line
-            .evaluate(t0 + h, DerivativeOrder::Position)
+            .evaluate(t0 + h, DerivativeOrder::Position, &tol())
             .unwrap()
             .position
             .into_array();
         let p_minus = line
-            .evaluate(t0 - h, DerivativeOrder::Position)
+            .evaluate(t0 - h, DerivativeOrder::Position, &tol())
             .unwrap()
             .position
             .into_array();
@@ -560,7 +633,7 @@ mod tests {
             (p_plus[1] - p_minus[1]) / (2.0 * h),
         ];
         let analytic = line
-            .evaluate(t0, DerivativeOrder::First)
+            .evaluate(t0, DerivativeOrder::First, &tol())
             .unwrap()
             .first
             .unwrap()
@@ -588,7 +661,7 @@ mod tests {
         .unwrap();
         let t0 = 7.5_f64;
         let point = line
-            .evaluate(t0, DerivativeOrder::Position)
+            .evaluate(t0, DerivativeOrder::Position, &tol())
             .unwrap()
             .position;
         let projections = line.project(point, &tol()).unwrap();
@@ -622,7 +695,7 @@ mod tests {
         )
         .unwrap();
         for query in [
-            line.evaluate(3.0, DerivativeOrder::Position)
+            line.evaluate(3.0, DerivativeOrder::Position, &tol())
                 .unwrap()
                 .position,
             Point2::try_new(3.0, 4.0).unwrap(),
@@ -645,11 +718,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            line.evaluate(f64::NAN, DerivativeOrder::Position),
+            line.evaluate(f64::NAN, DerivativeOrder::Position, &tol()),
             Err(GeometryError::NonFiniteParameter)
         );
         assert_eq!(
-            line.evaluate(f64::INFINITY, DerivativeOrder::Position),
+            line.evaluate(f64::INFINITY, DerivativeOrder::Position, &tol()),
             Err(GeometryError::NonFiniteParameter)
         );
     }
@@ -735,7 +808,7 @@ mod tests {
             Vector3::try_new(SQRT_2 / 2.0, SQRT_2 / 2.0, 0.0).unwrap(),
         )
         .unwrap();
-        let ev = line.evaluate(0.0, DerivativeOrder::Second).unwrap();
+        let ev = line.evaluate(0.0, DerivativeOrder::Second, &tol()).unwrap();
         assert!((ev.position.x() - 1.0).abs() < 1e-14);
         assert!((ev.position.y() - 2.0).abs() < 1e-14);
         assert!((ev.position.z() - 3.0).abs() < 1e-14);
@@ -744,6 +817,9 @@ mod tests {
             d2.iter().all(|v| v.abs() < 1e-14),
             "d2 must be zero for a line"
         );
+        assert!(ev.position_error_bound.get() >= 0.0);
+        assert!(ev.first_error_bound.unwrap().get() >= 0.0);
+        assert!(ev.second_error_bound.unwrap().get() >= 0.0);
     }
 
     #[test]
@@ -756,18 +832,18 @@ mod tests {
         let h = 1e-7_f64;
         let t0 = -1.5_f64;
         let p_plus = line
-            .evaluate(t0 + h, DerivativeOrder::Position)
+            .evaluate(t0 + h, DerivativeOrder::Position, &tol())
             .unwrap()
             .position
             .into_array();
         let p_minus = line
-            .evaluate(t0 - h, DerivativeOrder::Position)
+            .evaluate(t0 - h, DerivativeOrder::Position, &tol())
             .unwrap()
             .position
             .into_array();
         let fd: [f64; 3] = std::array::from_fn(|i| (p_plus[i] - p_minus[i]) / (2.0 * h));
         let analytic = line
-            .evaluate(t0, DerivativeOrder::First)
+            .evaluate(t0, DerivativeOrder::First, &tol())
             .unwrap()
             .first
             .unwrap()
@@ -791,7 +867,7 @@ mod tests {
         .unwrap();
         for t0 in [-10.0, 0.0, 5.0, 100.0] {
             let pt = line
-                .evaluate(t0, DerivativeOrder::Position)
+                .evaluate(t0, DerivativeOrder::Position, &tol())
                 .unwrap()
                 .position;
             let projs = line.project(pt, &tol()).unwrap();
@@ -824,7 +900,7 @@ mod tests {
         )
         .unwrap();
         for query in [
-            line.evaluate(-4.0, DerivativeOrder::Position)
+            line.evaluate(-4.0, DerivativeOrder::Position, &tol())
                 .unwrap()
                 .position,
             Point3::try_new(3.0, 4.0, 5.0).unwrap(),

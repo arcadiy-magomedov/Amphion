@@ -108,17 +108,32 @@ pub enum DerivativeOrder {
 }
 
 /// A two-dimensional curve evaluation.
+///
+/// Evaluated position and derivatives with certified error bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CurveEvaluation2 {
-    /// Evaluated point.
+    /// Evaluated position in 2-D parameter space.
     pub position: Point2,
-    /// First derivative when requested.
+    /// First derivative, if requested.
     pub first: Option<Vector2>,
-    /// Second derivative when requested.
+    /// Second derivative, if requested.
     pub second: Option<Vector2>,
+    /// Certified upper bound on `‖position − true p(t)‖` in metres.
+    /// Accounts for floating-point arithmetic error in the evaluation
+    /// formula and stored-frame deviation. Zero only for exactly
+    /// representable cases.
+    pub position_error_bound: DistanceBound,
+    /// Certified upper bound on `‖first − true p′(t)‖`, or `None` when
+    /// `first` is `None`.
+    pub first_error_bound: Option<DistanceBound>,
+    /// Certified upper bound on `‖second − true p″(t)‖`, or `None` when
+    /// `second` is `None`.
+    pub second_error_bound: Option<DistanceBound>,
 }
 
 /// A three-dimensional curve evaluation.
+///
+/// Evaluated position and derivatives with certified error bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CurveEvaluation3 {
     /// Evaluated point.
@@ -127,9 +142,19 @@ pub struct CurveEvaluation3 {
     pub first: Option<Vector3>,
     /// Second derivative when requested.
     pub second: Option<Vector3>,
+    /// Certified upper bound on `‖position − true p(t)‖` in metres.
+    pub position_error_bound: DistanceBound,
+    /// Certified upper bound on `‖first − true p′(t)‖`, or `None` when
+    /// `first` is `None`.
+    pub first_error_bound: Option<DistanceBound>,
+    /// Certified upper bound on `‖second − true p″(t)‖`, or `None` when
+    /// `second` is `None`.
+    pub second_error_bound: Option<DistanceBound>,
 }
 
 /// A surface evaluation through second order.
+///
+/// Evaluated position and derivatives with certified error bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SurfaceEvaluation {
     /// Evaluated point.
@@ -144,6 +169,23 @@ pub struct SurfaceEvaluation {
     pub duv: Option<Vector3>,
     /// Second partial derivative with respect to V.
     pub dvv: Option<Vector3>,
+    /// Certified upper bound on `‖position − true p(u,v)‖` in metres.
+    pub position_error_bound: DistanceBound,
+    /// Certified upper bound on `‖du − true ∂p/∂u‖`, or `None` when `du` is
+    /// `None`.
+    pub first_u_error_bound: Option<DistanceBound>,
+    /// Certified upper bound on `‖dv − true ∂p/∂v‖`, or `None` when `dv` is
+    /// `None`.
+    pub first_v_error_bound: Option<DistanceBound>,
+    /// Certified upper bound on `‖duu − true ∂²p/∂u²‖`, or `None` when
+    /// `duu` is `None`.
+    pub second_uu_error_bound: Option<DistanceBound>,
+    /// Certified upper bound on `‖duv − true ∂²p/∂u∂v‖`, or `None` when
+    /// `duv` is `None`.
+    pub second_uv_error_bound: Option<DistanceBound>,
+    /// Certified upper bound on `‖dvv − true ∂²p/∂v²‖`, or `None` when
+    /// `dvv` is `None`.
+    pub second_vv_error_bound: Option<DistanceBound>,
 }
 
 /// One inverse mapping from model space to a two-dimensional curve.

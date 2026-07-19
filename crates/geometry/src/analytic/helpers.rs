@@ -5,62 +5,52 @@
 //! types, call [`crate::GeometryError`]-returning helpers from the parent
 //! module.
 //!
-//! # Provisional distance bounds
+//! # Certified bounds are arithmetic-only
 //!
-//! `projection_distance_bound2` and `projection_distance_bound3` derive an
-//! upper bound on the true geometric distance from a query point to a
-//! projected surface/curve point, accounting for accumulated floating-point
-//! rounding.
+//! [`arithmetic_proj_bound2`], [`arithmetic_proj_bound3`], and
+//! [`arithmetic_eval_bound`] derive a certified upper bound on floating-point
+//! error for computations that use **only** IEEE 754 basic operations
+//! (addition, subtraction, multiplication, division, and `sqrt`), all of
+//! which are correctly rounded per IEEE 754-2008/2019 §5.4. Under Higham
+//! (2002), *Accuracy and Stability of Numerical Algorithms*, 2nd ed., SIAM,
+//! Theorem 3.5 and §2.2: for a computation composed of `n` such operations,
+//! `|fl(x) − x| ≤ γ_n · |x|` where `γ_n = n·ε / (1 − n·ε)`. Line and plane
+//! evaluation/projection involve at most `~16` elementary operations
+//! (dot products, additions, subtractions, one `sqrt` for magnitude); we use
+//! `γ_32 ≤ 64·ε` as a conservative round-number bound covering both the 2-D
+//! and 3-D cases with margin.
 //!
-//! ## What the bound covers
+//! **This bound is only valid for arithmetic-only computations.** No
+//! certified, WASM-compatible, formally-proved correctly-rounded `sin`,
+//! `cos`, or `atan2` implementation currently exists in the Rust ecosystem:
 //!
-//! The bound is `residual + fp_err`, where `residual` is the naively
-//! computed Euclidean distance between `query` and `projection`, and
-//! `fp_err = C · ε · s_world` is a heuristic allowance for rounding error
-//! accumulated while producing `projection` from `query`.
+//! - `libm` (MIT, pure Rust, WASM-compatible): empirically ~1–2 ULP, but
+//!   **not formally proved** correctly rounded.
+//! - `core-math` (MIT, 0.5 ULP correctly rounded): requires `fenv.h` C FFI
+//!   for directed-rounding control, **not WASM-compatible**.
+//! - `inari` / `rug` (interval arithmetic via MPFR): require GMP/MPFR C
+//!   libraries, **not WASM-compatible**.
+//! - `inari_wasm`: calls `f64::sin` directly without directed rounding, so
+//!   it is **not rigorous** as an interval implementation.
+//! - IEEE 754-2019 §9.2 only *recommends* (does not *require*)
+//!   correctly-rounded `sin`/`cos`/`atan2`, so no portable error bound on
+//!   these functions can be assumed by a certified kernel.
 //!
-//! The scale `s_world = |query| + |projection|` is deliberately a
-//! **world-coordinate** magnitude, not a translation-invariant local
-//! displacement.  A local scale such as `|query − anchor|` can be far smaller
-//! than the magnitudes actually manipulated during projection (e.g. when a
-//! circle has a huge radius but the query happens to land near the anchor),
-//! which silently discards the rounding error accumulated in the large
-//! intermediate coordinates and can produce a bound that is *below* the true
-//! distance. `s_world` bounds every intermediate magnitude the projection
-//! arithmetic can plausibly produce, so `fp_err` is a valid allowance for the
-//! rounding accumulated while computing `projection` regardless of where the
-//! query sits relative to the primitive's anchor.
+//! Consequently, every evaluator whose formula involves `sin`, `cos`, or
+//! `atan2` (`Circle2`, `Circle3`, `Cylinder`, `Cone` — both `evaluate()` and
+//! `project_into()`) returns [`GeometryError::Uncertified`] instead of a
+//! numeric bound, until a formally-proved WASM-compatible trigonometric
+//! implementation is integrated.
 //!
-//! `C = 64` is a **heuristic** constant intended to loosely cover a chain of
-//! `~32` elementary floating-point operations (dot products, additions,
-//! subtractions) plus a `2×` margin for the non-elementary trigonometric
-//! calls (`sin`, `cos`, `atan2`) used by curved primitives. This is
-//! **provisional**: it is not a formally derived certificate. In particular,
-//! IEEE 754-2019 only *recommends* (does not require) correctly-rounded
-//! transcendental functions, so no portable bound on `sin`/`cos`/`atan2`
-//! error can be assumed; and general elementary-operation error models (e.g.
-//! Higham, *Accuracy and Stability of Numerical Algorithms*, 2nd ed., SIAM
-//! 2002, §2.2) do not by themselves bound trigonometric or square-root
-//! operations. Formal certification requires interval arithmetic over the
-//! actual operation sequence, which is not yet available in this crate.
-//!
-//! **Rejection criterion**: if `fp_err > effective_length(s_world)`, the
-//! heuristic numerical error allowance exceeds the caller's tolerance at this
-//! scale, and we return `GeometryError::Uncertified` rather than assert a
-//! bound we cannot support.
-//!
-//! ## Foundation dependency
-//!
-//! Commit `cf85555` (not yet merged onto this branch) adds `UnitVector2/3`,
-//! `Interval`, checked vector norms, and `Transform3` point/vector
-//! application to `amphion-foundation`. Once available, this module's
-//! heuristic bound should be replaced by a formally certified interval-based
-//! bound derived from the actual operation sequence, and this doc comment
-//! should be updated accordingly.
+//! **Rejection criterion**: for arithmetic-only bounds, if the certified
+//! floating-point error allowance exceeds `tolerance.effective_length(scale)`
+//! at the relevant world-coordinate scale, we return
+//! `GeometryError::Uncertified` rather than assert a bound we cannot
+//! support.
 
 use amphion_foundation::ToleranceContext;
 
-use crate::{GeometryError, ParameterRange};
+use crate::{DistanceBound, GeometryError, ParameterRange};
 
 use super::ConstructionError;
 
@@ -79,10 +69,19 @@ pub(super) const UNIT_VECTOR_TOL: f64 = 4.0 * f64::EPSILON;
 /// would be unreliable.
 pub(super) const ILL_COND_THRESH: f64 = 2.384_185_791_015_625e-7;
 
-/// Heuristic FP-error constant used in `projection_distance_bound*`.
-/// See module-level documentation for what this covers and its provisional
-/// status.
-const C_FP: f64 = 64.0;
+/// Certified Higham `γ_32` bound (see module-level documentation) for
+/// arithmetic-only (no-trig) computations: `γ_32 = 32ε/(1−32ε) ≤ 64ε`.
+///
+/// Valid ONLY for computations built exclusively from IEEE 754 basic
+/// operations (add, sub, mul, div, sqrt). Never apply to a computation that
+/// calls `sin`, `cos`, or `atan2`.
+const GAMMA_32: f64 = 64.0 * f64::EPSILON;
+
+/// Higham `γ_64` bound used for evaluation error, which additionally accounts
+/// for the ≤ `UNIT_VECTOR_TOL` per-component deviation of a stored direction
+/// vector from a true unit vector. Still arithmetic-only; still ≤ a small
+/// constant multiple of ε.
+const GAMMA_64: f64 = 128.0 * f64::EPSILON;
 
 // ─── 3-D helpers ────────────────────────────────────────────────────────────
 
@@ -193,23 +192,6 @@ pub(super) fn all_finite2(v: [f64; 2]) -> bool {
     v[0].is_finite() && v[1].is_finite()
 }
 
-// ─── Angular helpers ─────────────────────────────────────────────────────────
-
-/// Maps an angle (in radians) to the canonical domain `[0, 2π)`.
-///
-/// Uses `rem_euclid` for correct signed-remainder behaviour across the full
-/// range of finite `f64` inputs.  The subsequent clamp `if r >= TAU { 0.0 }`
-/// handles the edge case where `rem_euclid` returns exactly `TAU` due to
-/// IEEE 754 rounding (e.g. `(-1e-300).rem_euclid(TAU) == TAU` on x86-64).
-/// The result is always in `[0, 2π)` for every finite input.
-pub(super) fn angle_to_full_turn(angle: f64) -> f64 {
-    use std::f64::consts::TAU;
-    let r = angle.rem_euclid(TAU);
-    // Clamp the floating-point artefact where rem_euclid rounds up to TAU.
-    // Add 0.0 to canonicalize -0.0 to +0.0 (IEEE 754: -0.0 + 0.0 = +0.0).
-    if r >= TAU { 0.0 } else { r + 0.0 }
-}
-
 // ─── Domain helpers ──────────────────────────────────────────────────────────
 
 /// Returns `true` when `t` is finite and inside the declared parameter range.
@@ -262,132 +244,126 @@ pub(super) fn validate_orthogonal3(a: [f64; 3], b: [f64; 3]) -> Result<(), Const
     Ok(())
 }
 
-/// Returns a provisional upper bound on `|query − projection|` for a 2-D
-/// projection, and checks that the heuristic floating-point error allowance
-/// fits within `tolerance`.
+/// Certified upper bound on `|query − projection|` for a LINE or PLANE
+/// projection in 2-D (no trig involved), and checks that the certified
+/// floating-point error allowance fits within `tolerance`.
 ///
-/// The characteristic scale `s_world = |query| + |projection|` is a
-/// world-coordinate magnitude (not translation-invariant); see the
-/// module-level documentation for why this is required for the bound to be
-/// valid at all coordinate scales.
+/// # Derivation (Higham 2002, §2.2, Theorem 3.5)
+///
+/// Line/plane projection involves only IEEE 754 basic operations (add, sub,
+/// mul, sqrt — all correctly rounded by IEEE 754-2008/2019 mandate). For `n`
+/// elementary operations: `|fl(x) − x| ≤ γ_n · |x|` where
+/// `γ_n = n·ε / (1 − n·ε)`. 2-D line/plane projection plus residual
+/// magnitude involves `≤ 16` such operations, so `γ_16 ≤ 32ε`; we use the
+/// conservative round number `γ_32 ≤ 64ε` ([`GAMMA_32`]) to cover both the
+/// 2-D and 3-D cases with margin.
+///
+/// The characteristic scale `scale = |query| + |projection|` is a
+/// world-coordinate magnitude (not translation-invariant): it bounds every
+/// intermediate magnitude the projection arithmetic can plausibly produce,
+/// so the resulting `fp_err` allowance is valid regardless of where `query`
+/// sits relative to the primitive's anchor.
+///
+/// This function is **only** valid for arithmetic-only computations (lines,
+/// planes). Functions involving `sin`/`cos`/`atan2` must return
+/// [`GeometryError::Uncertified`] directly instead of calling this helper.
 ///
 /// # Errors
 ///
-/// Returns [`GeometryError::Uncertified`] if the heuristic FP error allowance
-/// exceeds `tolerance.effective_length(s_world)`, i.e. the primitive's scale
-/// is too large relative to the requested tolerance for this provisional
-/// bound to be trustworthy.
-pub(super) fn projection_distance_bound2(
+/// Returns [`GeometryError::Uncertified`] if the certified FP error
+/// allowance exceeds `tolerance.effective_length(scale)`, i.e. the
+/// primitive's scale is too large relative to the requested tolerance for
+/// `f64` arithmetic to certify a bound.
+pub(super) fn arithmetic_proj_bound2(
     query: [f64; 2],
     projection: [f64; 2],
     tolerance: &ToleranceContext,
 ) -> Result<f64, GeometryError> {
-    let s_world = mag2(query) + mag2(projection);
     let residual = mag2(sub2(query, projection));
-    let fp_err = C_FP * f64::EPSILON * s_world;
+    let scale = mag2(query) + mag2(projection);
+    let fp_err = GAMMA_32 * scale;
     let bound = residual + fp_err;
+    if !bound.is_finite() {
+        return Err(GeometryError::Uncertified {
+            reason: "projection distance overflowed representable range".to_owned(),
+        });
+    }
     let eff_tol = tolerance
-        .effective_length(s_world)
+        .effective_length(scale)
         .map_err(|_| GeometryError::Uncertified {
-            reason: "invalid world scale for certification".to_owned(),
+            reason: "world scale is invalid for tolerance computation".to_owned(),
         })?;
     if fp_err > eff_tol {
         return Err(GeometryError::Uncertified {
-            reason: "floating-point error bound exceeds requested tolerance at this scale"
+            reason: "f64 coordinate granularity exceeds requested tolerance at this world \
+                     scale; consider reducing the coordinate magnitude or relaxing the tolerance"
                 .to_owned(),
         });
     }
     Ok(bound)
 }
 
-/// Returns a provisional upper bound on `|query − projection|` for a 3-D
-/// projection.  See [`projection_distance_bound2`] for the derivation.
-pub(super) fn projection_distance_bound3(
+/// Certified upper bound on `|query − projection|` for a LINE or PLANE
+/// projection in 3-D.  See [`arithmetic_proj_bound2`] for the derivation.
+pub(super) fn arithmetic_proj_bound3(
     query: [f64; 3],
     projection: [f64; 3],
     tolerance: &ToleranceContext,
 ) -> Result<f64, GeometryError> {
-    let s_world = mag3(query) + mag3(projection);
     let residual = mag3(sub3(query, projection));
-    let fp_err = C_FP * f64::EPSILON * s_world;
+    let scale = mag3(query) + mag3(projection);
+    let fp_err = GAMMA_32 * scale;
     let bound = residual + fp_err;
+    if !bound.is_finite() {
+        return Err(GeometryError::Uncertified {
+            reason: "projection distance overflowed representable range".to_owned(),
+        });
+    }
     let eff_tol = tolerance
-        .effective_length(s_world)
+        .effective_length(scale)
         .map_err(|_| GeometryError::Uncertified {
-            reason: "invalid world scale for certification".to_owned(),
+            reason: "world scale is invalid for tolerance computation".to_owned(),
         })?;
     if fp_err > eff_tol {
         return Err(GeometryError::Uncertified {
-            reason: "floating-point error bound exceeds requested tolerance at this scale"
+            reason: "f64 coordinate granularity exceeds requested tolerance at this world scale"
                 .to_owned(),
         });
     }
     Ok(bound)
 }
 
-/// Certifies the sign of the axial component `h` for cone projection.
+/// Certified upper bound on `‖evaluated_position − true_p(t)‖` for
+/// arithmetic-only evaluators (`Line2`/`Line3`, `Plane`).
 ///
-/// Returns `Some(Ordering)` when the sign can be certified from the FP error
-/// bound, or `None` when `|h|` is too small relative to `d_mag` to determine
-/// whether the query is above, below, or in the equatorial plane.
+/// Uses the [`GAMMA_64`] bound, which combines the `γ_32` arithmetic-error
+/// bound with an allowance for the `UNIT_VECTOR_TOL` per-component deviation
+/// of a stored direction vector from a true unit vector. `eval_scale` is the
+/// world-coordinate magnitude of the evaluation result (e.g.
+/// `|origin| + |t · direction|`).
 ///
-/// The error bound `C_H · ε · d_mag` is derived from Higham Theorem 3.5:
-/// a 3-D dot product after a 3-component vector subtraction accumulates at
-/// most 8ε relative error on `d_mag`.
-pub(super) fn certify_h_sign(h: f64, d_mag: f64) -> Option<core::cmp::Ordering> {
-    const C_H: f64 = 8.0;
-    let err_bound = C_H * f64::EPSILON * d_mag;
-    if h == 0.0 {
-        Some(core::cmp::Ordering::Equal)
-    } else if h > err_bound {
-        Some(core::cmp::Ordering::Greater)
-    } else if h < -err_bound {
-        Some(core::cmp::Ordering::Less)
-    } else {
-        None
+/// # Errors
+///
+/// Returns [`GeometryError::Uncertified`] if `eval_scale` is not finite, so
+/// the bound itself cannot be certified as finite and non-negative.
+pub(super) fn arithmetic_eval_bound(eval_scale: f64) -> Result<DistanceBound, GeometryError> {
+    if !eval_scale.is_finite() {
+        return Err(GeometryError::Uncertified {
+            reason: "evaluation scale is non-finite".to_owned(),
+        });
     }
+    let bound = (GAMMA_64 * eval_scale.abs()).max(0.0);
+    DistanceBound::try_new(bound).map_err(|_| GeometryError::Uncertified {
+        reason: "arithmetic evaluation error bound overflowed representable range".to_owned(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use std::f64::consts::{PI, TAU};
-
     use super::{
-        UNIT_VECTOR_TOL, angle_to_full_turn, mag2, mag3, normalize2, normalize3, validate_unit2,
-        validate_unit3,
+        UNIT_VECTOR_TOL, mag2, mag3, normalize2, normalize3, validate_unit2, validate_unit3,
     };
     use crate::analytic::ConstructionError;
-
-    #[test]
-    fn angle_to_full_turn_preserves_tiny_positive_angles() {
-        let angle = 1e-300_f64;
-        let mapped = angle_to_full_turn(angle);
-        assert!(mapped > 0.0);
-        assert!((mapped - angle).abs() < 1e-320);
-    }
-
-    #[test]
-    fn angle_to_full_turn_maps_tiny_negative_angles_below_tau() {
-        // (-1e-300).rem_euclid(TAU) == TAU on x86-64 due to IEEE 754 rounding.
-        // angle_to_full_turn must clamp that to 0.0, not TAU.
-        let mapped = angle_to_full_turn(-1e-300_f64);
-        assert!(mapped < TAU, "result must be < TAU, got {mapped:.20e}");
-        // Periodic equivalent: 0.0 is acceptable (same congruence class as -1e-300 mod 2π)
-        assert_eq!(mapped.to_bits(), 0.0_f64.to_bits());
-    }
-
-    #[test]
-    fn angle_to_full_turn_handles_seam_values() {
-        let eps = 1e-12_f64;
-        // PI is exactly representable, rem_euclid should be exact.
-        assert_eq!(angle_to_full_turn(PI).to_bits(), PI.to_bits());
-        assert!(angle_to_full_turn(TAU - eps) < TAU);
-        assert!(angle_to_full_turn(TAU + eps) < TAU);
-        assert_eq!(angle_to_full_turn(-0.0).to_bits(), 0.0f64.to_bits());
-        // Tiny positive: must survive without collapsing to 0.
-        assert!(angle_to_full_turn(1e-300_f64) > 0.0);
-        assert!(angle_to_full_turn(1e-300_f64) < TAU);
-    }
 
     #[test]
     fn normalize3_handles_max_scale_inputs() {
