@@ -36,13 +36,14 @@ use crate::{
 use super::{
     ConstructionError,
     helpers::{
-        ILL_COND_THRESH, add3, all_finite3, cross3, dot3, mag3, normalize3, scale3, sub3,
-        validate_orthogonal3, validate_unit3, widened_distance_bound3,
+        ILL_COND_THRESH, add3, all_finite3, certified_distance_bound3, cross3, dot3, mag3,
+        normalize3, scale3, sub3, validate_orthogonal3, validate_unit3,
     },
 };
 
 fn unbounded_range() -> ParameterRange {
-    ParameterRange::try_new(None, None, None).expect("None/None/None is always valid")
+    ParameterRange::try_new(None, None, None)
+        .unwrap_or_else(|_| unreachable!("unbounded domain is always valid"))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -102,14 +103,12 @@ impl Plane {
         }
         let v_unit = normalize3(v_perp).ok_or(ConstructionError::DependentAxes)?;
         Ok(Self {
-            // unreachable: validated above
-            origin: Point3::try_new(o[0], o[1], o[2]).expect("origin validated finite"),
-            // unreachable: validated above
+            origin: Point3::try_new(o[0], o[1], o[2])
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
             u_axis: Vector3::try_new(u_unit[0], u_unit[1], u_unit[2])
-                .expect("unit u_axis is finite"),
-            // unreachable: validated above
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
             v_axis: Vector3::try_new(v_unit[0], v_unit[1], v_unit[2])
-                .expect("unit v_axis is finite"),
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
         })
     }
 
@@ -137,7 +136,9 @@ impl Plane {
         let u = self.u_axis.into_array();
         let v = self.v_axis.into_array();
         let n = cross3(u, v);
-        Vector3::try_new(n[0], n[1], n[2]).expect("cross product of orthonormal pair is finite")
+        Vector3::try_new(n[0], n[1], n[2]).unwrap_or_else(|_| {
+            unreachable!("cross product of stored orthonormal pair is always a unit vector")
+        })
     }
 }
 
@@ -224,7 +225,8 @@ impl SurfaceEvaluator for Plane {
                         reason: "v_axis non-finite".to_owned(),
                     }
                 })?;
-                let zero = Vector3::try_new(0.0, 0.0, 0.0).expect("zero is finite");
+                let zero = Vector3::try_new(0.0, 0.0, 0.0)
+                    .unwrap_or_else(|_| unreachable!("zero vector is always finite"));
                 (Some(du), Some(dv), Some(zero), Some(zero), Some(zero))
             }
         };
@@ -241,7 +243,7 @@ impl SurfaceEvaluator for Plane {
     fn project_into(
         &self,
         point: Point3,
-        _tolerance: &ToleranceContext,
+        tolerance: &ToleranceContext,
         output: &mut Vec<SurfaceProjection>,
     ) -> Result<(), GeometryError> {
         output.clear();
@@ -271,11 +273,12 @@ impl SurfaceEvaluator for Plane {
                 reason: "plane projection v is non-finite".to_owned(),
             })?,
             point: proj,
-            distance_bound: DistanceBound::try_new(widened_distance_bound3(q, proj_arr)).map_err(
-                |_| GeometryError::Uncertified {
-                    reason: "plane projection distance is non-finite or negative".to_owned(),
-                },
-            )?,
+            distance_bound: DistanceBound::try_new(certified_distance_bound3(
+                o, q, proj_arr, tolerance,
+            )?)
+            .map_err(|_| GeometryError::Uncertified {
+                reason: "plane projection distance is non-finite or negative".to_owned(),
+            })?,
         };
         output.push(local);
         Ok(())

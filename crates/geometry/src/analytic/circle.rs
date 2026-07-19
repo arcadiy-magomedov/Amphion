@@ -42,16 +42,16 @@ use crate::{
 use super::{
     ConstructionError,
     helpers::{
-        ILL_COND_THRESH, add2, add3, all_finite2, all_finite3, angle_to_full_turn, cross3, dot2,
-        dot3, in_range, mag2, mag3, normalize2, normalize3, perp2, scale2, scale3, sub2, sub3,
-        validate_orthogonal3, validate_unit2, validate_unit3, widened_distance_bound2,
-        widened_distance_bound3,
+        ILL_COND_THRESH, add2, add3, all_finite2, all_finite3, angle_to_full_turn,
+        certified_distance_bound2, certified_distance_bound3, cross3, dot2, dot3, in_range, mag2,
+        mag3, normalize2, normalize3, perp2, scale2, scale3, sub2, sub3, validate_orthogonal3,
+        validate_unit2, validate_unit3,
     },
 };
 
 fn circle_domain() -> ParameterRange {
     ParameterRange::try_new(Some(0.0), Some(TAU), Some(TAU))
-        .expect("circle domain [0, 2π) is always valid")
+        .unwrap_or_else(|_| unreachable!("circle domain [0, 2π) is always valid"))
 }
 
 // ─── Circle2 ─────────────────────────────────────────────────────────────────
@@ -100,11 +100,10 @@ impl Circle2 {
         }
         let x_unit = normalize2(x).ok_or(ConstructionError::DegenerateAxis)?;
         Ok(Self {
-            // unreachable: validated above
-            center: Point2::try_new(c[0], c[1]).expect("center validated finite"),
-            // unreachable: validated above
+            center: Point2::try_new(c[0], c[1]).map_err(|_| ConstructionError::NonFiniteInput)?,
             radius,
-            x_axis: Vector2::try_new(x_unit[0], x_unit[1]).expect("unit x_axis is finite"),
+            x_axis: Vector2::try_new(x_unit[0], x_unit[1])
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
         })
     }
 
@@ -131,7 +130,8 @@ impl Circle2 {
     pub fn y_axis(&self) -> Vector2 {
         let x = self.x_axis.into_array();
         let y = perp2(x);
-        Vector2::try_new(y[0], y[1]).expect("perp of unit vector is unit")
+        Vector2::try_new(y[0], y[1])
+            .unwrap_or_else(|_| unreachable!("perp of stored unit vector is always a unit vector"))
     }
 }
 
@@ -240,7 +240,11 @@ impl Curve2Evaluator for Circle2 {
         let y = perp2(x);
         let r = self.radius;
         let diff = sub2(q, c);
-        if mag2(diff) < tolerance.absolute_length() {
+        let s_local = mag2(diff);
+        let eff_tol = tolerance
+            .effective_length(self.radius)
+            .unwrap_or_else(|_| tolerance.absolute_length());
+        if s_local < eff_tol {
             return Err(GeometryError::Singular);
         }
         let theta = angle_to_full_turn(dot2(diff, y).atan2(dot2(diff, x)));
@@ -255,11 +259,12 @@ impl Curve2Evaluator for Circle2 {
                 reason: "circle projection parameter is non-finite".to_owned(),
             })?,
             point: proj,
-            distance_bound: DistanceBound::try_new(widened_distance_bound2(q, proj_arr)).map_err(
-                |_| GeometryError::Uncertified {
-                    reason: "circle projection distance is non-finite or negative".to_owned(),
-                },
-            )?,
+            distance_bound: DistanceBound::try_new(certified_distance_bound2(
+                c, q, proj_arr, tolerance,
+            )?)
+            .map_err(|_| GeometryError::Uncertified {
+                reason: "circle projection distance is non-finite or negative".to_owned(),
+            })?,
         });
         Ok(())
     }
@@ -336,15 +341,13 @@ impl Circle3 {
         }
         let x_unit = normalize3(x_perp).ok_or(ConstructionError::DependentAxes)?;
         Ok(Self {
-            // unreachable: validated above
-            center: Point3::try_new(c[0], c[1], c[2]).expect("center validated finite"),
+            center: Point3::try_new(c[0], c[1], c[2])
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
             radius,
-            // unreachable: validated above
             normal: Vector3::try_new(n_unit[0], n_unit[1], n_unit[2])
-                .expect("normal unit vector is finite"),
-            // unreachable: validated above
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
             x_axis: Vector3::try_new(x_unit[0], x_unit[1], x_unit[2])
-                .expect("x_axis unit vector is finite"),
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
         })
     }
 
@@ -378,7 +381,9 @@ impl Circle3 {
         let n = self.normal.into_array();
         let x = self.x_axis.into_array();
         let y = cross3(n, x);
-        Vector3::try_new(y[0], y[1], y[2]).expect("cross product of orthonormal pair is unit")
+        Vector3::try_new(y[0], y[1], y[2]).unwrap_or_else(|_| {
+            unreachable!("cross product of stored orthonormal pair is always a unit vector")
+        })
     }
 }
 
@@ -499,7 +504,11 @@ impl Curve3Evaluator for Circle3 {
         let diff = sub3(q, c);
         // In-plane component (project off the normal direction).
         let diff_in_plane = sub3(diff, scale3(n, dot3(diff, n)));
-        if mag3(diff_in_plane) < tolerance.absolute_length() {
+        let s_local = mag3(diff_in_plane);
+        let eff_tol = tolerance
+            .effective_length(self.radius)
+            .unwrap_or_else(|_| tolerance.absolute_length());
+        if s_local < eff_tol {
             return Err(GeometryError::Singular);
         }
         let proj_x = dot3(diff_in_plane, x);
@@ -517,11 +526,12 @@ impl Curve3Evaluator for Circle3 {
                 reason: "circle projection parameter is non-finite".to_owned(),
             })?,
             point: proj,
-            distance_bound: DistanceBound::try_new(widened_distance_bound3(q, proj_arr)).map_err(
-                |_| GeometryError::Uncertified {
-                    reason: "circle projection distance is non-finite or negative".to_owned(),
-                },
-            )?,
+            distance_bound: DistanceBound::try_new(certified_distance_bound3(
+                c, q, proj_arr, tolerance,
+            )?)
+            .map_err(|_| GeometryError::Uncertified {
+                reason: "circle projection distance is non-finite or negative".to_owned(),
+            })?,
         };
         output.push(local);
         Ok(())
@@ -1153,8 +1163,8 @@ mod tests {
         .unwrap();
         let mut output = vec![
             c.project(Point3::try_new(1.0, 0.0, 0.0).unwrap(), &tol())
-                .unwrap()[0]
-                .clone(),
+                .unwrap()
+                .remove(0),
         ];
         let err = c.project_into(Point3::try_new(0.0, 0.0, 3.0).unwrap(), &tol(), &mut output);
         assert_eq!(err, Err(GeometryError::Singular));

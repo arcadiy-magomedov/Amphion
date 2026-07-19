@@ -32,9 +32,9 @@ use crate::{
 use super::{
     ConstructionError,
     helpers::{
-        add2, add3, all_finite2, all_finite3, dot2, dot3, normalize2, normalize3, scale2, scale3,
-        sub2, sub3, validate_unit2, validate_unit3, widened_distance_bound2,
-        widened_distance_bound3,
+        add2, add3, all_finite2, all_finite3, certified_distance_bound2, certified_distance_bound3,
+        dot2, dot3, normalize2, normalize3, scale2, scale3, sub2, sub3, validate_unit2,
+        validate_unit3,
     },
 };
 
@@ -43,7 +43,7 @@ use super::{
 /// Infinite line domain: no bounds, no period.
 fn line_domain() -> ParameterRange {
     ParameterRange::try_new(None, None, None)
-        .expect("None/None/None is always a valid ParameterRange")
+        .unwrap_or_else(|_| unreachable!("unbounded domain is always valid"))
 }
 
 // ─── Line2 ───────────────────────────────────────────────────────────────────
@@ -82,10 +82,9 @@ impl Line2 {
         }
         let d_unit = normalize2(d).ok_or(ConstructionError::DegenerateAxis)?;
         Ok(Self {
-            // unreachable: validated above
-            origin: Point2::try_new(o[0], o[1]).expect("origin is already validated finite"),
-            // unreachable: validated above
-            direction: Vector2::try_new(d_unit[0], d_unit[1]).expect("unit direction is finite"),
+            origin: Point2::try_new(o[0], o[1]).map_err(|_| ConstructionError::NonFiniteInput)?,
+            direction: Vector2::try_new(d_unit[0], d_unit[1])
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
         })
     }
 
@@ -178,7 +177,7 @@ impl Curve2Evaluator for Line2 {
     fn project_into(
         &self,
         point: Point2,
-        _tolerance: &ToleranceContext,
+        tolerance: &ToleranceContext,
         output: &mut Vec<CurveProjection2>,
     ) -> Result<(), GeometryError> {
         output.clear();
@@ -197,7 +196,7 @@ impl Curve2Evaluator for Line2 {
             Point2::try_new(proj_arr[0], proj_arr[1]).map_err(|_| GeometryError::Uncertified {
                 reason: "line projection point is non-finite".to_owned(),
             })?;
-        let dist = widened_distance_bound2(q, proj_arr);
+        let dist = certified_distance_bound2(o, q, proj_arr, tolerance)?;
         output.push(CurveProjection2 {
             parameter: ParameterValue::try_new(t).map_err(|_| GeometryError::Uncertified {
                 reason: "line projection parameter is non-finite".to_owned(),
@@ -249,11 +248,10 @@ impl Line3 {
         }
         let d_unit = normalize3(d).ok_or(ConstructionError::DegenerateAxis)?;
         Ok(Self {
-            // unreachable: validated above
-            origin: Point3::try_new(o[0], o[1], o[2]).expect("origin is already validated finite"),
-            // unreachable: validated above
+            origin: Point3::try_new(o[0], o[1], o[2])
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
             direction: Vector3::try_new(d_unit[0], d_unit[1], d_unit[2])
-                .expect("unit direction is finite"),
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
         })
     }
 
@@ -348,7 +346,7 @@ impl Curve3Evaluator for Line3 {
     fn project_into(
         &self,
         point: Point3,
-        _tolerance: &ToleranceContext,
+        tolerance: &ToleranceContext,
         output: &mut Vec<CurveProjection3>,
     ) -> Result<(), GeometryError> {
         output.clear();
@@ -368,7 +366,7 @@ impl Curve3Evaluator for Line3 {
                 reason: "line projection point is non-finite".to_owned(),
             }
         })?;
-        let dist = widened_distance_bound3(q, proj_arr);
+        let dist = certified_distance_bound3(o, q, proj_arr, tolerance)?;
         output.push(CurveProjection3 {
             parameter: ParameterValue::try_new(t).map_err(|_| GeometryError::Uncertified {
                 reason: "line projection parameter is non-finite".to_owned(),
@@ -458,7 +456,7 @@ mod tests {
             let dir = [f64::NAN, 0.0f64];
             crate::analytic::helpers::all_finite2(dir)
         });
-        assert_eq!(bad_dir_result.unwrap(), false);
+        assert!(!bad_dir_result.unwrap());
     }
 
     #[test]

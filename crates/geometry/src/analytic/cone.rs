@@ -54,18 +54,20 @@ use crate::{
 use super::{
     ConstructionError,
     helpers::{
-        ILL_COND_THRESH, add3, all_finite3, angle_to_full_turn, cross3, dot3, in_range, mag3,
-        normalize3, scale3, sub3, validate_orthogonal3, validate_unit3, widened_distance_bound3,
+        ILL_COND_THRESH, add3, all_finite3, angle_to_full_turn, certified_distance_bound3,
+        certify_h_sign, cross3, dot3, in_range, mag3, normalize3, scale3, sub3,
+        validate_orthogonal3, validate_unit3,
     },
 };
 
 fn angular_range() -> ParameterRange {
     ParameterRange::try_new(Some(0.0), Some(TAU), Some(TAU))
-        .expect("angular [0, 2π) is always valid")
+        .unwrap_or_else(|_| unreachable!("angular [0, 2π) domain is always valid"))
 }
 
 fn unbounded_range() -> ParameterRange {
-    ParameterRange::try_new(None, None, None).expect("unbounded range is always valid")
+    ParameterRange::try_new(None, None, None)
+        .unwrap_or_else(|_| unreachable!("unbounded domain is always valid"))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -135,14 +137,13 @@ impl Cone {
         }
         let x_unit = normalize3(x_perp).ok_or(ConstructionError::DependentAxes)?;
         Ok(Self {
-            // unreachable: validated above
-            apex: Point3::try_new(ap[0], ap[1], ap[2]).expect("apex validated finite"),
-            // unreachable: validated above
-            axis: Vector3::try_new(a_unit[0], a_unit[1], a_unit[2]).expect("unit axis is finite"),
+            apex: Point3::try_new(ap[0], ap[1], ap[2])
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
+            axis: Vector3::try_new(a_unit[0], a_unit[1], a_unit[2])
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
             half_angle,
-            // unreachable: validated above
             x_axis: Vector3::try_new(x_unit[0], x_unit[1], x_unit[2])
-                .expect("unit x_axis is finite"),
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
         })
     }
 
@@ -176,7 +177,9 @@ impl Cone {
         let a = self.axis.into_array();
         let x = self.x_axis.into_array();
         let y = cross3(a, x);
-        Vector3::try_new(y[0], y[1], y[2]).expect("cross product of orthonormal pair is finite")
+        Vector3::try_new(y[0], y[1], y[2]).unwrap_or_else(|_| {
+            unreachable!("cross product of stored orthonormal pair is always a unit vector")
+        })
     }
 }
 
@@ -339,10 +342,14 @@ impl SurfaceEvaluator for Cone {
 
         let d = sub3(q, ap);
         let h = dot3(d, a); // axial component
+        let d_mag = mag3(d);
         let radial_vec = sub3(d, scale3(a, h)); // radial component vector
         let r = mag3(radial_vec);
 
-        if r < tolerance.absolute_length() {
+        let eff_tol = tolerance
+            .effective_length(d_mag)
+            .unwrap_or_else(|_| tolerance.absolute_length());
+        if r < eff_tol {
             return Err(GeometryError::Singular);
         }
 
@@ -355,6 +362,7 @@ impl SurfaceEvaluator for Cone {
         let t1 = h * cos_a + r * sin_a; // projection parameter on nappe 1
         let t2 = -h * cos_a + r * sin_a; // projection parameter on nappe 2
 
+        // Build a candidate on one nappe without touching `output` yet.
         let project_nappe = |t: f64, sign: f64| -> Result<SurfaceProjection, GeometryError> {
             let v_val = sign * t * cos_a;
             let u_proj = if sign.is_sign_positive() {
@@ -373,9 +381,7 @@ impl SurfaceEvaluator for Cone {
                     reason: "cone projection point is non-finite".to_owned(),
                 }
             })?;
-            let stable_dist = (h * sin_a - sign * r * cos_a).abs();
-            let widened_dist = widened_distance_bound3(q, proj_arr);
-            let dist = stable_dist.max(widened_dist);
+            let dist = certified_distance_bound3(ap, q, proj_arr, tolerance)?;
             Ok(SurfaceProjection {
                 u: ParameterValue::try_new(u_proj).map_err(|_| GeometryError::Uncertified {
                     reason: "cone u is non-finite".to_owned(),
@@ -392,34 +398,49 @@ impl SurfaceEvaluator for Cone {
             })
         };
 
-        let mut local = Vec::with_capacity(2);
-        match (t1 > 0.0, t2 > 0.0) {
+        // Construct all candidates on the stack, validate both before any push.
+        let candidates: [Option<SurfaceProjection>; 2] = match (t1 > 0.0, t2 > 0.0) {
             (true, true) => {
                 let cand1 = project_nappe(t1, 1.0)?;
                 let cand2 = project_nappe(t2, -1.0)?;
-                let dist1 = cand1.distance_bound.get();
-                let dist2 = cand2.distance_bound.get();
-                let dist_tol = tolerance.absolute_length();
-                if dist1 < dist2 - dist_tol {
-                    local.push(cand1);
-                } else if dist2 < dist1 - dist_tol {
-                    local.push(cand2);
-                } else {
-                    local.push(cand1);
-                    local.push(cand2);
+                // Use certify_h_sign to decide which nappe is geometrically closer.
+                // `h` is the axial component of `d = q − apex`.
+                // Positive h → nappe 1 is closer; negative → nappe 2; uncertain → both.
+                match certify_h_sign(h, d_mag) {
+                    Some(core::cmp::Ordering::Greater) => [Some(cand1), None],
+                    Some(core::cmp::Ordering::Less) => [None, Some(cand2)],
+                    Some(core::cmp::Ordering::Equal) | None => {
+                        // Equatorial plane or numerically ambiguous: return both.
+                        // certify_h_sign returning None means the sign cannot be
+                        // certified; rather than returning Uncertified (which would
+                        // suppress valid projections), we conservatively include both.
+                        [Some(cand1), Some(cand2)]
+                    }
                 }
             }
-            (true, false) => local.push(project_nappe(t1, 1.0)?),
-            (false, true) => local.push(project_nappe(t2, -1.0)?),
+            (true, false) => [Some(project_nappe(t1, 1.0)?), None],
+            (false, true) => [None, Some(project_nappe(t2, -1.0)?)],
             (false, false) => return Err(GeometryError::Singular),
+        };
+
+        // Collect valid candidates onto a fixed-size stack, sort, then push atomically.
+        let mut sorted: [Option<SurfaceProjection>; 2] = [None, None];
+        let mut count = 0;
+        for c in candidates.into_iter().flatten() {
+            sorted[count] = Some(c);
+            count += 1;
         }
-        local.sort_by(|lhs, rhs| {
-            lhs.u
+        sorted[..count].sort_by(|a_opt, b_opt| {
+            let a_c = a_opt.as_ref().unwrap();
+            let b_c = b_opt.as_ref().unwrap();
+            a_c.u
                 .get()
-                .total_cmp(&rhs.u.get())
-                .then(lhs.v.get().total_cmp(&rhs.v.get()))
+                .total_cmp(&b_c.u.get())
+                .then(a_c.v.get().total_cmp(&b_c.v.get()))
         });
-        output.extend(local);
+        for opt in &sorted[..count] {
+            output.push(*opt.as_ref().unwrap());
+        }
         Ok(())
     }
 }
@@ -467,7 +488,8 @@ mod tests {
 
     #[test]
     fn cone_construction_valid() {
-        assert_eq!(std_cone().half_angle(), FRAC_PI_4);
+        // half_angle is stored exactly as passed; FRAC_PI_4 round-trips bit-for-bit.
+        assert_eq!(std_cone().half_angle().to_bits(), FRAC_PI_4.to_bits());
     }
 
     #[test]
@@ -903,9 +925,33 @@ mod tests {
     #[test]
     fn cone_projection_near_equator_returns_two_when_distances_tie() {
         let c = std_cone();
-        let q = Point3::try_new(1.0, 0.0, 1.0e-12).unwrap();
-        let projs = c.project(q, &tol()).unwrap();
-        assert_eq!(projs.len(), 2);
+        // Exactly on the equatorial plane: h = 0, certify_h_sign = Equal → both nappes.
+        let q_exact = Point3::try_new(1.0, 0.0, 0.0).unwrap();
+        let projs_exact = c.project(q_exact, &tol()).unwrap();
+        assert_eq!(
+            projs_exact.len(),
+            2,
+            "equatorial h=0 must return both nappes"
+        );
+
+        // Below FP threshold: h = 1e-300 < 8ε·d_mag ≈ 1.8e-15 → certify_h_sign = None → both.
+        let q_tiny = Point3::try_new(1.0, 0.0, 1e-300).unwrap();
+        let projs_tiny = c.project(q_tiny, &tol()).unwrap();
+        assert_eq!(
+            projs_tiny.len(),
+            2,
+            "sub-threshold h should return both nappes"
+        );
+
+        // Certified positive h: h = 1e-12 >> 8ε·d_mag ≈ 1.8e-15 → only nappe 1 returned.
+        let q_cert = Point3::try_new(1.0, 0.0, 1.0e-12).unwrap();
+        let projs_cert = c.project(q_cert, &tol()).unwrap();
+        assert_eq!(
+            projs_cert.len(),
+            1,
+            "certified h > 0 should return only nappe 1"
+        );
+        assert!(projs_cert[0].v.get() > 0.0, "nappe 1 has positive v");
     }
 
     #[test]

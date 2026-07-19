@@ -46,18 +46,19 @@ use crate::{
 use super::{
     ConstructionError,
     helpers::{
-        ILL_COND_THRESH, add3, all_finite3, angle_to_full_turn, cross3, dot3, in_range, mag3,
-        normalize3, scale3, sub3, validate_orthogonal3, validate_unit3, widened_distance_bound3,
+        ILL_COND_THRESH, add3, all_finite3, angle_to_full_turn, certified_distance_bound3, cross3,
+        dot3, in_range, mag3, normalize3, scale3, sub3, validate_orthogonal3, validate_unit3,
     },
 };
 
 fn angular_range() -> ParameterRange {
     ParameterRange::try_new(Some(0.0), Some(TAU), Some(TAU))
-        .expect("angular [0, 2π) is always valid")
+        .unwrap_or_else(|_| unreachable!("angular [0, 2π) domain is always valid"))
 }
 
 fn unbounded_range() -> ParameterRange {
-    ParameterRange::try_new(None, None, None).expect("unbounded range is always valid")
+    ParameterRange::try_new(None, None, None)
+        .unwrap_or_else(|_| unreachable!("unbounded domain is always valid"))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -127,15 +128,13 @@ impl Cylinder {
         }
         let x_unit = normalize3(x_perp).ok_or(ConstructionError::DependentAxes)?;
         Ok(Self {
-            // unreachable: validated above
-            axis_origin: Point3::try_new(o[0], o[1], o[2]).expect("origin validated finite"),
-            // unreachable: validated above
+            axis_origin: Point3::try_new(o[0], o[1], o[2])
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
             axis_dir: Vector3::try_new(a_unit[0], a_unit[1], a_unit[2])
-                .expect("unit axis_dir is finite"),
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
             radius,
-            // unreachable: validated above
             x_axis: Vector3::try_new(x_unit[0], x_unit[1], x_unit[2])
-                .expect("unit x_axis is finite"),
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
         })
     }
 
@@ -169,7 +168,9 @@ impl Cylinder {
         let a = self.axis_dir.into_array();
         let x = self.x_axis.into_array();
         let y = cross3(a, x);
-        Vector3::try_new(y[0], y[1], y[2]).expect("cross product of orthonormal pair is finite")
+        Vector3::try_new(y[0], y[1], y[2]).unwrap_or_else(|_| {
+            unreachable!("cross product of stored orthonormal pair is always a unit vector")
+        })
     }
 }
 
@@ -282,7 +283,8 @@ impl SurfaceEvaluator for Cylinder {
                         reason: "cylinder duu non-finite".to_owned(),
                     }
                 })?;
-                let zero = Vector3::try_new(0.0, 0.0, 0.0).expect("zero is finite");
+                let zero = Vector3::try_new(0.0, 0.0, 0.0)
+                    .unwrap_or_else(|_| unreachable!("zero vector is always finite"));
                 (Some(du), Some(dv), Some(duu), Some(zero), Some(zero))
             }
         };
@@ -313,7 +315,10 @@ impl SurfaceEvaluator for Cylinder {
         let v_val = dot3(diff, a);
         let radial_vec = sub3(diff, scale3(a, v_val));
         let radial_len = mag3(radial_vec);
-        if radial_len < tolerance.absolute_length() {
+        let eff_tol = tolerance
+            .effective_length(r)
+            .unwrap_or_else(|_| tolerance.absolute_length());
+        if radial_len < eff_tol {
             return Err(GeometryError::Singular);
         }
         let u_val = angle_to_full_turn(dot3(radial_vec, y).atan2(dot3(radial_vec, x)));
@@ -335,11 +340,12 @@ impl SurfaceEvaluator for Cylinder {
                 reason: "cylinder projection v is non-finite".to_owned(),
             })?,
             point: proj,
-            distance_bound: DistanceBound::try_new(widened_distance_bound3(q, proj_arr)).map_err(
-                |_| GeometryError::Uncertified {
-                    reason: "cylinder projection distance is non-finite or negative".to_owned(),
-                },
-            )?,
+            distance_bound: DistanceBound::try_new(certified_distance_bound3(
+                o, q, proj_arr, tolerance,
+            )?)
+            .map_err(|_| GeometryError::Uncertified {
+                reason: "cylinder projection distance is non-finite or negative".to_owned(),
+            })?,
         };
         output.push(local);
         Ok(())
