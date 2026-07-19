@@ -24,7 +24,7 @@
     clippy::similar_names
 )]
 
-use amphion_foundation::{Point3, ToleranceContext, Transform3, Vector3};
+use amphion_foundation::{Point3, ToleranceContext, Transform3, UnitVector3, Vector3};
 use serde::{Deserialize, Serialize};
 
 use crate::traits::SurfaceEvaluator;
@@ -36,10 +36,9 @@ use crate::{
 use super::{
     ConstructionError, TransformError,
     helpers::{
-        ILL_COND_THRESH, add3, all_finite3, arithmetic_eval_bound, arithmetic_proj_bound3, cross3,
-        dot3, mag3, normalize3, scale3, sub3, validate_orthogonal3, validate_unit3,
+        ILL_COND_THRESH, UNIT_VECTOR_TOL, add3, all_finite3, arithmetic_eval_bound,
+        arithmetic_proj_bound3, dot3, mag3, normalization_to_construction, scale3, sub3,
     },
-    transform::{apply_to_point, apply_to_vector},
 };
 
 fn unbounded_range() -> ParameterRange {
@@ -64,9 +63,9 @@ struct PlaneRepr {
 #[serde(try_from = "PlaneRepr", into = "PlaneRepr")]
 pub struct Plane {
     origin: Point3,
-    u_axis: Vector3,
-    v_axis: Vector3,
-    normal: Vector3,
+    u_axis: UnitVector3,
+    v_axis: UnitVector3,
+    normal: UnitVector3,
 }
 
 impl Plane {
@@ -88,16 +87,14 @@ impl Plane {
         v_axis: Vector3,
     ) -> Result<Self, ConstructionError> {
         let o = origin.into_array();
-        let u = u_axis.into_array();
-        let v = v_axis.into_array();
-        if !all_finite3(o) || !all_finite3(u) || !all_finite3(v) {
+        if !all_finite3(o) {
             return Err(ConstructionError::NonFiniteInput);
         }
-        let u_unit = normalize3(u).ok_or(ConstructionError::DegenerateAxis)?;
-        let v_norm = normalize3(v).ok_or(ConstructionError::DegenerateAxis)?;
+        let u_unit = UnitVector3::try_normalize(u_axis).map_err(normalization_to_construction)?;
+        let v_norm = UnitVector3::try_normalize(v_axis).map_err(normalization_to_construction)?;
         // Orthogonalize v against u.
-        let dot_vu = dot3(v_norm, u_unit);
-        let v_perp = sub3(v_norm, scale3(u_unit, dot_vu));
+        let dot_vu = dot3(v_norm.into_array(), u_unit.into_array());
+        let v_perp = sub3(v_norm.into_array(), scale3(u_unit.into_array(), dot_vu));
         let perp_mag = mag3(v_perp);
         if perp_mag == 0.0 {
             return Err(ConstructionError::DependentAxes);
@@ -105,17 +102,19 @@ impl Plane {
         if perp_mag < ILL_COND_THRESH {
             return Err(ConstructionError::IllConditionedAxes);
         }
-        let v_unit = normalize3(v_perp).ok_or(ConstructionError::DependentAxes)?;
-        let n_arr = cross3(u_unit, v_unit);
+        let v_unit = UnitVector3::try_normalize(
+            Vector3::try_new(v_perp[0], v_perp[1], v_perp[2])
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
+        )
+        .map_err(|_| ConstructionError::DependentAxes)?;
+        let normal = UnitVector3::try_normalize(u_unit.cross(v_unit))
+            .map_err(|_| ConstructionError::DependentAxes)?;
         Ok(Self {
             origin: Point3::try_new(o[0], o[1], o[2])
                 .map_err(|_| ConstructionError::NonFiniteInput)?,
-            u_axis: Vector3::try_new(u_unit[0], u_unit[1], u_unit[2])
-                .map_err(|_| ConstructionError::NonFiniteInput)?,
-            v_axis: Vector3::try_new(v_unit[0], v_unit[1], v_unit[2])
-                .map_err(|_| ConstructionError::NonFiniteInput)?,
-            normal: Vector3::try_new(n_arr[0], n_arr[1], n_arr[2])
-                .map_err(|_| ConstructionError::NonFiniteInput)?,
+            u_axis: u_unit,
+            v_axis: v_unit,
+            normal,
         })
     }
 
@@ -128,19 +127,19 @@ impl Plane {
     /// Returns the unit U direction.
     #[must_use]
     pub fn u_axis(&self) -> Vector3 {
-        self.u_axis
+        self.u_axis.as_vector()
     }
 
     /// Returns the unit V direction (orthogonal to `u_axis`).
     #[must_use]
     pub fn v_axis(&self) -> Vector3 {
-        self.v_axis
+        self.v_axis.as_vector()
     }
 
     /// Returns the outward unit normal `u_axis × v_axis`.
     #[must_use]
     pub fn normal(&self) -> Vector3 {
-        self.normal
+        self.normal.as_vector()
     }
 
     /// Applies an affine `transform` to this plane, returning a new plane.
@@ -158,19 +157,17 @@ impl Plane {
     /// - [`TransformError::DegenerateResult`] — the transformed axes become
     ///   zero-length, dependent, or ill-conditioned
     pub fn try_transform(&self, transform: &Transform3) -> Result<Self, TransformError> {
-        let m = transform.into_row_major();
-        let o =
-            apply_to_point(m, self.origin.into_array()).ok_or(TransformError::NonFiniteResult)?;
-        let u =
-            apply_to_vector(m, self.u_axis.into_array()).ok_or(TransformError::NonFiniteResult)?;
-        let v =
-            apply_to_vector(m, self.v_axis.into_array()).ok_or(TransformError::NonFiniteResult)?;
-        Self::try_new(
-            Point3::try_new(o[0], o[1], o[2]).map_err(|_| TransformError::NonFiniteResult)?,
-            Vector3::try_new(u[0], u[1], u[2]).map_err(|_| TransformError::NonFiniteResult)?,
-            Vector3::try_new(v[0], v[1], v[2]).map_err(|_| TransformError::NonFiniteResult)?,
-        )
-        .map_err(|_| TransformError::DegenerateResult)
+        let new_origin = transform
+            .try_apply_to_point(self.origin)
+            .map_err(|_| TransformError::NonFiniteResult)?;
+        let new_u_vec = transform
+            .try_apply_to_vector(self.u_axis.as_vector())
+            .map_err(|_| TransformError::NonFiniteResult)?;
+        let new_v_vec = transform
+            .try_apply_to_vector(self.v_axis.as_vector())
+            .map_err(|_| TransformError::NonFiniteResult)?;
+        Self::try_new(new_origin, new_u_vec, new_v_vec)
+            .map_err(|_| TransformError::DegenerateResult)
     }
 }
 
@@ -178,21 +175,23 @@ impl TryFrom<PlaneRepr> for Plane {
     type Error = ConstructionError;
     fn try_from(repr: PlaneRepr) -> Result<Self, Self::Error> {
         let origin = repr.origin.into_array();
-        let u_axis = repr.u_axis.into_array();
-        let v_axis = repr.v_axis.into_array();
-        if !all_finite3(origin) || !all_finite3(u_axis) || !all_finite3(v_axis) {
+        if !all_finite3(origin) {
             return Err(ConstructionError::NonFiniteInput);
         }
-        validate_unit3(u_axis)?;
-        validate_unit3(v_axis)?;
-        validate_orthogonal3(u_axis, v_axis)?;
-        let n_arr = cross3(u_axis, v_axis);
+        let u_unit =
+            UnitVector3::try_normalize(repr.u_axis).map_err(normalization_to_construction)?;
+        let v_unit =
+            UnitVector3::try_normalize(repr.v_axis).map_err(normalization_to_construction)?;
+        if u_unit.dot(v_unit).abs() > UNIT_VECTOR_TOL {
+            return Err(ConstructionError::DependentAxes);
+        }
+        let normal = UnitVector3::try_normalize(u_unit.cross(v_unit))
+            .map_err(|_| ConstructionError::DependentAxes)?;
         Ok(Self {
             origin: repr.origin,
-            u_axis: repr.u_axis,
-            v_axis: repr.v_axis,
-            normal: Vector3::try_new(n_arr[0], n_arr[1], n_arr[2])
-                .map_err(|_| ConstructionError::NonFiniteInput)?,
+            u_axis: u_unit,
+            v_axis: v_unit,
+            normal,
         })
     }
 }
@@ -201,8 +200,8 @@ impl From<Plane> for PlaneRepr {
     fn from(p: Plane) -> Self {
         Self {
             origin: p.origin,
-            u_axis: p.u_axis,
-            v_axis: p.v_axis,
+            u_axis: p.u_axis.as_vector(),
+            v_axis: p.v_axis.as_vector(),
         }
     }
 }
@@ -606,17 +605,18 @@ mod tests {
     }
 
     #[test]
-    fn plane_serde_rejects_non_unit_axes() {
+    fn plane_serde_normalizes_non_unit_axes() {
+        // Foundation's UnitVector3::try_normalize is lenient: a non-unit but
+        // finite, non-zero axis is silently renormalized rather than
+        // rejected.
         let repr: PlaneRepr = serde_json::from_value(json!({
             "origin": [1.0, 2.0, 3.0],
             "u_axis": [2.0, 0.0, 0.0],
             "v_axis": [0.0, 1.0, 0.0]
         }))
         .unwrap();
-        assert_eq!(
-            Plane::try_from(repr),
-            Err(ConstructionError::DegenerateAxis)
-        );
+        let plane = Plane::try_from(repr).unwrap();
+        assert_eq!(plane.u_axis(), Vector3::try_new(1.0, 0.0, 0.0).unwrap());
     }
 
     #[test]

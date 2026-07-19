@@ -34,7 +34,7 @@
 
 use std::f64::consts::TAU;
 
-use amphion_foundation::{Point3, ToleranceContext, Transform3, Vector3};
+use amphion_foundation::{Point3, ToleranceContext, Transform3, UnitVector3, Vector3};
 use serde::{Deserialize, Serialize};
 
 use crate::traits::SurfaceEvaluator;
@@ -46,10 +46,10 @@ use crate::{
 use super::{
     ConstructionError, TransformError,
     helpers::{
-        ILL_COND_THRESH, all_finite3, cross3, dot3, in_range, mag3, normalize3, scale3, sub3,
-        validate_orthogonal3, validate_unit3,
+        ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite3, dot3, in_range, mag3,
+        normalization_to_construction, scale3, sub3,
     },
-    transform::{apply_to_point, apply_to_vector, similarity_scale},
+    transform::similarity_scale,
 };
 
 fn angular_range() -> ParameterRange {
@@ -86,10 +86,10 @@ struct CylinderRepr {
 #[serde(try_from = "CylinderRepr", into = "CylinderRepr")]
 pub struct Cylinder {
     axis_origin: Point3,
-    axis_dir: Vector3,
+    axis_dir: UnitVector3,
     radius: f64,
-    x_axis: Vector3,
-    y_axis: Vector3,
+    x_axis: UnitVector3,
+    y_axis: UnitVector3,
 }
 
 impl Cylinder {
@@ -113,19 +113,17 @@ impl Cylinder {
         x_axis: Vector3,
     ) -> Result<Self, ConstructionError> {
         let o = axis_origin.into_array();
-        let a = axis_dir.into_array();
-        let x = x_axis.into_array();
-        if !all_finite3(o) || !all_finite3(a) || !radius.is_finite() || !all_finite3(x) {
+        if !all_finite3(o) || !radius.is_finite() {
             return Err(ConstructionError::NonFiniteInput);
         }
         if radius <= 0.0 {
             return Err(ConstructionError::NotPositive);
         }
-        let a_unit = normalize3(a).ok_or(ConstructionError::DegenerateAxis)?;
-        let x_norm = normalize3(x).ok_or(ConstructionError::DegenerateAxis)?;
+        let a_unit = UnitVector3::try_normalize(axis_dir).map_err(normalization_to_construction)?;
+        let x_norm = UnitVector3::try_normalize(x_axis).map_err(normalization_to_construction)?;
         // Orthogonalize x against axis_dir.
-        let dot_xa = dot3(x_norm, a_unit);
-        let x_perp = sub3(x_norm, scale3(a_unit, dot_xa));
+        let dot_xa = dot3(x_norm.into_array(), a_unit.into_array());
+        let x_perp = sub3(x_norm.into_array(), scale3(a_unit.into_array(), dot_xa));
         let perp_mag = mag3(x_perp);
         if perp_mag == 0.0 {
             return Err(ConstructionError::DependentAxes);
@@ -133,18 +131,20 @@ impl Cylinder {
         if perp_mag < ILL_COND_THRESH {
             return Err(ConstructionError::IllConditionedAxes);
         }
-        let x_unit = normalize3(x_perp).ok_or(ConstructionError::DependentAxes)?;
-        let y_arr = cross3(a_unit, x_unit);
+        let x_unit = UnitVector3::try_normalize(
+            Vector3::try_new(x_perp[0], x_perp[1], x_perp[2])
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
+        )
+        .map_err(|_| ConstructionError::DependentAxes)?;
+        let y_axis = UnitVector3::try_normalize(a_unit.cross(x_unit))
+            .map_err(|_| ConstructionError::DependentAxes)?;
         Ok(Self {
             axis_origin: Point3::try_new(o[0], o[1], o[2])
                 .map_err(|_| ConstructionError::NonFiniteInput)?,
-            axis_dir: Vector3::try_new(a_unit[0], a_unit[1], a_unit[2])
-                .map_err(|_| ConstructionError::NonFiniteInput)?,
+            axis_dir: a_unit,
             radius,
-            x_axis: Vector3::try_new(x_unit[0], x_unit[1], x_unit[2])
-                .map_err(|_| ConstructionError::NonFiniteInput)?,
-            y_axis: Vector3::try_new(y_arr[0], y_arr[1], y_arr[2])
-                .map_err(|_| ConstructionError::NonFiniteInput)?,
+            x_axis: x_unit,
+            y_axis,
         })
     }
 
@@ -157,7 +157,7 @@ impl Cylinder {
     /// Returns the unit axis direction.
     #[must_use]
     pub fn axis_dir(&self) -> Vector3 {
-        self.axis_dir
+        self.axis_dir.as_vector()
     }
 
     /// Returns the radius.
@@ -169,13 +169,13 @@ impl Cylinder {
     /// Returns the unit reference direction for `u = 0`.
     #[must_use]
     pub fn x_axis(&self) -> Vector3 {
-        self.x_axis
+        self.x_axis.as_vector()
     }
 
     /// Returns the unit y-axis: `axis_dir × x_axis`.
     #[must_use]
     pub fn y_axis(&self) -> Vector3 {
-        self.y_axis
+        self.y_axis.as_vector()
     }
 
     /// Applies a similarity `transform` (rigid motion plus uniform scale, no
@@ -196,22 +196,19 @@ impl Cylinder {
     /// - [`TransformError::DegenerateResult`] — the transformed axes or
     ///   scaled radius fail cylinder construction
     pub fn try_transform(&self, transform: &Transform3) -> Result<Self, TransformError> {
-        let m = transform.into_row_major();
-        let scale = similarity_scale(m).ok_or(TransformError::NotSimilarity)?;
-        let o = apply_to_point(m, self.axis_origin.into_array())
-            .ok_or(TransformError::NonFiniteResult)?;
-        let a = apply_to_vector(m, self.axis_dir.into_array())
-            .ok_or(TransformError::NonFiniteResult)?;
-        let x =
-            apply_to_vector(m, self.x_axis.into_array()).ok_or(TransformError::NonFiniteResult)?;
+        let scale = similarity_scale(transform).ok_or(TransformError::NotSimilarity)?;
+        let new_origin = transform
+            .try_apply_to_point(self.axis_origin)
+            .map_err(|_| TransformError::NonFiniteResult)?;
+        let new_axis_vec = transform
+            .try_apply_to_vector(self.axis_dir.as_vector())
+            .map_err(|_| TransformError::NonFiniteResult)?;
+        let new_x_vec = transform
+            .try_apply_to_vector(self.x_axis.as_vector())
+            .map_err(|_| TransformError::NonFiniteResult)?;
         let new_radius = self.radius * scale;
-        Self::try_new(
-            Point3::try_new(o[0], o[1], o[2]).map_err(|_| TransformError::NonFiniteResult)?,
-            Vector3::try_new(a[0], a[1], a[2]).map_err(|_| TransformError::NonFiniteResult)?,
-            new_radius,
-            Vector3::try_new(x[0], x[1], x[2]).map_err(|_| TransformError::NonFiniteResult)?,
-        )
-        .map_err(|_| TransformError::DegenerateResult)
+        Self::try_new(new_origin, new_axis_vec, new_radius, new_x_vec)
+            .map_err(|_| TransformError::DegenerateResult)
     }
 }
 
@@ -219,29 +216,27 @@ impl TryFrom<CylinderRepr> for Cylinder {
     type Error = ConstructionError;
     fn try_from(repr: CylinderRepr) -> Result<Self, Self::Error> {
         let axis_origin = repr.axis_origin.into_array();
-        let axis_dir = repr.axis_dir.into_array();
-        let x_axis = repr.x_axis.into_array();
-        if !all_finite3(axis_origin)
-            || !all_finite3(axis_dir)
-            || !repr.radius.is_finite()
-            || !all_finite3(x_axis)
-        {
+        if !all_finite3(axis_origin) || !repr.radius.is_finite() {
             return Err(ConstructionError::NonFiniteInput);
         }
         if repr.radius <= 0.0 {
             return Err(ConstructionError::NotPositive);
         }
-        validate_unit3(axis_dir)?;
-        validate_unit3(x_axis)?;
-        validate_orthogonal3(axis_dir, x_axis)?;
-        let y_arr = cross3(axis_dir, x_axis);
+        let a_unit =
+            UnitVector3::try_normalize(repr.axis_dir).map_err(normalization_to_construction)?;
+        let x_unit =
+            UnitVector3::try_normalize(repr.x_axis).map_err(normalization_to_construction)?;
+        if a_unit.dot(x_unit).abs() > UNIT_VECTOR_TOL {
+            return Err(ConstructionError::DependentAxes);
+        }
+        let y_axis = UnitVector3::try_normalize(a_unit.cross(x_unit))
+            .map_err(|_| ConstructionError::DependentAxes)?;
         Ok(Self {
             axis_origin: repr.axis_origin,
-            axis_dir: repr.axis_dir,
+            axis_dir: a_unit,
             radius: repr.radius,
-            x_axis: repr.x_axis,
-            y_axis: Vector3::try_new(y_arr[0], y_arr[1], y_arr[2])
-                .map_err(|_| ConstructionError::NonFiniteInput)?,
+            x_axis: x_unit,
+            y_axis,
         })
     }
 }
@@ -250,9 +245,9 @@ impl From<Cylinder> for CylinderRepr {
     fn from(c: Cylinder) -> Self {
         Self {
             axis_origin: c.axis_origin,
-            axis_dir: c.axis_dir,
+            axis_dir: c.axis_dir.as_vector(),
             radius: c.radius,
-            x_axis: c.x_axis,
+            x_axis: c.x_axis.as_vector(),
         }
     }
 }
@@ -505,17 +500,21 @@ mod tests {
     }
 
     #[test]
-    fn cylinder_serde_rejects_bad_axis_radius_and_orthogonality() {
-        let bad_axis: CylinderRepr = serde_json::from_value(json!({
+    fn cylinder_serde_normalizes_axis_and_rejects_dependent_axes_and_bad_radius() {
+        // Foundation's UnitVector3::try_normalize is lenient: a non-unit but
+        // finite, non-zero axis_dir is silently renormalized rather than
+        // rejected.
+        let normalized_axis: CylinderRepr = serde_json::from_value(json!({
             "axis_origin": [1.0, 2.0, 3.0],
             "axis_dir": [2.0, 0.0, 0.0],
             "radius": 2.5,
             "x_axis": [0.0, 1.0, 0.0]
         }))
         .unwrap();
+        let cylinder = Cylinder::try_from(normalized_axis).unwrap();
         assert_eq!(
-            Cylinder::try_from(bad_axis),
-            Err(ConstructionError::DegenerateAxis)
+            cylinder.axis_dir(),
+            Vector3::try_new(1.0, 0.0, 0.0).unwrap()
         );
 
         let bad_frame: CylinderRepr = serde_json::from_value(json!({

@@ -30,7 +30,9 @@
 
 use std::f64::consts::TAU;
 
-use amphion_foundation::{Point2, Point3, ToleranceContext, Transform3, Vector2, Vector3};
+use amphion_foundation::{
+    Point2, Point3, ToleranceContext, Transform3, UnitVector2, UnitVector3, Vector2, Vector3,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::traits::{Curve2Evaluator, Curve3Evaluator};
@@ -42,10 +44,10 @@ use crate::{
 use super::{
     ConstructionError, TransformError,
     helpers::{
-        ILL_COND_THRESH, all_finite2, all_finite3, cross3, dot3, in_range, mag3, normalize2,
-        normalize3, perp2, scale3, sub3, validate_orthogonal3, validate_unit2, validate_unit3,
+        ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite2, all_finite3, dot3, in_range, mag3,
+        normalization_to_construction, perp2, scale3, sub3,
     },
-    transform::{apply_to_point, apply_to_vector, similarity_scale},
+    transform::similarity_scale,
 };
 
 fn circle_domain() -> ParameterRange {
@@ -74,8 +76,8 @@ struct Circle2Repr {
 pub struct Circle2 {
     center: Point2,
     radius: f64,
-    x_axis: Vector2,
-    y_axis: Vector2,
+    x_axis: UnitVector2,
+    y_axis: UnitVector2,
 }
 
 impl Circle2 {
@@ -94,22 +96,23 @@ impl Circle2 {
         x_axis: Vector2,
     ) -> Result<Self, ConstructionError> {
         let c = center.into_array();
-        let x = x_axis.into_array();
-        if !all_finite2(c) || !radius.is_finite() || !all_finite2(x) {
+        if !all_finite2(c) || !radius.is_finite() {
             return Err(ConstructionError::NonFiniteInput);
         }
         if radius <= 0.0 {
             return Err(ConstructionError::NotPositive);
         }
-        let x_unit = normalize2(x).ok_or(ConstructionError::DegenerateAxis)?;
-        let y_arr = perp2(x_unit);
+        let x_unit = UnitVector2::try_normalize(x_axis).map_err(normalization_to_construction)?;
+        let y_arr = perp2(x_unit.into_array());
+        let y_unit = UnitVector2::try_normalize(
+            Vector2::try_new(y_arr[0], y_arr[1]).map_err(|_| ConstructionError::NonFiniteInput)?,
+        )
+        .map_err(normalization_to_construction)?;
         Ok(Self {
             center: Point2::try_new(c[0], c[1]).map_err(|_| ConstructionError::NonFiniteInput)?,
             radius,
-            x_axis: Vector2::try_new(x_unit[0], x_unit[1])
-                .map_err(|_| ConstructionError::NonFiniteInput)?,
-            y_axis: Vector2::try_new(y_arr[0], y_arr[1])
-                .map_err(|_| ConstructionError::NonFiniteInput)?,
+            x_axis: x_unit,
+            y_axis: y_unit,
         })
     }
 
@@ -128,13 +131,13 @@ impl Circle2 {
     /// Returns the unit reference direction for `θ = 0`.
     #[must_use]
     pub fn x_axis(&self) -> Vector2 {
-        self.x_axis
+        self.x_axis.as_vector()
     }
 
     /// Returns the unit y-axis (90° CCW rotation of `x_axis`).
     #[must_use]
     pub fn y_axis(&self) -> Vector2 {
-        self.y_axis
+        self.y_axis.as_vector()
     }
 }
 
@@ -142,21 +145,24 @@ impl TryFrom<Circle2Repr> for Circle2 {
     type Error = ConstructionError;
     fn try_from(repr: Circle2Repr) -> Result<Self, Self::Error> {
         let center = repr.center.into_array();
-        let x_axis = repr.x_axis.into_array();
-        if !all_finite2(center) || !repr.radius.is_finite() || !all_finite2(x_axis) {
+        if !all_finite2(center) || !repr.radius.is_finite() {
             return Err(ConstructionError::NonFiniteInput);
         }
         if repr.radius <= 0.0 {
             return Err(ConstructionError::NotPositive);
         }
-        validate_unit2(x_axis)?;
-        let y_arr = perp2(x_axis);
+        let x_unit =
+            UnitVector2::try_normalize(repr.x_axis).map_err(normalization_to_construction)?;
+        let y_arr = perp2(x_unit.into_array());
+        let y_unit = UnitVector2::try_normalize(
+            Vector2::try_new(y_arr[0], y_arr[1]).map_err(|_| ConstructionError::NonFiniteInput)?,
+        )
+        .map_err(normalization_to_construction)?;
         Ok(Self {
             center: repr.center,
             radius: repr.radius,
-            x_axis: repr.x_axis,
-            y_axis: Vector2::try_new(y_arr[0], y_arr[1])
-                .map_err(|_| ConstructionError::NonFiniteInput)?,
+            x_axis: x_unit,
+            y_axis: y_unit,
         })
     }
 }
@@ -166,7 +172,7 @@ impl From<Circle2> for Circle2Repr {
         Self {
             center: c.center,
             radius: c.radius,
-            x_axis: c.x_axis,
+            x_axis: c.x_axis.as_vector(),
         }
     }
 }
@@ -249,9 +255,9 @@ struct Circle3Repr {
 pub struct Circle3 {
     center: Point3,
     radius: f64,
-    normal: Vector3,
-    x_axis: Vector3,
-    y_axis: Vector3,
+    normal: UnitVector3,
+    x_axis: UnitVector3,
+    y_axis: UnitVector3,
 }
 
 impl Circle3 {
@@ -276,19 +282,17 @@ impl Circle3 {
         x_axis: Vector3,
     ) -> Result<Self, ConstructionError> {
         let c = center.into_array();
-        let n = normal.into_array();
-        let x = x_axis.into_array();
-        if !all_finite3(c) || !radius.is_finite() || !all_finite3(n) || !all_finite3(x) {
+        if !all_finite3(c) || !radius.is_finite() {
             return Err(ConstructionError::NonFiniteInput);
         }
         if radius <= 0.0 {
             return Err(ConstructionError::NotPositive);
         }
-        let n_unit = normalize3(n).ok_or(ConstructionError::DegenerateAxis)?;
-        let x_norm = normalize3(x).ok_or(ConstructionError::DegenerateAxis)?;
+        let n_unit = UnitVector3::try_normalize(normal).map_err(normalization_to_construction)?;
+        let x_norm = UnitVector3::try_normalize(x_axis).map_err(normalization_to_construction)?;
         // Orthogonalize x against n.
-        let dot_xn = dot3(x_norm, n_unit);
-        let x_perp = sub3(x_norm, scale3(n_unit, dot_xn));
+        let dot_xn = dot3(x_norm.into_array(), n_unit.into_array());
+        let x_perp = sub3(x_norm.into_array(), scale3(n_unit.into_array(), dot_xn));
         let perp_mag = mag3(x_perp);
         if perp_mag == 0.0 {
             return Err(ConstructionError::DependentAxes);
@@ -296,18 +300,20 @@ impl Circle3 {
         if perp_mag < ILL_COND_THRESH {
             return Err(ConstructionError::IllConditionedAxes);
         }
-        let x_unit = normalize3(x_perp).ok_or(ConstructionError::DependentAxes)?;
-        let y_arr = cross3(n_unit, x_unit);
+        let x_unit = UnitVector3::try_normalize(
+            Vector3::try_new(x_perp[0], x_perp[1], x_perp[2])
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
+        )
+        .map_err(|_| ConstructionError::DependentAxes)?;
+        let y_unit = UnitVector3::try_normalize(n_unit.cross(x_unit))
+            .map_err(|_| ConstructionError::DependentAxes)?;
         Ok(Self {
             center: Point3::try_new(c[0], c[1], c[2])
                 .map_err(|_| ConstructionError::NonFiniteInput)?,
             radius,
-            normal: Vector3::try_new(n_unit[0], n_unit[1], n_unit[2])
-                .map_err(|_| ConstructionError::NonFiniteInput)?,
-            x_axis: Vector3::try_new(x_unit[0], x_unit[1], x_unit[2])
-                .map_err(|_| ConstructionError::NonFiniteInput)?,
-            y_axis: Vector3::try_new(y_arr[0], y_arr[1], y_arr[2])
-                .map_err(|_| ConstructionError::NonFiniteInput)?,
+            normal: n_unit,
+            x_axis: x_unit,
+            y_axis: y_unit,
         })
     }
 
@@ -326,19 +332,19 @@ impl Circle3 {
     /// Returns the unit normal.
     #[must_use]
     pub fn normal(&self) -> Vector3 {
-        self.normal
+        self.normal.as_vector()
     }
 
     /// Returns the unit reference direction for `θ = 0`.
     #[must_use]
     pub fn x_axis(&self) -> Vector3 {
-        self.x_axis
+        self.x_axis.as_vector()
     }
 
     /// Returns the unit y-axis: `normal × x_axis`.
     #[must_use]
     pub fn y_axis(&self) -> Vector3 {
-        self.y_axis
+        self.y_axis.as_vector()
     }
 
     /// Applies a similarity `transform` (rigid motion plus uniform scale, no
@@ -358,22 +364,19 @@ impl Circle3 {
     /// - [`TransformError::DegenerateResult`] — the transformed axes or
     ///   scaled radius fail circle construction
     pub fn try_transform(&self, transform: &Transform3) -> Result<Self, TransformError> {
-        let m = transform.into_row_major();
-        let scale = similarity_scale(m).ok_or(TransformError::NotSimilarity)?;
-        let c =
-            apply_to_point(m, self.center.into_array()).ok_or(TransformError::NonFiniteResult)?;
-        let n =
-            apply_to_vector(m, self.normal.into_array()).ok_or(TransformError::NonFiniteResult)?;
-        let x =
-            apply_to_vector(m, self.x_axis.into_array()).ok_or(TransformError::NonFiniteResult)?;
+        let scale = similarity_scale(transform).ok_or(TransformError::NotSimilarity)?;
+        let new_center = transform
+            .try_apply_to_point(self.center)
+            .map_err(|_| TransformError::NonFiniteResult)?;
+        let new_normal_vec = transform
+            .try_apply_to_vector(self.normal.as_vector())
+            .map_err(|_| TransformError::NonFiniteResult)?;
+        let new_x_axis_vec = transform
+            .try_apply_to_vector(self.x_axis.as_vector())
+            .map_err(|_| TransformError::NonFiniteResult)?;
         let new_radius = self.radius * scale;
-        Self::try_new(
-            Point3::try_new(c[0], c[1], c[2]).map_err(|_| TransformError::NonFiniteResult)?,
-            new_radius,
-            Vector3::try_new(n[0], n[1], n[2]).map_err(|_| TransformError::NonFiniteResult)?,
-            Vector3::try_new(x[0], x[1], x[2]).map_err(|_| TransformError::NonFiniteResult)?,
-        )
-        .map_err(|_| TransformError::DegenerateResult)
+        Self::try_new(new_center, new_radius, new_normal_vec, new_x_axis_vec)
+            .map_err(|_| TransformError::DegenerateResult)
     }
 }
 
@@ -381,29 +384,27 @@ impl TryFrom<Circle3Repr> for Circle3 {
     type Error = ConstructionError;
     fn try_from(repr: Circle3Repr) -> Result<Self, Self::Error> {
         let center = repr.center.into_array();
-        let normal = repr.normal.into_array();
-        let x_axis = repr.x_axis.into_array();
-        if !all_finite3(center)
-            || !repr.radius.is_finite()
-            || !all_finite3(normal)
-            || !all_finite3(x_axis)
-        {
+        if !all_finite3(center) || !repr.radius.is_finite() {
             return Err(ConstructionError::NonFiniteInput);
         }
         if repr.radius <= 0.0 {
             return Err(ConstructionError::NotPositive);
         }
-        validate_unit3(normal)?;
-        validate_unit3(x_axis)?;
-        validate_orthogonal3(normal, x_axis)?;
-        let y_arr = cross3(normal, x_axis);
+        let n_unit =
+            UnitVector3::try_normalize(repr.normal).map_err(normalization_to_construction)?;
+        let x_unit =
+            UnitVector3::try_normalize(repr.x_axis).map_err(normalization_to_construction)?;
+        if n_unit.dot(x_unit).abs() > UNIT_VECTOR_TOL {
+            return Err(ConstructionError::DependentAxes);
+        }
+        let y_unit = UnitVector3::try_normalize(n_unit.cross(x_unit))
+            .map_err(|_| ConstructionError::DependentAxes)?;
         Ok(Self {
             center: repr.center,
             radius: repr.radius,
-            normal: repr.normal,
-            x_axis: repr.x_axis,
-            y_axis: Vector3::try_new(y_arr[0], y_arr[1], y_arr[2])
-                .map_err(|_| ConstructionError::NonFiniteInput)?,
+            normal: n_unit,
+            x_axis: x_unit,
+            y_axis: y_unit,
         })
     }
 }
@@ -413,8 +414,8 @@ impl From<Circle3> for Circle3Repr {
         Self {
             center: c.center,
             radius: c.radius,
-            normal: c.normal,
-            x_axis: c.x_axis,
+            normal: c.normal.as_vector(),
+            x_axis: c.x_axis.as_vector(),
         }
     }
 }
@@ -689,17 +690,18 @@ mod tests {
     }
 
     #[test]
-    fn circle2_serde_rejects_bad_radius_or_axis() {
-        let bad_axis: Circle2Repr = serde_json::from_value(json!({
+    fn circle2_serde_normalizes_axis_and_rejects_bad_radius() {
+        // Foundation's UnitVector2::try_normalize is lenient: a non-unit but
+        // finite, non-zero x_axis is silently renormalized rather than
+        // rejected.
+        let normalized_axis: Circle2Repr = serde_json::from_value(json!({
             "center": [1.0, 2.0],
             "radius": 3.0,
             "x_axis": [2.0, 0.0]
         }))
         .unwrap();
-        assert_eq!(
-            Circle2::try_from(bad_axis),
-            Err(ConstructionError::DegenerateAxis)
-        );
+        let circle = Circle2::try_from(normalized_axis).unwrap();
+        assert_eq!(circle.x_axis(), Vector2::try_new(1.0, 0.0).unwrap());
 
         let bad_radius: Circle2Repr = serde_json::from_value(json!({
             "center": [1.0, 2.0],
@@ -880,18 +882,19 @@ mod tests {
     }
 
     #[test]
-    fn circle3_serde_rejects_bad_axis_radius_and_orthogonality() {
-        let bad_axis: Circle3Repr = serde_json::from_value(json!({
+    fn circle3_serde_normalizes_axis_and_rejects_dependent_axes_and_bad_radius() {
+        // Foundation's UnitVector3::try_normalize is lenient: a non-unit but
+        // finite, non-zero normal is silently renormalized rather than
+        // rejected.
+        let normalized_axis: Circle3Repr = serde_json::from_value(json!({
             "center": [1.0, 2.0, 3.0],
             "radius": 4.0,
             "normal": [2.0, 0.0, 0.0],
             "x_axis": [0.0, 1.0, 0.0]
         }))
         .unwrap();
-        assert_eq!(
-            Circle3::try_from(bad_axis),
-            Err(ConstructionError::DegenerateAxis)
-        );
+        let circle = Circle3::try_from(normalized_axis).unwrap();
+        assert_eq!(circle.normal(), Vector3::try_new(1.0, 0.0, 0.0).unwrap());
 
         let bad_frame: Circle3Repr = serde_json::from_value(json!({
             "center": [1.0, 2.0, 3.0],

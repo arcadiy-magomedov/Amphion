@@ -35,7 +35,7 @@
 
 use std::f64::consts::TAU;
 
-use amphion_foundation::{Point3, ToleranceContext, Transform3, Vector3};
+use amphion_foundation::{Point3, ToleranceContext, Transform3, UnitVector3, Vector3};
 use serde::{Deserialize, Serialize};
 
 use crate::traits::SurfaceEvaluator;
@@ -47,10 +47,10 @@ use crate::{
 use super::{
     ConstructionError, TransformError,
     helpers::{
-        ILL_COND_THRESH, all_finite3, cross3, dot3, in_range, mag3, normalize3, scale3, sub3,
-        validate_orthogonal3, validate_unit3,
+        ILL_COND_THRESH, UNIT_VECTOR_TOL, all_finite3, dot3, in_range, mag3,
+        normalization_to_construction, scale3, sub3,
     },
-    transform::{apply_to_point, apply_to_vector, similarity_scale},
+    transform::similarity_scale,
 };
 
 fn angular_range() -> ParameterRange {
@@ -87,10 +87,10 @@ struct ConeRepr {
 #[serde(try_from = "ConeRepr", into = "ConeRepr")]
 pub struct Cone {
     apex: Point3,
-    axis: Vector3,
+    axis: UnitVector3,
     half_angle: f64,
-    x_axis: Vector3,
-    y_axis: Vector3,
+    x_axis: UnitVector3,
+    y_axis: UnitVector3,
 }
 
 impl Cone {
@@ -114,19 +114,17 @@ impl Cone {
         x_axis: Vector3,
     ) -> Result<Self, ConstructionError> {
         let ap = apex.into_array();
-        let a = axis.into_array();
-        let x = x_axis.into_array();
-        if !all_finite3(ap) || !all_finite3(a) || !half_angle.is_finite() || !all_finite3(x) {
+        if !all_finite3(ap) || !half_angle.is_finite() {
             return Err(ConstructionError::NonFiniteInput);
         }
         if half_angle <= 0.0 || half_angle >= std::f64::consts::FRAC_PI_2 {
             return Err(ConstructionError::InvalidHalfAngle);
         }
-        let a_unit = normalize3(a).ok_or(ConstructionError::DegenerateAxis)?;
-        let x_norm = normalize3(x).ok_or(ConstructionError::DegenerateAxis)?;
+        let a_unit = UnitVector3::try_normalize(axis).map_err(normalization_to_construction)?;
+        let x_norm = UnitVector3::try_normalize(x_axis).map_err(normalization_to_construction)?;
         // Orthogonalize x against axis.
-        let dot_xa = dot3(x_norm, a_unit);
-        let x_perp = sub3(x_norm, scale3(a_unit, dot_xa));
+        let dot_xa = dot3(x_norm.into_array(), a_unit.into_array());
+        let x_perp = sub3(x_norm.into_array(), scale3(a_unit.into_array(), dot_xa));
         let perp_mag = mag3(x_perp);
         if perp_mag == 0.0 {
             return Err(ConstructionError::DependentAxes);
@@ -134,18 +132,20 @@ impl Cone {
         if perp_mag < ILL_COND_THRESH {
             return Err(ConstructionError::IllConditionedAxes);
         }
-        let x_unit = normalize3(x_perp).ok_or(ConstructionError::DependentAxes)?;
-        let y_arr = cross3(a_unit, x_unit);
+        let x_unit = UnitVector3::try_normalize(
+            Vector3::try_new(x_perp[0], x_perp[1], x_perp[2])
+                .map_err(|_| ConstructionError::NonFiniteInput)?,
+        )
+        .map_err(|_| ConstructionError::DependentAxes)?;
+        let y_axis = UnitVector3::try_normalize(a_unit.cross(x_unit))
+            .map_err(|_| ConstructionError::DependentAxes)?;
         Ok(Self {
             apex: Point3::try_new(ap[0], ap[1], ap[2])
                 .map_err(|_| ConstructionError::NonFiniteInput)?,
-            axis: Vector3::try_new(a_unit[0], a_unit[1], a_unit[2])
-                .map_err(|_| ConstructionError::NonFiniteInput)?,
+            axis: a_unit,
             half_angle,
-            x_axis: Vector3::try_new(x_unit[0], x_unit[1], x_unit[2])
-                .map_err(|_| ConstructionError::NonFiniteInput)?,
-            y_axis: Vector3::try_new(y_arr[0], y_arr[1], y_arr[2])
-                .map_err(|_| ConstructionError::NonFiniteInput)?,
+            x_axis: x_unit,
+            y_axis,
         })
     }
 
@@ -158,7 +158,7 @@ impl Cone {
     /// Returns the unit axis direction.
     #[must_use]
     pub fn axis(&self) -> Vector3 {
-        self.axis
+        self.axis.as_vector()
     }
 
     /// Returns the half-angle in radians (strictly between 0 and π/2).
@@ -170,13 +170,13 @@ impl Cone {
     /// Returns the unit reference direction for `u = 0`.
     #[must_use]
     pub fn x_axis(&self) -> Vector3 {
-        self.x_axis
+        self.x_axis.as_vector()
     }
 
     /// Returns the unit y-axis: `axis × x_axis`.
     #[must_use]
     pub fn y_axis(&self) -> Vector3 {
-        self.y_axis
+        self.y_axis.as_vector()
     }
 
     /// Applies a similarity `transform` (rigid motion plus uniform scale, no
@@ -197,24 +197,21 @@ impl Cone {
     /// - [`TransformError::DegenerateResult`] — the transformed axes fail
     ///   cone construction
     pub fn try_transform(&self, transform: &Transform3) -> Result<Self, TransformError> {
-        let m = transform.into_row_major();
         // The scale factor itself is irrelevant to a cone (half_angle and
         // the apex-relative direction fully determine its shape); only its
         // existence certifies that `transform` is a similarity.
-        similarity_scale(m).ok_or(TransformError::NotSimilarity)?;
-        let ap =
-            apply_to_point(m, self.apex.into_array()).ok_or(TransformError::NonFiniteResult)?;
-        let a =
-            apply_to_vector(m, self.axis.into_array()).ok_or(TransformError::NonFiniteResult)?;
-        let x =
-            apply_to_vector(m, self.x_axis.into_array()).ok_or(TransformError::NonFiniteResult)?;
-        Self::try_new(
-            Point3::try_new(ap[0], ap[1], ap[2]).map_err(|_| TransformError::NonFiniteResult)?,
-            Vector3::try_new(a[0], a[1], a[2]).map_err(|_| TransformError::NonFiniteResult)?,
-            self.half_angle,
-            Vector3::try_new(x[0], x[1], x[2]).map_err(|_| TransformError::NonFiniteResult)?,
-        )
-        .map_err(|_| TransformError::DegenerateResult)
+        similarity_scale(transform).ok_or(TransformError::NotSimilarity)?;
+        let new_apex = transform
+            .try_apply_to_point(self.apex)
+            .map_err(|_| TransformError::NonFiniteResult)?;
+        let new_axis_vec = transform
+            .try_apply_to_vector(self.axis.as_vector())
+            .map_err(|_| TransformError::NonFiniteResult)?;
+        let new_x_vec = transform
+            .try_apply_to_vector(self.x_axis.as_vector())
+            .map_err(|_| TransformError::NonFiniteResult)?;
+        Self::try_new(new_apex, new_axis_vec, self.half_angle, new_x_vec)
+            .map_err(|_| TransformError::DegenerateResult)
     }
 }
 
@@ -222,29 +219,27 @@ impl TryFrom<ConeRepr> for Cone {
     type Error = ConstructionError;
     fn try_from(repr: ConeRepr) -> Result<Self, Self::Error> {
         let apex = repr.apex.into_array();
-        let axis = repr.axis.into_array();
-        let x_axis = repr.x_axis.into_array();
-        if !all_finite3(apex)
-            || !all_finite3(axis)
-            || !repr.half_angle.is_finite()
-            || !all_finite3(x_axis)
-        {
+        if !all_finite3(apex) || !repr.half_angle.is_finite() {
             return Err(ConstructionError::NonFiniteInput);
         }
         if repr.half_angle <= 0.0 || repr.half_angle >= std::f64::consts::FRAC_PI_2 {
             return Err(ConstructionError::InvalidHalfAngle);
         }
-        validate_unit3(axis)?;
-        validate_unit3(x_axis)?;
-        validate_orthogonal3(axis, x_axis)?;
-        let y_arr = cross3(axis, x_axis);
+        let a_unit =
+            UnitVector3::try_normalize(repr.axis).map_err(normalization_to_construction)?;
+        let x_unit =
+            UnitVector3::try_normalize(repr.x_axis).map_err(normalization_to_construction)?;
+        if a_unit.dot(x_unit).abs() > UNIT_VECTOR_TOL {
+            return Err(ConstructionError::DependentAxes);
+        }
+        let y_axis = UnitVector3::try_normalize(a_unit.cross(x_unit))
+            .map_err(|_| ConstructionError::DependentAxes)?;
         Ok(Self {
             apex: repr.apex,
-            axis: repr.axis,
+            axis: a_unit,
             half_angle: repr.half_angle,
-            x_axis: repr.x_axis,
-            y_axis: Vector3::try_new(y_arr[0], y_arr[1], y_arr[2])
-                .map_err(|_| ConstructionError::NonFiniteInput)?,
+            x_axis: x_unit,
+            y_axis,
         })
     }
 }
@@ -253,9 +248,9 @@ impl From<Cone> for ConeRepr {
     fn from(c: Cone) -> Self {
         Self {
             apex: c.apex,
-            axis: c.axis,
+            axis: c.axis.as_vector(),
             half_angle: c.half_angle,
-            x_axis: c.x_axis,
+            x_axis: c.x_axis.as_vector(),
         }
     }
 }
@@ -528,18 +523,19 @@ mod tests {
     }
 
     #[test]
-    fn cone_serde_rejects_bad_axis_angle_and_orthogonality() {
-        let bad_axis: ConeRepr = serde_json::from_value(json!({
+    fn cone_serde_normalizes_axis_and_rejects_dependent_axes_and_bad_angle() {
+        // Foundation's UnitVector3::try_normalize is lenient: a non-unit but
+        // finite, non-zero axis is silently renormalized rather than
+        // rejected.
+        let normalized_axis: ConeRepr = serde_json::from_value(json!({
             "apex": [1.0, 2.0, 3.0],
             "axis": [2.0, 0.0, 0.0],
             "half_angle": 0.5,
             "x_axis": [0.0, 1.0, 0.0]
         }))
         .unwrap();
-        assert_eq!(
-            Cone::try_from(bad_axis),
-            Err(ConstructionError::DegenerateAxis)
-        );
+        let cone = Cone::try_from(normalized_axis).unwrap();
+        assert_eq!(cone.axis(), Vector3::try_new(1.0, 0.0, 0.0).unwrap());
 
         let bad_frame: ConeRepr = serde_json::from_value(json!({
             "apex": [1.0, 2.0, 3.0],

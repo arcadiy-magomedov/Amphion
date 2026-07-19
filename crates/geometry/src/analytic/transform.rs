@@ -1,30 +1,27 @@
 //! Checked primitive transformation via `Transform3`.
 //!
-//! All transform operations here are **provisional** pending the `cf85555`
-//! foundation integration, which adds `try_apply_to_point`,
-//! `try_apply_to_vector`, and similarity classification directly to
-//! `amphion-foundation`. Until then, this module manually applies the raw
-//! row-major 3×4 matrix returned by `Transform3::into_row_major` and
-//! re-derives the checks that a future foundation API would provide
-//! natively (finiteness of the transformed result, and — for primitives
-//! whose shape is only preserved under a similarity — a heuristic
-//! orthogonality/equal-scale/no-reflection check on the transform's linear
-//! part).
+//! Uses `Transform3::try_apply_to_point`, `try_apply_to_vector`, and
+//! `try_compose` from the accepted foundation (670516d).
 //!
 //! `Line3` and `Plane` accept any non-degenerate affine transform: an affine
 //! image of a line is a line, and an affine image of a plane (as long as it
 //! does not collapse the spanning vectors) is a plane. `Circle3`, `Cylinder`,
 //! and `Cone` require a *similarity* transform (rigid motion plus uniform
-//! scale, no reflection), because only a similarity preserves circles,
+//! scale, no reflection), since only a similarity preserves circles,
 //! circular cylinders, and circular cones as such.
 //!
-//! 2-D primitives (`Line2`, `Circle2`) are intentionally **not** covered:
-//! the current foundation has no `Transform2` type. Support should be added
-//! once one exists.
+//! 2-D primitives (`Line2`, `Circle2`) are not covered: the foundation has
+//! no `Transform2` type. Support will be added when one exists.
+//!
+//! Reflection (`det < 0`) is supported as a similarity and preserves
+//! geometric families; whether to reject it is a v0 policy choice.
+//! Currently the implementation rejects it via positive-determinant check,
+//! returning `TransformError::NotSimilarity`. This is a deliberate v0
+//! limitation; a future release may add `TransformError::ReflectionUnsupported`.
 
 #![allow(clippy::many_single_char_names, clippy::similar_names)]
 
-use super::helpers::{dot3, mag3};
+use amphion_foundation::{Transform3, Vector3};
 
 /// A failure from applying a `Transform3` to an analytic primitive.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,67 +45,40 @@ pub enum TransformError {
 /// the module-level documentation.
 const SIMILARITY_TOL: f64 = 1e-10;
 
-/// Applies a `Transform3` (3×4 row-major) to a 3-D point.
-///
-/// Returns `None` if any resulting coordinate is non-finite.
-pub(super) fn apply_to_point(m: [f64; 12], p: [f64; 3]) -> Option<[f64; 3]> {
-    let x = m[0] * p[0] + m[1] * p[1] + m[2] * p[2] + m[3];
-    let y = m[4] * p[0] + m[5] * p[1] + m[6] * p[2] + m[7];
-    let z = m[8] * p[0] + m[9] * p[1] + m[10] * p[2] + m[11];
-    if x.is_finite() && y.is_finite() && z.is_finite() {
-        Some([x, y, z])
-    } else {
-        None
-    }
-}
-
-/// Applies a `Transform3` to a 3-D direction vector (linear part only, no
-/// translation).
-///
-/// Returns `None` if any resulting coordinate is non-finite.
-pub(super) fn apply_to_vector(m: [f64; 12], v: [f64; 3]) -> Option<[f64; 3]> {
-    let x = m[0] * v[0] + m[1] * v[1] + m[2] * v[2];
-    let y = m[4] * v[0] + m[5] * v[1] + m[6] * v[2];
-    let z = m[8] * v[0] + m[9] * v[1] + m[10] * v[2];
-    if x.is_finite() && y.is_finite() && z.is_finite() {
-        Some([x, y, z])
-    } else {
-        None
-    }
-}
-
 /// Computes the uniform scale factor of a transform's linear part and
 /// verifies it is a similarity: equal-magnitude, mutually orthogonal
 /// columns, non-zero scale, and a positive determinant (no reflection).
 ///
 /// Returns `Some(scale)` when the linear part is a similarity, `None`
 /// otherwise.
-pub(super) fn similarity_scale(m: [f64; 12]) -> Option<f64> {
-    let tol = SIMILARITY_TOL;
-    let c0 = [m[0], m[4], m[8]];
-    let c1 = [m[1], m[5], m[9]];
-    let c2 = [m[2], m[6], m[10]];
-    let s0 = mag3(c0);
-    let s1 = mag3(c1);
-    let s2 = mag3(c2);
+pub(super) fn similarity_scale(transform: &Transform3) -> Option<f64> {
+    let m = transform.into_row_major();
+    // Extract columns of the linear part as Vector3 (using checked constructor).
+    let c0 = Vector3::try_new(m[0], m[4], m[8]).ok()?;
+    let c1 = Vector3::try_new(m[1], m[5], m[9]).ok()?;
+    let c2 = Vector3::try_new(m[2], m[6], m[10]).ok()?;
+    let s0 = c0.try_magnitude().ok()?;
+    let s1 = c1.try_magnitude().ok()?;
+    let s2 = c2.try_magnitude().ok()?;
     if s0 < 1e-300 {
         return None;
     }
+    let tol = SIMILARITY_TOL;
     // Equal scale across all three columns.
     if (s0 - s1).abs() > tol * s0 || (s0 - s2).abs() > tol * s0 {
         return None;
     }
-    // Mutual orthogonality.
-    if dot3(c0, c1).abs() > tol * s0 * s1 {
+    // Mutual orthogonality using checked dot products.
+    if c0.try_dot(c1).ok()?.abs() > tol * s0 * s1 {
         return None;
     }
-    if dot3(c0, c2).abs() > tol * s0 * s2 {
+    if c0.try_dot(c2).ok()?.abs() > tol * s0 * s2 {
         return None;
     }
-    if dot3(c1, c2).abs() > tol * s1 * s2 {
+    if c1.try_dot(c2).ok()?.abs() > tol * s1 * s2 {
         return None;
     }
-    // Positive determinant: reject reflections.
+    // Positive determinant (no reflection).
     let det = m[0] * (m[5] * m[10] - m[9] * m[6]) - m[1] * (m[4] * m[10] - m[8] * m[6])
         + m[2] * (m[4] * m[9] - m[8] * m[5]);
     if det < 0.0 {

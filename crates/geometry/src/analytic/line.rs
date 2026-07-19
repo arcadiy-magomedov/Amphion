@@ -20,7 +20,9 @@
     clippy::similar_names
 )]
 
-use amphion_foundation::{Point2, Point3, ToleranceContext, Transform3, Vector2, Vector3};
+use amphion_foundation::{
+    Point2, Point3, ToleranceContext, Transform3, UnitVector2, UnitVector3, Vector2, Vector3,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::traits::{Curve2Evaluator, Curve3Evaluator};
@@ -33,10 +35,9 @@ use super::{
     ConstructionError, TransformError,
     helpers::{
         add2, add3, all_finite2, all_finite3, arithmetic_eval_bound, arithmetic_proj_bound2,
-        arithmetic_proj_bound3, dot2, dot3, mag2, mag3, normalize2, normalize3, scale2, scale3,
-        sub2, sub3, validate_unit2, validate_unit3,
+        arithmetic_proj_bound3, dot2, dot3, mag2, mag3, normalization_to_construction, scale2,
+        scale3, sub2, sub3,
     },
-    transform::{apply_to_point, apply_to_vector},
 };
 
 // ─── Helpers shared by both line types ──────────────────────────────────────
@@ -65,7 +66,7 @@ struct Line2Repr {
 #[serde(try_from = "Line2Repr", into = "Line2Repr")]
 pub struct Line2 {
     origin: Point2,
-    direction: Vector2,
+    direction: UnitVector2,
 }
 
 impl Line2 {
@@ -79,15 +80,13 @@ impl Line2 {
     /// has zero length.
     pub fn try_new(origin: Point2, direction: Vector2) -> Result<Self, ConstructionError> {
         let o = origin.into_array();
-        let d = direction.into_array();
-        if !all_finite2(o) || !all_finite2(d) {
+        if !all_finite2(o) {
             return Err(ConstructionError::NonFiniteInput);
         }
-        let d_unit = normalize2(d).ok_or(ConstructionError::DegenerateAxis)?;
+        let dir = UnitVector2::try_normalize(direction).map_err(normalization_to_construction)?;
         Ok(Self {
             origin: Point2::try_new(o[0], o[1]).map_err(|_| ConstructionError::NonFiniteInput)?,
-            direction: Vector2::try_new(d_unit[0], d_unit[1])
-                .map_err(|_| ConstructionError::NonFiniteInput)?,
+            direction: dir,
         })
     }
 
@@ -100,7 +99,7 @@ impl Line2 {
     /// Returns the stored unit direction vector.
     #[must_use]
     pub fn direction(&self) -> Vector2 {
-        self.direction
+        self.direction.as_vector()
     }
 }
 
@@ -108,14 +107,14 @@ impl TryFrom<Line2Repr> for Line2 {
     type Error = ConstructionError;
     fn try_from(repr: Line2Repr) -> Result<Self, Self::Error> {
         let origin = repr.origin.into_array();
-        let direction = repr.direction.into_array();
-        if !all_finite2(origin) || !all_finite2(direction) {
+        if !all_finite2(origin) {
             return Err(ConstructionError::NonFiniteInput);
         }
-        validate_unit2(direction)?;
+        let direction =
+            UnitVector2::try_normalize(repr.direction).map_err(normalization_to_construction)?;
         Ok(Self {
             origin: repr.origin,
-            direction: repr.direction,
+            direction,
         })
     }
 }
@@ -124,7 +123,7 @@ impl From<Line2> for Line2Repr {
     fn from(line: Line2) -> Self {
         Self {
             origin: line.origin,
-            direction: line.direction,
+            direction: line.direction.as_vector(),
         }
     }
 }
@@ -269,7 +268,7 @@ struct Line3Repr {
 #[serde(try_from = "Line3Repr", into = "Line3Repr")]
 pub struct Line3 {
     origin: Point3,
-    direction: Vector3,
+    direction: UnitVector3,
 }
 
 impl Line3 {
@@ -283,16 +282,14 @@ impl Line3 {
     /// has zero length.
     pub fn try_new(origin: Point3, direction: Vector3) -> Result<Self, ConstructionError> {
         let o = origin.into_array();
-        let d = direction.into_array();
-        if !all_finite3(o) || !all_finite3(d) {
+        if !all_finite3(o) {
             return Err(ConstructionError::NonFiniteInput);
         }
-        let d_unit = normalize3(d).ok_or(ConstructionError::DegenerateAxis)?;
+        let dir = UnitVector3::try_normalize(direction).map_err(normalization_to_construction)?;
         Ok(Self {
             origin: Point3::try_new(o[0], o[1], o[2])
                 .map_err(|_| ConstructionError::NonFiniteInput)?,
-            direction: Vector3::try_new(d_unit[0], d_unit[1], d_unit[2])
-                .map_err(|_| ConstructionError::NonFiniteInput)?,
+            direction: dir,
         })
     }
 
@@ -305,7 +302,7 @@ impl Line3 {
     /// Returns the stored unit direction vector.
     #[must_use]
     pub fn direction(&self) -> Vector3 {
-        self.direction
+        self.direction.as_vector()
     }
 
     /// Applies an affine `transform` to this line, returning a new line.
@@ -321,16 +318,13 @@ impl Line3 {
     /// - [`TransformError::DegenerateResult`] — the transformed direction has
     ///   zero length
     pub fn try_transform(&self, transform: &Transform3) -> Result<Self, TransformError> {
-        let m = transform.into_row_major();
-        let o =
-            apply_to_point(m, self.origin.into_array()).ok_or(TransformError::NonFiniteResult)?;
-        let d = apply_to_vector(m, self.direction.into_array())
-            .ok_or(TransformError::NonFiniteResult)?;
-        Self::try_new(
-            Point3::try_new(o[0], o[1], o[2]).map_err(|_| TransformError::NonFiniteResult)?,
-            Vector3::try_new(d[0], d[1], d[2]).map_err(|_| TransformError::NonFiniteResult)?,
-        )
-        .map_err(|_| TransformError::DegenerateResult)
+        let o = transform
+            .try_apply_to_point(self.origin)
+            .map_err(|_| TransformError::NonFiniteResult)?;
+        let d_vec = transform
+            .try_apply_to_vector(self.direction.as_vector())
+            .map_err(|_| TransformError::NonFiniteResult)?;
+        Self::try_new(o, d_vec).map_err(|_| TransformError::DegenerateResult)
     }
 }
 
@@ -338,14 +332,14 @@ impl TryFrom<Line3Repr> for Line3 {
     type Error = ConstructionError;
     fn try_from(repr: Line3Repr) -> Result<Self, Self::Error> {
         let origin = repr.origin.into_array();
-        let direction = repr.direction.into_array();
-        if !all_finite3(origin) || !all_finite3(direction) {
+        if !all_finite3(origin) {
             return Err(ConstructionError::NonFiniteInput);
         }
-        validate_unit3(direction)?;
+        let direction =
+            UnitVector3::try_normalize(repr.direction).map_err(normalization_to_construction)?;
         Ok(Self {
             origin: repr.origin,
-            direction: repr.direction,
+            direction,
         })
     }
 }
@@ -354,7 +348,7 @@ impl From<Line3> for Line3Repr {
     fn from(line: Line3) -> Self {
         Self {
             origin: line.origin,
-            direction: line.direction,
+            direction: line.direction.as_vector(),
         }
     }
 }
@@ -740,33 +734,31 @@ mod tests {
     }
 
     #[test]
-    fn line2_serde_rejects_non_unit_direction() {
+    fn line2_serde_normalizes_non_unit_direction() {
+        // Foundation's UnitVector2::try_normalize is lenient: any finite,
+        // non-zero direction is silently renormalized rather than rejected.
         let repr: Line2Repr = serde_json::from_value(json!({
             "origin": [1.0, 2.0],
             "direction": [2.0, 0.0]
         }))
         .unwrap();
-        assert_eq!(
-            Line2::try_from(repr),
-            Err(ConstructionError::DegenerateAxis)
-        );
+        let line = Line2::try_from(repr).unwrap();
+        assert_eq!(line.direction(), Vector2::try_new(1.0, 0.0).unwrap());
     }
 
     #[test]
-    fn line2_serde_rejects_marginally_non_unit_direction() {
-        // UNIT_VECTOR_TOL was tightened from 8ε to 4ε to match the cf85555
-        // UnitVector2/3 magnitude-deviation guarantee. `1.000_000_000_000_000_9`
-        // is 4 ULPs above 1.0, giving |v·v − 1| = 8ε > 4ε, so this direction
-        // must now be rejected even though it is very close to unit length.
+    fn line2_serde_normalizes_marginally_non_unit_direction() {
+        // `1.000_000_000_000_000_9` is 4 ULPs above 1.0; foundation's lenient
+        // `try_normalize` accepts and renormalizes any finite non-zero input,
+        // unlike the old strict `validate_unit2` (which rejected deviations
+        // beyond `UNIT_VECTOR_TOL`).
         let repr: Line2Repr = serde_json::from_value(json!({
             "origin": [1.0, 2.0],
             "direction": [1.000_000_000_000_000_9, 0.0]
         }))
         .unwrap();
-        assert_eq!(
-            Line2::try_from(repr),
-            Err(ConstructionError::DegenerateAxis)
-        );
+        let line = Line2::try_from(repr).unwrap();
+        assert_eq!(line.direction(), Vector2::try_new(1.0, 0.0).unwrap());
     }
 
     #[test]
@@ -916,32 +908,29 @@ mod tests {
     }
 
     #[test]
-    fn line3_serde_rejects_non_unit_direction() {
+    fn line3_serde_normalizes_non_unit_direction() {
         let repr: Line3Repr = serde_json::from_value(json!({
             "origin": [1.0, 2.0, 3.0],
             "direction": [2.0, 0.0, 0.0]
         }))
         .unwrap();
-        assert_eq!(
-            Line3::try_from(repr),
-            Err(ConstructionError::DegenerateAxis)
-        );
+        let line = Line3::try_from(repr).unwrap();
+        assert_eq!(line.direction(), Vector3::try_new(1.0, 0.0, 0.0).unwrap());
     }
 
     #[test]
-    fn line3_serde_rejects_marginally_non_unit_direction() {
-        // See `line2_serde_rejects_marginally_non_unit_direction`: 4 ULPs
-        // above 1.0 gives |v·v − 1| = 8ε, which exceeds the tightened 4ε
-        // UNIT_VECTOR_TOL and must be rejected.
+    fn line3_serde_normalizes_marginally_non_unit_direction() {
+        // See `line2_serde_normalizes_marginally_non_unit_direction`:
+        // foundation's lenient `try_normalize` accepts and renormalizes any
+        // finite non-zero input, including directions a few ULPs from unit
+        // length.
         let repr: Line3Repr = serde_json::from_value(json!({
             "origin": [1.0, 2.0, 3.0],
             "direction": [1.000_000_000_000_000_9, 0.0, 0.0]
         }))
         .unwrap();
-        assert_eq!(
-            Line3::try_from(repr),
-            Err(ConstructionError::DegenerateAxis)
-        );
+        let line = Line3::try_from(repr).unwrap();
+        assert_eq!(line.direction(), Vector3::try_new(1.0, 0.0, 0.0).unwrap());
     }
 
     #[test]

@@ -48,7 +48,7 @@
 //! `GeometryError::Uncertified` rather than assert a bound we cannot
 //! support.
 
-use amphion_foundation::ToleranceContext;
+use amphion_foundation::{Interval, NormalizationError, ToleranceContext, Vector2, Vector3};
 
 use crate::{DistanceBound, GeometryError, ParameterRange};
 
@@ -57,10 +57,28 @@ use super::ConstructionError;
 /// Serde validation tolerance: accept vectors whose squared-norm differs from
 /// 1 by at most `4ε`, matching the magnitude-deviation guarantee of the
 /// `UnitVector2`/`UnitVector3` types introduced in foundation commit
-/// `cf85555`. Honest round-tripped values produced by this module's own
+/// `670516d`. Honest round-tripped values produced by this module's own
 /// normalization have `||v||² − 1| ≤ 2ε`, so they pass with a `2×` margin;
 /// clearly corrupted or hand-crafted non-unit vectors are rejected.
 pub(super) const UNIT_VECTOR_TOL: f64 = 4.0 * f64::EPSILON;
+
+/// Converts a foundation [`NormalizationError`] into the analytic
+/// geometry crate's own [`ConstructionError`].
+///
+/// `NonFinite` and `NotNormalized` both indicate the supplied vector cannot
+/// be trusted as-is, which this crate reports as
+/// [`ConstructionError::NonFiniteInput`]; `ZeroMagnitude` maps to
+/// [`ConstructionError::DegenerateAxis`], matching the prior local
+/// `normalize2`/`normalize3` behavior of returning `None` only for the zero
+/// vector.
+pub(super) fn normalization_to_construction(err: NormalizationError) -> ConstructionError {
+    match err {
+        NormalizationError::NonFinite | NormalizationError::NotNormalized => {
+            ConstructionError::NonFiniteInput
+        }
+        NormalizationError::ZeroMagnitude => ConstructionError::DegenerateAxis,
+    }
+}
 
 /// Ill-conditioning threshold for Gram-Schmidt orthogonalization.  If the
 /// component of the supplied x-axis perpendicular to the main axis has
@@ -89,18 +107,6 @@ pub(super) fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-pub(super) fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
-pub(super) fn mag3_sq(v: [f64; 3]) -> f64 {
-    dot3(v, v)
-}
-
 pub(super) fn mag3(v: [f64; 3]) -> f64 {
     let scale = v[0].abs().max(v[1].abs()).max(v[2].abs());
     if scale == 0.0 {
@@ -109,19 +115,6 @@ pub(super) fn mag3(v: [f64; 3]) -> f64 {
         let vs = [v[0] / scale, v[1] / scale, v[2] / scale];
         scale * (vs[0] * vs[0] + vs[1] * vs[1] + vs[2] * vs[2]).sqrt()
     }
-}
-
-/// Returns `None` only when `v` has exactly zero squared-magnitude.
-pub(super) fn normalize3(v: [f64; 3]) -> Option<[f64; 3]> {
-    let scale = v[0].abs().max(v[1].abs()).max(v[2].abs());
-    if scale == 0.0 || !scale.is_finite() {
-        return None;
-    }
-    let vs = [v[0] / scale, v[1] / scale, v[2] / scale];
-    let inv = (vs[0] * vs[0] + vs[1] * vs[1] + vs[2] * vs[2])
-        .sqrt()
-        .recip();
-    Some([vs[0] * inv, vs[1] * inv, vs[2] * inv])
 }
 
 pub(super) fn add3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
@@ -146,10 +139,6 @@ pub(super) fn dot2(a: [f64; 2], b: [f64; 2]) -> f64 {
     a[0] * b[0] + a[1] * b[1]
 }
 
-pub(super) fn mag2_sq(v: [f64; 2]) -> f64 {
-    dot2(v, v)
-}
-
 pub(super) fn mag2(v: [f64; 2]) -> f64 {
     let scale = v[0].abs().max(v[1].abs());
     if scale == 0.0 {
@@ -158,17 +147,6 @@ pub(super) fn mag2(v: [f64; 2]) -> f64 {
         let vs = [v[0] / scale, v[1] / scale];
         scale * (vs[0] * vs[0] + vs[1] * vs[1]).sqrt()
     }
-}
-
-/// Returns `None` only when `v` has exactly zero squared-magnitude.
-pub(super) fn normalize2(v: [f64; 2]) -> Option<[f64; 2]> {
-    let scale = v[0].abs().max(v[1].abs());
-    if scale == 0.0 || !scale.is_finite() {
-        return None;
-    }
-    let vs = [v[0] / scale, v[1] / scale];
-    let inv = (vs[0] * vs[0] + vs[1] * vs[1]).sqrt().recip();
-    Some([vs[0] * inv, vs[1] * inv])
 }
 
 pub(super) fn add2(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
@@ -214,36 +192,6 @@ pub(super) fn in_range(t: f64, range: ParameterRange) -> bool {
     lo_ok && hi_ok
 }
 
-pub(super) fn validate_unit2(v: [f64; 2]) -> Result<(), ConstructionError> {
-    if !all_finite2(v) {
-        return Err(ConstructionError::NonFiniteInput);
-    }
-    if (mag2_sq(v) - 1.0).abs() > UNIT_VECTOR_TOL {
-        return Err(ConstructionError::DegenerateAxis);
-    }
-    Ok(())
-}
-
-pub(super) fn validate_unit3(v: [f64; 3]) -> Result<(), ConstructionError> {
-    if !all_finite3(v) {
-        return Err(ConstructionError::NonFiniteInput);
-    }
-    if (mag3_sq(v) - 1.0).abs() > UNIT_VECTOR_TOL {
-        return Err(ConstructionError::DegenerateAxis);
-    }
-    Ok(())
-}
-
-pub(super) fn validate_orthogonal3(a: [f64; 3], b: [f64; 3]) -> Result<(), ConstructionError> {
-    if !all_finite3(a) || !all_finite3(b) {
-        return Err(ConstructionError::NonFiniteInput);
-    }
-    if dot3(a, b).abs() > UNIT_VECTOR_TOL {
-        return Err(ConstructionError::DependentAxes);
-    }
-    Ok(())
-}
-
 /// Certified upper bound on `|query − projection|` for a LINE or PLANE
 /// projection in 2-D (no trig involved), and checks that the certified
 /// floating-point error allowance fits within `tolerance`.
@@ -279,15 +227,50 @@ pub(super) fn arithmetic_proj_bound2(
     projection: [f64; 2],
     tolerance: &ToleranceContext,
 ) -> Result<f64, GeometryError> {
-    let residual = mag2(sub2(query, projection));
-    let scale = mag2(query) + mag2(projection);
+    // Use Vector2 checked magnitude for scale-safe residual computation.
+    let diff = [query[0] - projection[0], query[1] - projection[1]];
+    let diff_vec = Vector2::try_new(diff[0], diff[1]).map_err(|_| GeometryError::Uncertified {
+        reason: "projection difference is non-finite".to_owned(),
+    })?;
+    let residual = diff_vec
+        .try_magnitude()
+        .map_err(|_| GeometryError::Uncertified {
+            reason: "projection residual overflowed".to_owned(),
+        })?;
+
+    // World-coordinate scale for Higham error bound.
+    let q_vec = Vector2::try_new(query[0], query[1]).map_err(|_| GeometryError::Uncertified {
+        reason: "query is non-finite".to_owned(),
+    })?;
+    let p_vec =
+        Vector2::try_new(projection[0], projection[1]).map_err(|_| GeometryError::Uncertified {
+            reason: "projection is non-finite".to_owned(),
+        })?;
+    let q_mag = q_vec
+        .try_magnitude()
+        .map_err(|_| GeometryError::Uncertified {
+            reason: "query magnitude overflowed".to_owned(),
+        })?;
+    let p_mag = p_vec
+        .try_magnitude()
+        .map_err(|_| GeometryError::Uncertified {
+            reason: "projection magnitude overflowed".to_owned(),
+        })?;
+    let scale = q_mag + p_mag;
     let fp_err = GAMMA_32 * scale;
-    let bound = residual + fp_err;
-    if !bound.is_finite() {
-        return Err(GeometryError::Uncertified {
-            reason: "projection distance overflowed representable range".to_owned(),
-        });
-    }
+
+    // Use Interval::point + widen for outward-rounded final bound.
+    // Interval::widen uses next_down/next_up internally (stabilized Rust 1.87).
+    let bound = Interval::point(residual)
+        .map_err(|_| GeometryError::Uncertified {
+            reason: "residual is non-finite for interval bound".to_owned(),
+        })?
+        .widen(fp_err)
+        .map_err(|_| GeometryError::Uncertified {
+            reason: "certified distance bound overflowed representable range".to_owned(),
+        })?
+        .hi();
+
     let eff_tol = tolerance
         .effective_length(scale)
         .map_err(|_| GeometryError::Uncertified {
@@ -310,15 +293,56 @@ pub(super) fn arithmetic_proj_bound3(
     projection: [f64; 3],
     tolerance: &ToleranceContext,
 ) -> Result<f64, GeometryError> {
-    let residual = mag3(sub3(query, projection));
-    let scale = mag3(query) + mag3(projection);
+    // Use Vector3 checked magnitude for scale-safe residual computation.
+    let diff = [
+        query[0] - projection[0],
+        query[1] - projection[1],
+        query[2] - projection[2],
+    ];
+    let diff_vec =
+        Vector3::try_new(diff[0], diff[1], diff[2]).map_err(|_| GeometryError::Uncertified {
+            reason: "projection difference is non-finite".to_owned(),
+        })?;
+    let residual = diff_vec
+        .try_magnitude()
+        .map_err(|_| GeometryError::Uncertified {
+            reason: "projection residual overflowed".to_owned(),
+        })?;
+
+    // World-coordinate scale for Higham error bound.
+    let q_vec =
+        Vector3::try_new(query[0], query[1], query[2]).map_err(|_| GeometryError::Uncertified {
+            reason: "query is non-finite".to_owned(),
+        })?;
+    let p_vec = Vector3::try_new(projection[0], projection[1], projection[2]).map_err(|_| {
+        GeometryError::Uncertified {
+            reason: "projection is non-finite".to_owned(),
+        }
+    })?;
+    let q_mag = q_vec
+        .try_magnitude()
+        .map_err(|_| GeometryError::Uncertified {
+            reason: "query magnitude overflowed".to_owned(),
+        })?;
+    let p_mag = p_vec
+        .try_magnitude()
+        .map_err(|_| GeometryError::Uncertified {
+            reason: "projection magnitude overflowed".to_owned(),
+        })?;
+    let scale = q_mag + p_mag;
     let fp_err = GAMMA_32 * scale;
-    let bound = residual + fp_err;
-    if !bound.is_finite() {
-        return Err(GeometryError::Uncertified {
-            reason: "projection distance overflowed representable range".to_owned(),
-        });
-    }
+
+    // Use Interval::point + widen for outward-rounded final bound.
+    let bound = Interval::point(residual)
+        .map_err(|_| GeometryError::Uncertified {
+            reason: "residual is non-finite for interval bound".to_owned(),
+        })?
+        .widen(fp_err)
+        .map_err(|_| GeometryError::Uncertified {
+            reason: "certified distance bound overflowed representable range".to_owned(),
+        })?
+        .hi();
+
     let eff_tol = tolerance
         .effective_length(scale)
         .map_err(|_| GeometryError::Uncertified {
@@ -352,7 +376,11 @@ pub(super) fn arithmetic_eval_bound(eval_scale: f64) -> Result<DistanceBound, Ge
             reason: "evaluation scale is non-finite".to_owned(),
         });
     }
-    let bound = (GAMMA_64 * eval_scale.abs()).max(0.0);
+    let raw = GAMMA_64 * eval_scale.abs();
+    // Use next_up() for outward rounding (sqrt is correctly rounded, so
+    // the arithmetic bound via Higham is already valid; one next_up adds
+    // the final-addition rounding).
+    let bound = raw.next_up().max(0.0);
     DistanceBound::try_new(bound).map_err(|_| GeometryError::Uncertified {
         reason: "arithmetic evaluation error bound overflowed representable range".to_owned(),
     })
@@ -360,62 +388,76 @@ pub(super) fn arithmetic_eval_bound(eval_scale: f64) -> Result<DistanceBound, Ge
 
 #[cfg(test)]
 mod tests {
+    use amphion_foundation::{NormalizationError, ToleranceContext, Vector2, Vector3};
+
     use super::{
-        UNIT_VECTOR_TOL, mag2, mag3, normalize2, normalize3, validate_unit2, validate_unit3,
+        UNIT_VECTOR_TOL, arithmetic_eval_bound, arithmetic_proj_bound2, arithmetic_proj_bound3,
+        normalization_to_construction,
     };
     use crate::analytic::ConstructionError;
 
     #[test]
-    fn normalize3_handles_max_scale_inputs() {
-        let unit = normalize3([f64::MAX, f64::MAX, f64::MAX]).unwrap();
-        assert!((mag3(unit) - 1.0).abs() < 1e-15);
-    }
-
-    #[test]
-    fn normalize3_handles_subnormal_inputs() {
-        let unit = normalize3([f64::MIN_POSITIVE, f64::MIN_POSITIVE, 0.0]).unwrap();
-        assert!((mag3(unit) - 1.0).abs() < 1e-15);
-    }
-
-    #[test]
-    fn normalize2_handles_extreme_scales() {
-        let unit_large = normalize2([f64::MAX, -f64::MAX]).unwrap();
-        let unit_small = normalize2([f64::MIN_POSITIVE, f64::MIN_POSITIVE]).unwrap();
-        assert!((mag2(unit_large) - 1.0).abs() < 1e-15);
-        assert!((mag2(unit_small) - 1.0).abs() < 1e-15);
-    }
-
-    #[test]
-    fn unit_vector_tol_rejects_vector_deviating_by_more_than_4eps() {
-        // v = 1.0 + 4*eps is 4 ULPs away from 1.0 on the f64 grid near 1.0
-        // (grid spacing there is exactly `eps`), so this is exact, not a
-        // rounding artefact of the decimal literal.
-        let eps = f64::EPSILON;
-        let v = 1.0 + 4.0 * eps;
-        let deviation = (v * v - 1.0).abs();
-        assert!(
-            deviation > UNIT_VECTOR_TOL,
-            "test fixture must exceed the tightened 4ε tolerance: deviation={deviation:e}, \
-             tol={UNIT_VECTOR_TOL:e}"
-        );
+    fn normalization_to_construction_maps_zero_magnitude_to_degenerate_axis() {
         assert_eq!(
-            validate_unit2([v, 0.0]),
-            Err(ConstructionError::DegenerateAxis)
-        );
-        assert_eq!(
-            validate_unit3([v, 0.0, 0.0]),
-            Err(ConstructionError::DegenerateAxis)
+            normalization_to_construction(NormalizationError::ZeroMagnitude),
+            ConstructionError::DegenerateAxis
         );
     }
 
     #[test]
-    fn unit_vector_tol_accepts_normalize_round_trip_with_2x_margin() {
-        // This module's own normalization guarantees `||v||² − 1| ≤ 2ε`, so
-        // round-tripped unit vectors must pass the tightened 4ε tolerance
-        // with a 2× margin.
-        let v2 = normalize2([3.0, 4.0]).unwrap();
-        assert!(validate_unit2(v2).is_ok());
-        let v3 = normalize3([1.0, 2.0, 2.0]).unwrap();
-        assert!(validate_unit3(v3).is_ok());
+    fn normalization_to_construction_maps_non_finite_to_non_finite_input() {
+        assert_eq!(
+            normalization_to_construction(NormalizationError::NonFinite),
+            ConstructionError::NonFiniteInput
+        );
+    }
+
+    #[test]
+    fn normalization_to_construction_maps_not_normalized_to_non_finite_input() {
+        assert_eq!(
+            normalization_to_construction(NormalizationError::NotNormalized),
+            ConstructionError::NonFiniteInput
+        );
+    }
+
+    #[test]
+    fn arithmetic_eval_bound_rejects_non_finite_scale() {
+        assert!(arithmetic_eval_bound(f64::NAN).is_err());
+        assert!(arithmetic_eval_bound(f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn arithmetic_eval_bound_is_non_negative_and_outward_rounded() {
+        // next_up() on a positive value strictly increases it, so the
+        // returned bound must be >= the raw Higham product.
+        let bound = arithmetic_eval_bound(1.0).unwrap();
+        assert!(bound.get() >= 0.0);
+        assert!(bound.get() >= 128.0 * f64::EPSILON);
+    }
+
+    fn tol() -> ToleranceContext {
+        ToleranceContext::try_new(1e-9, 1e-8, 1e-10, 1e-12).unwrap()
+    }
+
+    #[test]
+    fn arithmetic_proj_bound2_certifies_zero_residual() {
+        let bound = arithmetic_proj_bound2([1.0, 2.0], [1.0, 2.0], &tol()).unwrap();
+        assert!(bound >= 0.0);
+    }
+
+    #[test]
+    fn arithmetic_proj_bound3_certifies_zero_residual() {
+        let bound = arithmetic_proj_bound3([1.0, 2.0, 3.0], [1.0, 2.0, 3.0], &tol()).unwrap();
+        assert!(bound >= 0.0);
+    }
+
+    #[test]
+    fn unit_vector_tol_matches_foundation_deviation_guarantee() {
+        // UnitVector2/UnitVector3 guarantee a magnitude within 4*EPSILON of
+        // 1.0 (see `amphion_foundation::unit`); this crate's own tolerance
+        // for downstream orthogonality/consistency checks matches it.
+        assert!((UNIT_VECTOR_TOL - 4.0 * f64::EPSILON).abs() < f64::EPSILON);
+        let _ = Vector2::try_new(1.0, 0.0).unwrap();
+        let _ = Vector3::try_new(1.0, 0.0, 0.0).unwrap();
     }
 }
