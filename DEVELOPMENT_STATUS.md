@@ -4,32 +4,24 @@ Updated: 2026-07-20
 
 ## Accepted state
 
-`main` and `origin/main` are at `86e5908` (`Document cross-device development
-handoff`). The latest accepted implementation commit is `10924d5` (`Freeze
-STEP AP242 subset`).
+The latest accepted implementation commit on `main` is `bad0693` (`geometry:
+integrate certified analytic primitives`), merged through PR #1.
 
 Integrated and independently accepted:
 
 - exact foundation numerics: `670516d`;
 - validated topology core: `6212395`;
 - deterministic QA harness: `ee331be`;
-- frozen STEP AP242 subset: `10924d5`.
+- frozen STEP AP242 subset: `10924d5`;
+- certified analytic Geometry: `bad0693`.
 
-The STEP commit passed all five GitHub Actions jobs in run `29698775502`.
+The Geometry integration passed all five GitHub Actions jobs in run
+`29773500601`, including debug tests on Linux, macOS, and Windows, release-mode
+tests, and the complete quality gate. **Wave 2 is closed.**
 
-## Active work
+## Accepted Geometry integration
 
-Analytic Geometry remains the only blocker for closing Wave 2. Its proof,
-isolated integration, and local gates are complete.
-
-- Reviewed source branch: `agent/analytic-geometry`
-- Initial reviewed source commit: `c49b79d` (**superseded**)
-- Integration branch: `agent/integrate-analytic-geometry`
-- Integration base: `86e5908`
-- Accepted integration artifact: the commit containing this handoff
-- Status: **local gates and final read-only review passed; GitHub integration pending**
-
-The integration candidate closes the former blockers:
+The accepted integration closes the former Geometry blockers:
 
 - Circle, Cylinder, and Cone evaluation and projection use certified interval
   enclosures of the frozen mathematical ideal frame.
@@ -61,19 +53,20 @@ integrated alone. Integration reviews subsequently found and corrected:
 - exact affine transform application that preserves Line3/Plane/p-curve
   synchronization under cancellation and retains signed-zero identity bits.
 
-The resulting integration candidate contains 241 permanent Geometry tests.
+The accepted implementation contains 241 permanent Geometry tests.
 
 The initial source passed independent numeric, curved-frame, and whole-diff
-reviews. The corrected integration candidate then passed the complete locked
+reviews. The corrected integration then passed the complete locked
 formatting, check, Clippy, debug/release test, rustdoc, and metadata gates.
-A fresh independent read-only review of the complete effective integration
-diff returned no findings.
+A fresh independent read-only review of the complete effective diff returned
+no findings before PR #1 was merged.
 
-Before Wave 2 can close:
+## Next work
 
-1. push the integration commit and require every GitHub Actions job to pass;
-2. merge the accepted integration and update this handoff to the resulting
-   `main` commit.
+Wave 3 is now unblocked: topology validation, property generators,
+intersection contracts, STEP Part 21, and the corpus minimizer. Each task must
+start from current `main` in its own exclusive `agent/<task-id>` worktree and
+follow the dependency and review gates in `EXECUTION_PLAN.md`.
 
 ## Reproducing on another machine
 
@@ -81,7 +74,8 @@ Before Wave 2 can close:
 git clone https://github.com/arcadiy-magomedov/Amphion.git
 cd Amphion
 git fetch origin
-git switch agent/integrate-analytic-geometry
+git switch main
+git pull --ff-only
 ```
 
 Start Copilot CLI from the cloned repository and read this file before
