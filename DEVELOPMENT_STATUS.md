@@ -1,10 +1,12 @@
 # Amphion development handoff
 
-Updated: 2026-07-19
+Updated: 2026-07-20
 
 ## Accepted state
 
-`main` and `origin/main` are at `10924d5` (`Freeze STEP AP242 subset`).
+`main` and `origin/main` are at `86e5908` (`Document cross-device development
+handoff`). The latest accepted implementation commit is `10924d5` (`Freeze
+STEP AP242 subset`).
 
 Integrated and independently accepted:
 
@@ -17,36 +19,61 @@ The STEP commit passed all five GitHub Actions jobs in run `29698775502`.
 
 ## Active work
 
-Analytic Geometry is the only blocker for closing Wave 2.
+Analytic Geometry remains the only blocker for closing Wave 2. Its proof,
+isolated integration, and local gates are complete.
 
-- Remote branch: `agent/analytic-geometry`
-- Current WIP commit: `df10382`
-- Status: **not accepted and not ready to merge**
+- Reviewed source branch: `agent/analytic-geometry`
+- Initial reviewed source commit: `c49b79d` (**superseded**)
+- Integration branch: `agent/integrate-analytic-geometry`
+- Integration base: `86e5908`
+- Accepted integration artifact: the commit containing this handoff
+- Status: **local gates and final read-only review passed; GitHub integration pending**
 
-The branch contains useful exact-rational, trig, transform, typed tolerance,
-serialization, and regression work, but its curved-frame proof remains under
-adversarial review. In particular, do not accept scalar frame-deviation
-patches as a substitute for evaluating and projecting against certified
-interval enclosures of the frozen mathematical ideal frame. Cone projection
-must compare all admissible nappe/apex candidates by certified distance, not
-select only by `sign(h)`.
+The integration candidate closes the former blockers:
 
-Additional API cleanup still required at `df10382`:
+- Circle, Cylinder, and Cone evaluation and projection use certified interval
+  enclosures of the frozen mathematical ideal frame.
+- Cone projection constructs and compares the positive-nappe, negative-nappe,
+  and apex candidates by certified squared-distance intervals.
+- `EvaluationContext` requires validated budget and derivative-limit groups;
+  serde has no missing-field defaults or validation bypass.
+- Trigonometric and algebraic certification paths enforce hard pre-allocation
+  resource caps, including rational-to-`f64` conversion work.
+- Similarity transforms use exact rational classification and reject
+  non-representable scales or scaled radii.
+- Primitive transforms use exact dyadic affine application and reject
+  non-representable transformed coordinates instead of independently rounding
+  matrix products.
+- Public static domains no longer contain input-dependent panic paths.
 
-- remove serde defaults that permit missing derivative-limit/budget fields;
-- prevent `EvaluationContext::with_budget` from bypassing budget validation;
-- keep mandatory derivative-limit groups constructor-only and slot-typed.
+`c49b79d` was the initial 225-test proof snapshot. It must not be reused or
+integrated alone. Integration reviews subsequently found and corrected:
 
-Do not merge Geometry until:
+- Curve2 parameter-space tolerance checks;
+- exact representable similarity-scale recovery;
+- cone-apex projection documentation;
+- preservation of Line2/Line3 affine direction scale for synchronized
+  p-curves;
+- canonical evaluation of the exact upper seam endpoint on full-period
+  circles, cylinders, and cones;
+- preservation of Plane affine bases and Circle3/Cylinder/Cone frozen seeds
+  across transforms, including bitwise identity no-ops;
+- exact affine transform application that preserves Line3/Plane/p-curve
+  synchronization under cancellation and retains signed-zero identity bits.
 
-1. the complete branch passes an independent proof-level review;
-2. all required adversarial frame, projection, cone, periodic, serde, and
-   subnormal-root regressions pass;
-3. locked debug/release tests, formatting, check, Clippy, and warnings-denied
-   rustdoc all pass;
-4. `CONTRACTS.md` is updated to the accepted public API;
-5. the branch is rebased or squash-integrated onto current `main`;
-6. all GitHub Actions jobs pass on the integrated commit.
+The resulting integration candidate contains 241 permanent Geometry tests.
+
+The initial source passed independent numeric, curved-frame, and whole-diff
+reviews. The corrected integration candidate then passed the complete locked
+formatting, check, Clippy, debug/release test, rustdoc, and metadata gates.
+A fresh independent read-only review of the complete effective integration
+diff returned no findings.
+
+Before Wave 2 can close:
+
+1. push the integration commit and require every GitHub Actions job to pass;
+2. merge the accepted integration and update this handoff to the resulting
+   `main` commit.
 
 ## Reproducing on another machine
 
@@ -54,7 +81,7 @@ Do not merge Geometry until:
 git clone https://github.com/arcadiy-magomedov/Amphion.git
 cd Amphion
 git fetch origin
-git switch agent/analytic-geometry
+git switch agent/integrate-analytic-geometry
 ```
 
 Start Copilot CLI from the cloned repository and read this file before
