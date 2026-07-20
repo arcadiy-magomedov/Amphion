@@ -36,6 +36,22 @@ pub struct ParameterRange {
 }
 
 impl ParameterRange {
+    pub(crate) const fn unbounded() -> Self {
+        Self {
+            lower: None,
+            upper: None,
+            period: None,
+        }
+    }
+
+    pub(crate) const fn full_angular_period() -> Self {
+        Self {
+            lower: Some(0.0),
+            upper: Some(core::f64::consts::TAU),
+            period: Some(core::f64::consts::TAU),
+        }
+    }
+
     /// Creates a parameter range.
     ///
     /// # Errors

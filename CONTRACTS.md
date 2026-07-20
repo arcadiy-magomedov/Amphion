@@ -62,6 +62,90 @@ Curve and surface evaluators:
 - represent non-elementary intersection curves procedurally or as NURBS with
   certified approximation bounds.
 
+### Analytic evaluator certification
+
+Every analytic `evaluate`, `project`, and `project_into` operation receives an
+`EvaluationContext` containing:
+
+- the caller's explicit `ToleranceContext`;
+- a non-degenerate `CertificationBudget`;
+- mandatory, dimensionally typed derivative limits for every curve and surface
+  derivative slot.
+
+`CertificationBudget::series_terms` and `rational_bits` are positive. During
+budgeted evaluation and projection, they are hard pre-allocation ceilings for
+certified series work, exact integer/rational values, and rational-to-`f64`
+conversion workspace. Conservative early exhaustion is allowed; continuing
+past a cap or returning an uncertified approximation is not. Exhaustion returns
+`GeometryError::Uncertified`.
+
+Derivative limits are finite and non-negative. `f64::MAX` means no effective
+limit. The limit groups and budget are constructor-only values, every
+`EvaluationContext` serialization field is mandatory, and deserialization
+runs through the same validation as direct construction.
+
+Successful evaluations carry certified position and requested derivative
+bounds. Successful inverse mappings carry typed angular or linear parameter
+bounds, a point residual bound, and an upper distance bound in the evaluator's
+coordinate space.
+
+For `Curve2`, position, projection-point, distance, and derivative bounds are
+in surface parameter-space coordinates; position and projection-point
+certificates are checked against `ToleranceContext::parametric`. `Curve3` and
+surface position certificates use the scale-aware model-space length
+tolerance.
+
+### Analytic frames, projections, and transforms
+
+Finite direction fields stored by circular primitives are frozen seeds, not
+claims that their exact dyadic components form an orthonormal frame. Canonical
+evaluation and projection use these mathematical ideal frames:
+
+- in 2-D, `x = normalize(x_seed)` and `y = perp(x)`;
+- in 3-D, `z = normalize(z_seed)`,
+  `x = normalize(x_seed - z_seed * (x_seed dot z_seed) /
+  (z_seed dot z_seed))`, and `y = z cross x`.
+
+Circle, cylinder, and cone certificates are computed against that ideal frame.
+Line and plane parameterizations use their stored finite basis vectors
+directly. Line construction and deserialization preserve the complete non-zero
+direction vector, including its magnitude, because that affine coefficient
+synchronizes a 3-D edge curve with every 2-D p-curve. Inverse mappings solve
+the corresponding exact metric equations rather than assuming exact unit
+length or orthogonality.
+
+Plane transforms preserve the transformed affine basis vectors directly, so
+the same `(u, v)` maps to the affine image of the original point. Circle,
+cylinder, and cone similarity transforms preserve the finite transformed
+frozen-seed bits without constructor normalization or Gram-Schmidt
+canonicalization. An identity transform is a bitwise no-op on every stored
+basis or seed.
+
+All 3-D analytic transforms apply the stored finite matrix entries and
+primitive coordinates as exact dyadic rationals. A non-identity transform
+succeeds only when every exact transformed point, vector, and affine-basis
+component is representable as `f64`; otherwise it returns
+`TransformError::UnrepresentableResult`. Independently rounded matrix products
+may not be substituted because they can break the shared parameter identity
+between an edge curve and its p-curve.
+
+Full-period circle, cylinder, and cone evaluators accept both declared
+endpoints. The exact upper endpoint is a seam alias and is evaluated
+canonically at the lower endpoint. Projection output remains canonical in the
+half-open fundamental interval.
+
+Cone projection constructs the positive-nappe, negative-nappe, and apex
+candidates and selects only a uniquely certified minimum. Exact mirror ties
+return both nappes. If admissibility or ordering cannot be proved within the
+budget, projection returns `GeometryError::Uncertified`.
+
+Certificate-free circle, cylinder, and cone transforms accept only exact
+positive-determinant similarities over the stored matrix entries. Pairwise
+column dot products must be exactly zero and squared column norms exactly
+equal. The uniform scale and any scaled radius must be exactly representable as
+`f64`; otherwise the transform returns `TransformError::UnrepresentableScale`.
+Reflections are rejected in the current API.
+
 Every edge use on a face carries a parameter-space curve synchronized with the
 edge's three-dimensional curve. An edge stores a finite increasing trimming
 interval on its canonical 3D curve. The p-curve evaluator used by each coedge
